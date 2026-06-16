@@ -965,17 +965,20 @@ function TaskDetailPanel({ task }: { task: Task }) {
 
 function TaskEditForm({ task }: { task: Task }) {
   const queryClient = useQueryClient();
+  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
+  const [requestedSkills, setRequestedSkills] = useState<string[]>(task.requested_skills);
 
   useEffect(() => {
     setTitle(task.title);
     setDescription(task.description);
-  }, [task.title, task.description]);
+    setRequestedSkills(task.requested_skills);
+  }, [task.description, task.requested_skills, task.title]);
 
   const mutation = useMutation({
-    mutationFn: () => updateTask(task.id, { title: title.trim(), description }),
+    mutationFn: () => updateTask(task.id, { title: title.trim(), description, requested_skills: requestedSkills }),
     onSuccess: async () => {
       setEditing(false);
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -983,6 +986,7 @@ function TaskEditForm({ task }: { task: Task }) {
       await queryClient.invalidateQueries({ queryKey: ["task-history", task.id] });
     },
   });
+  const skillOptions = Array.from(new Set([...(skills.data ?? []).map((skill) => skill.name), ...task.requested_skills])).sort();
 
   return (
     <section className="task-edit">
@@ -1004,6 +1008,7 @@ function TaskEditForm({ task }: { task: Task }) {
               onClick={() => {
                 setTitle(task.title);
                 setDescription(task.description);
+                setRequestedSkills(task.requested_skills);
                 setEditing(false);
               }}
             >
@@ -1026,11 +1031,36 @@ function TaskEditForm({ task }: { task: Task }) {
             Description
             <textarea value={description} onChange={(event) => setDescription(event.target.value)} />
           </label>
+          {skillOptions.length > 0 && (
+            <fieldset className="skill-picker">
+              <legend>Requested skills</legend>
+              <div>
+                {skillOptions.map((skillName) => (
+                  <label className="skill-choice" key={skillName}>
+                    <input
+                      checked={requestedSkills.includes(skillName)}
+                      type="checkbox"
+                      onChange={(event) => {
+                        setRequestedSkills((current) =>
+                          event.target.checked
+                            ? [...current, skillName]
+                            : current.filter((name) => name !== skillName),
+                        );
+                      }}
+                    />
+                    <span>{skillName}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )}
         </div>
       ) : (
         <div className="task-brief">
           <strong>{task.title}</strong>
           <p>{task.description || "No description"}</p>
+          {task.requested_skills.length > 0 && <span>requested {task.requested_skills.join(", ")}</span>}
+          {task.matched_skills.length > 0 && <span>matched {task.matched_skills.join(", ")}</span>}
         </div>
       )}
     </section>

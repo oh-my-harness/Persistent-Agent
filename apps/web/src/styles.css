@@ -694,6 +694,11 @@ textarea {
   margin: 0;
 }
 
+.task-brief span {
+  color: #657680;
+  font-size: 13px;
+}
+
 .task-conversation {
   display: grid;
   gap: 10px;

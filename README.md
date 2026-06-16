@@ -18,7 +18,7 @@ The repository now contains the first executable skeleton:
 - Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, resource-lock changes, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
-- Web task detail panel with editable task title/description, task conversation, latest result, dependencies, and execution history.
+- Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
@@ -288,7 +288,7 @@ MVP UI actions:
 - create or change tasks by chatting with the main agent,
 - create one-off task,
 - create recurring task,
-- edit task priority/order,
+- edit task priority/order and requested skills,
 - pause/resume/cancel task,
 - reply to blocked task,
 - manually trigger scheduler scan,
