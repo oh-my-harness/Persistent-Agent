@@ -28,7 +28,7 @@ import {
   updateSkill,
   updateTask,
 } from "./api";
-import type { ConversationMessage, Memory, Task, TaskType } from "./types";
+import type { AppEvent, ConversationMessage, Memory, SchedulerTick, Task, TaskType } from "./types";
 import type { Skill } from "./types";
 import "./styles.css";
 
@@ -43,7 +43,7 @@ function App() {
 }
 
 function Shell() {
-  const [lastEvent, setLastEvent] = useState("Waiting for server events");
+  const [eventLog, setEventLog] = useState<TimelineEvent[]>([]);
   const queryClient = useQueryClient();
 
   const tasks = useQuery({ queryKey: ["tasks"], queryFn: listTasks });
@@ -52,14 +52,25 @@ function Shell() {
   useEffect(() => {
     const source = new EventSource("/api/events");
     source.addEventListener("app", (event) => {
-      setLastEvent(event.data);
+      const parsed = parseAppEvent(event.data);
+      setEventLog((current) => [toTimelineEvent(parsed, event.data), ...current].slice(0, 20));
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
       void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
       void queryClient.invalidateQueries({ queryKey: ["memories"] });
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     });
-    source.onerror = () => setLastEvent("Event stream disconnected");
+    source.onerror = () =>
+      setEventLog((current) => [
+        {
+          id: `${Date.now()}-disconnected`,
+          title: "Event stream disconnected",
+          detail: "The UI will reconnect automatically when the server is available.",
+          tone: "warning" as const,
+          timestamp: new Date().toISOString(),
+        },
+        ...current,
+      ].slice(0, 20));
     return () => source.close();
   }, [queryClient]);
 
@@ -118,10 +129,10 @@ function Shell() {
           </section>
           <section className="panel event-panel">
             <div className="panel-heading">
-              <h2>Event Stream</h2>
+              <h2>Execution Monitor</h2>
               <span>SSE</span>
             </div>
-            <pre>{lastEvent}</pre>
+            <EventTimeline events={eventLog} />
           </section>
         </section>
       </section>
@@ -514,6 +525,125 @@ function Metric({ label, value }: { label: string; value: number }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+type TimelineEvent = {
+  id: string;
+  title: string;
+  detail: string;
+  tone: "info" | "success" | "warning" | "danger";
+  timestamp: string;
+};
+
+function EventTimeline({ events }: { events: TimelineEvent[] }) {
+  return (
+    <div className="event-timeline">
+      {events.map((event) => (
+        <article className={`event-item ${event.tone}`} key={event.id}>
+          <div>
+            <strong>{event.title}</strong>
+            <time>{new Date(event.timestamp).toLocaleTimeString()}</time>
+          </div>
+          <p>{event.detail}</p>
+        </article>
+      ))}
+      {events.length === 0 && <p className="empty">Waiting for scheduler, task, and main-agent events.</p>}
+    </div>
+  );
+}
+
+function parseAppEvent(raw: string): AppEvent | null {
+  try {
+    return JSON.parse(raw) as AppEvent;
+  } catch {
+    return null;
+  }
+}
+
+function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
+  const timestamp = new Date().toISOString();
+  const fallback = {
+    id: `${Date.now()}-${Math.random()}`,
+    title: "Unknown event",
+    detail: raw,
+    tone: "warning" as const,
+    timestamp,
+  };
+
+  if (!event) {
+    return fallback;
+  }
+
+  switch (event.type) {
+    case "task_changed":
+      return {
+        id: `${timestamp}-task-${event.task.id}`,
+        title: `Task ${event.task.status.replaceAll("_", " ")}`,
+        detail: event.task.title,
+        tone: taskEventTone(event.task.status),
+        timestamp,
+      };
+    case "main_agent_reply":
+      return {
+        id: `${timestamp}-main-agent-${event.message.id}`,
+        title: "Main agent replied",
+        detail: event.message.content,
+        tone: "info",
+        timestamp,
+      };
+    case "scheduler_tick":
+      return schedulerTimelineEvent(event.tick, timestamp);
+    case "heartbeat":
+      return {
+        id: `${timestamp}-heartbeat`,
+        title: "Heartbeat",
+        detail: "Server event stream is alive.",
+        tone: "info",
+        timestamp,
+      };
+    default:
+      return fallback;
+  }
+}
+
+function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): TimelineEvent {
+  const requeued = tick.requeued_tasks.length;
+  const taskTitle = tick.claimed_task?.title ?? "No runnable task";
+  const suffix = requeued > 0 ? ` ${requeued} recurring task(s) requeued.` : "";
+
+  switch (tick.outcome.type) {
+    case "completed":
+      return {
+        id: `${timestamp}-scheduler-completed-${tick.claimed_task?.id ?? "none"}`,
+        title: "Scheduler completed a task",
+        detail: `${taskTitle}: ${tick.outcome.summary}${suffix}`,
+        tone: "success",
+        timestamp,
+      };
+    case "blocked":
+      return {
+        id: `${timestamp}-scheduler-blocked-${tick.claimed_task?.id ?? "none"}`,
+        title: "Scheduler needs user input",
+        detail: `${taskTitle}: ${tick.outcome.reason}${suffix}`,
+        tone: "warning",
+        timestamp,
+      };
+    case "idle":
+      return {
+        id: `${timestamp}-scheduler-idle`,
+        title: "Scheduler idle",
+        detail: `${taskTitle}.${suffix}`,
+        tone: "info",
+        timestamp,
+      };
+  }
+}
+
+function taskEventTone(status: Task["status"]): TimelineEvent["tone"] {
+  if (status === "completed") return "success";
+  if (status === "failed" || status === "cancelled") return "danger";
+  if (status === "waiting_for_user" || status === "paused") return "warning";
+  return "info";
 }
 
 function TaskComposer() {

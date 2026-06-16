@@ -25,7 +25,7 @@ The repository now contains the first executable skeleton:
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate review, edit/delete controls, and approved-memory injection into worker context.
 - Axum API with REST endpoints and an SSE event stream.
-- Vite React Web UI under `apps/web`.
+- Vite React Web UI under `apps/web` with a readable SSE execution monitor.
 
 Run the backend:
 

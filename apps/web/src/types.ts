@@ -52,6 +52,12 @@ export interface SchedulerTick {
   outcome: { type: "idle" } | { type: "completed"; summary: string } | { type: "blocked"; reason: string };
 }
 
+export type AppEvent =
+  | { type: "task_changed"; task: Task }
+  | { type: "main_agent_reply"; message: ConversationMessage }
+  | { type: "scheduler_tick"; tick: SchedulerTick }
+  | { type: "heartbeat" };
+
 export interface ConversationMessage {
   id: string;
   conversation_id: string;
