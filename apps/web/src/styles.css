@@ -214,6 +214,34 @@ textarea {
   min-height: 420px;
 }
 
+.status-filter {
+  background: #f3f6f7;
+  border: 1px solid #d9e0e3;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 4px;
+}
+
+.status-filter button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: #52636c;
+  font-size: 12px;
+  font-weight: 700;
+  min-height: 30px;
+  padding: 6px 10px;
+}
+
+.status-filter button.active {
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(25, 35, 40, 0.12);
+  color: #1f2f37;
+}
+
 .memory-panel {
   grid-column: 1 / -1;
 }

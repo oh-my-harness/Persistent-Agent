@@ -37,6 +37,18 @@ import "./styles.css";
 
 const queryClient = new QueryClient();
 
+const TASK_STATUS_FILTERS: Array<{ label: string; value: "all" | Task["status"] }> = [
+  { label: "All", value: "all" },
+  { label: "Queued", value: "queued" },
+  { label: "Running", value: "running" },
+  { label: "Needs user", value: "waiting_for_user" },
+  { label: "Scheduled", value: "waiting_for_schedule" },
+  { label: "Completed", value: "completed" },
+  { label: "Failed", value: "failed" },
+  { label: "Paused", value: "paused" },
+  { label: "Cancelled", value: "cancelled" },
+];
+
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
@@ -47,6 +59,7 @@ function App() {
 
 function Shell() {
   const [eventLog, setEventLog] = useState<TimelineEvent[]>([]);
+  const [taskStatusFilter, setTaskStatusFilter] = useState<"all" | Task["status"]>("all");
   const queryClient = useQueryClient();
 
   const tasks = useQuery({ queryKey: ["tasks"], queryFn: listTasks });
@@ -83,7 +96,14 @@ function Shell() {
     return () => source.close();
   }, [queryClient]);
 
-  const visibleTasks = tasks.data ?? [];
+  const allTasks = tasks.data ?? [];
+  const visibleTasks = useMemo(
+    () =>
+      taskStatusFilter === "all"
+        ? allTasks
+        : allTasks.filter((task) => task.status === taskStatusFilter),
+    [allTasks, taskStatusFilter],
+  );
 
   return (
     <main className="app-shell">
@@ -127,13 +147,29 @@ function Shell() {
           <section className="panel task-list-panel">
             <div className="panel-heading">
               <h2>Queue</h2>
-              <span>{tasks.isLoading ? "Loading" : `${visibleTasks.length} tasks`}</span>
+              <span>{tasks.isLoading ? "Loading" : `${visibleTasks.length}/${allTasks.length} tasks`}</span>
+            </div>
+            <div className="status-filter" aria-label="Task status filter">
+              {TASK_STATUS_FILTERS.map((filter) => (
+                <button
+                  key={filter.value}
+                  className={taskStatusFilter === filter.value ? "active" : ""}
+                  type="button"
+                  onClick={() => setTaskStatusFilter(filter.value)}
+                >
+                  {filter.label}
+                </button>
+              ))}
             </div>
             <div className="task-list">
               {visibleTasks.map((task) => (
                 <TaskRow key={task.id} task={task} />
               ))}
-              {visibleTasks.length === 0 && <p className="empty">No tasks yet.</p>}
+              {visibleTasks.length === 0 && (
+                <p className="empty">
+                  {taskStatusFilter === "all" ? "No tasks yet." : "No tasks match this status."}
+                </p>
+              )}
             </div>
           </section>
           <section className="panel event-panel">

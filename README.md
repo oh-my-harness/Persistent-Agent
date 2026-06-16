@@ -17,7 +17,7 @@ The repository now contains the first executable skeleton:
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
 - Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, resource-lock changes, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
-- Web task pool controls for priority and queue-position changes.
+- Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
