@@ -86,6 +86,7 @@ where
     }
 
     async fn tick_inner(&self) -> anyhow::Result<SchedulerTick> {
+        let recovered_tasks = self.db.recover_expired_running_tasks("scheduler").await?;
         let requeued_tasks = self.db.requeue_due_recurring_tasks("scheduler").await?;
         let Some(task) = self
             .db
@@ -93,6 +94,7 @@ where
             .await?
         else {
             return Ok(SchedulerTick {
+                recovered_tasks,
                 requeued_tasks,
                 claimed_task: None,
                 outcome: SchedulerOutcome::Idle,
@@ -152,6 +154,7 @@ where
                 self.db.fail_task(task.id, &error, "worker").await?;
 
                 return Ok(SchedulerTick {
+                    recovered_tasks,
                     requeued_tasks,
                     claimed_task: Some(task),
                     outcome: SchedulerOutcome::Failed { error },
@@ -208,6 +211,7 @@ where
                 }
                 self.db.complete_task(task.id, &summary, "worker").await?;
                 Ok(SchedulerTick {
+                    recovered_tasks,
                     requeued_tasks,
                     claimed_task: Some(task),
                     outcome: SchedulerOutcome::Completed { summary },
@@ -240,6 +244,7 @@ where
                     .set_task_status(task.id, TaskStatus::WaitingForUser, "worker", Some(&reason))
                     .await?;
                 Ok(SchedulerTick {
+                    recovered_tasks,
                     requeued_tasks,
                     claimed_task: Some(task),
                     outcome: SchedulerOutcome::Blocked { reason },
@@ -862,6 +867,7 @@ pub struct WorkerArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerTick {
+    pub recovered_tasks: Vec<Task>,
     pub requeued_tasks: Vec<Task>,
     pub claimed_task: Option<Task>,
     pub outcome: SchedulerOutcome,
@@ -915,6 +921,40 @@ mod tests {
                 lease_seconds: 45,
             }
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_recovers_expired_running_task_before_claiming_work() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Resume stale work".to_owned(),
+                    description: "Recover before executing".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.claim_next_runnable("previous-worker", 1).await?;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let scheduler = Scheduler::new(db.clone(), StubWorker);
+        let tick = scheduler.tick().await?;
+
+        assert_eq!(tick.recovered_tasks.len(), 1);
+        assert_eq!(tick.recovered_tasks[0].id, task.id);
+        assert_eq!(
+            tick.claimed_task.as_ref().map(|task| task.id),
+            Some(task.id)
+        );
+        assert!(matches!(tick.outcome, SchedulerOutcome::Completed { .. }));
 
         Ok(())
     }

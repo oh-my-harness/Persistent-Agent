@@ -47,6 +47,7 @@ export interface TaskPoolSummary {
 }
 
 export interface SchedulerTick {
+  recovered_tasks: Task[];
   requeued_tasks: Task[];
   claimed_task?: Task | null;
   outcome:

@@ -395,6 +395,68 @@ impl Db {
         }
     }
 
+    pub async fn recover_expired_running_tasks(&self, actor: &str) -> anyhow::Result<Vec<Task>> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+            SELECT id, lease_owner, lease_expires_at FROM tasks
+            WHERE status = 'running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            ORDER BY lease_expires_at ASC, priority DESC, queue_position ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovered = Vec::new();
+        for row in rows {
+            let task_id = parse_uuid(row.try_get::<String, _>("id")?)?;
+            let previous_owner: Option<String> = row.try_get("lease_owner")?;
+            let previous_lease_expires_at: Option<DateTime<Utc>> =
+                row.try_get("lease_expires_at")?;
+            let queue_position = self.next_queue_position().await?;
+
+            let result = sqlx::query(
+                r#"
+                UPDATE tasks
+                SET status = 'queued', queue_position = ?, blocked_reason = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                "#,
+            )
+            .bind(queue_position)
+            .bind(now)
+            .bind(task_id.to_string())
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                continue;
+            }
+
+            self.record_action(
+                Some(task_id),
+                actor,
+                "recover_expired_running_task",
+                json!({
+                    "queue_position": queue_position,
+                    "previous_lease_owner": previous_owner,
+                    "previous_lease_expires_at": previous_lease_expires_at,
+                }),
+            )
+            .await?;
+
+            recovered.push(self.get_task(task_id).await?);
+        }
+
+        Ok(recovered)
+    }
+
     pub async fn requeue_due_recurring_tasks(&self, actor: &str) -> anyhow::Result<Vec<Task>> {
         let now = Utc::now();
         let rows = sqlx::query(
@@ -2084,6 +2146,63 @@ mod tests {
 
         let completed = db.heartbeat_task_lease(task.id, "worker-a", 60).await?;
         assert!(completed.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_running_task_can_be_recovered_to_queue() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Recover stale lease".to_owned(),
+                    description: "Move expired running work back to the queue".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.claim_next_runnable("worker-a", 60).await?;
+
+        let expired_at = Utc::now() - Duration::seconds(5);
+        sqlx::query("UPDATE tasks SET lease_expires_at = ? WHERE id = ?")
+            .bind(expired_at)
+            .bind(task.id.to_string())
+            .execute(db.pool())
+            .await?;
+
+        let recovered = db.recover_expired_running_tasks("scheduler").await?;
+        let lease_row = sqlx::query("SELECT lease_owner, lease_expires_at FROM tasks WHERE id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(db.pool())
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, TaskStatus::Queued);
+        assert!(
+            lease_row
+                .try_get::<Option<String>, _>("lease_owner")?
+                .is_none()
+        );
+        assert!(
+            lease_row
+                .try_get::<Option<DateTime<Utc>>, _>("lease_expires_at")?
+                .is_none()
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "recover_expired_running_task")
+        );
+
+        let claimed_again = db.claim_next_runnable("worker-b", 60).await?;
+        assert_eq!(claimed_again.map(|task| task.id), Some(task.id));
 
         Ok(())
     }

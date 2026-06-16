@@ -27,7 +27,7 @@ The repository now contains the first executable skeleton:
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
-- Running task leases are refreshed while workers execute, preventing long attempts from looking stale.
+- Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
@@ -143,18 +143,20 @@ Suggested lifecycle:
 The main agent owns a single execution loop:
 
 1. Wake on a timer or explicit user action.
-2. Find the first runnable task by queue order and priority.
-3. Skip tasks whose dependencies are not yet satisfied or whose exclusive resources are already held by a running task.
-4. Resolve applicable skills.
-5. Start one worker agent for that task.
-6. Track logs, state, artifacts, and conversation messages.
-7. On success:
+2. Recover running tasks whose leases expired, putting them back at the tail of the queue.
+3. Requeue recurring tasks whose next scheduled run is due.
+4. Find the first runnable task by queue order and priority.
+5. Skip tasks whose dependencies are not yet satisfied or whose exclusive resources are already held by a running task.
+6. Resolve applicable skills.
+7. Start one worker agent for that task.
+8. Track logs, state, artifacts, and conversation messages.
+9. On success:
    - Mark one-off tasks as `completed`.
    - Move recurring tasks to `waiting_for_schedule` or the tail of the queue.
-8. On blocker:
+10. On blocker:
    - Mark task as `waiting_for_user`.
    - Post a concise request in the linked conversation.
-9. Review worker memory candidates and optionally promote useful ones into long-term memory.
+11. Review worker memory candidates and optionally promote useful ones into long-term memory.
 
 ### Future: Parallel Execution
 
