@@ -13,6 +13,8 @@ const ZH_CREATE: &str = "\u{521b}\u{5efa}";
 const ZH_NEW: &str = "\u{65b0}\u{5efa}";
 const ZH_ADD: &str = "\u{6dfb}\u{52a0}";
 const ZH_ADD_ONE: &str = "\u{52a0}\u{4e00}\u{4e2a}";
+const ZH_SPLIT: &str = "\u{62c6}\u{5206}";
+const ZH_DECOMPOSE: &str = "\u{5206}\u{89e3}";
 const ZH_RECURRING: &str = "\u{5faa}\u{73af}";
 const ZH_SCHEDULED: &str = "\u{5b9a}\u{671f}";
 const ZH_ONE_OFF: &str = "\u{4e00}\u{6b21}\u{6027}";
@@ -276,6 +278,23 @@ impl MainAgent {
         let intent = parse_intent(&input.content);
         let mut changed_tasks = Vec::new();
         let reply = match intent {
+            MainAgentIntent::SplitTasks { titles } => {
+                for title in titles {
+                    let task = self
+                        .create_task(CreateTask {
+                            title: title.clone(),
+                            description: format!("Split from user request: {}", input.content),
+                            task_type: TaskType::OneOff,
+                            priority: 0,
+                            requested_skills: Vec::new(),
+                            schedule: None,
+                            created_by: "user".to_owned(),
+                        })
+                        .await?;
+                    changed_tasks.push(task);
+                }
+                format!("Created {} split task(s).", changed_tasks.len())
+            }
             MainAgentIntent::CreateTask {
                 title,
                 description,
@@ -465,7 +484,7 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::Help => {
-                "I can create tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: ask clarification for task Deploy release: Which environment should I deploy to?".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -541,6 +560,9 @@ pub struct MainAgentMessageResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MainAgentIntent {
+    SplitTasks {
+        titles: Vec<String>,
+    },
     CreateTask {
         title: String,
         description: String,
@@ -600,6 +622,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     let normalized = trimmed.to_lowercase();
 
     if let Some(intent) = parse_explain_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_split_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -786,6 +812,71 @@ fn is_create_request(normalized: &str) -> bool {
         normalized,
         &[ZH_CREATE, ZH_NEW, ZH_ADD, ZH_ADD_ONE, "create", "add task"],
     )
+}
+
+fn parse_split_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "split goal",
+            "split task",
+            "split into tasks",
+            "decompose goal",
+            "break down",
+            ZH_SPLIT,
+            ZH_DECOMPOSE,
+        ],
+    ) {
+        return None;
+    }
+
+    let tail = split_tail(content)?;
+    let titles = extract_split_titles(tail);
+    (titles.len() >= 2).then_some(MainAgentIntent::SplitTasks { titles })
+}
+
+fn split_tail(content: &str) -> Option<&str> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((_, tail)) = content.split_once(separator) {
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                return Some(tail);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_split_titles(content: &str) -> Vec<String> {
+    content
+        .split(['\n', ';', '\u{ff1b}'])
+        .flat_map(|part| part.split("、"))
+        .map(clean_split_title)
+        .filter(|title| !title.is_empty())
+        .map(|title| clamp_title(&title))
+        .collect()
+}
+
+fn clean_split_title(value: &str) -> String {
+    let value = value.trim();
+    let value = value
+        .trim_start_matches(|ch: char| {
+            ch.is_ascii_whitespace()
+                || ch == '-'
+                || ch == '*'
+                || ch == '\u{2022}'
+                || ch == '.'
+                || ch == ')'
+                || ch == '\u{3001}'
+        })
+        .trim();
+    let value = value
+        .trim_start_matches(|ch: char| ch.is_ascii_digit())
+        .trim_start_matches(['.', ')', '\u{3001}'])
+        .trim();
+
+    value.to_owned()
 }
 
 fn is_convert_request(normalized: &str) -> bool {
@@ -1430,6 +1521,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_split_tasks_intents() {
+        assert_eq!(
+            parse_intent("split goal: investigate issue; write fix; run tests"),
+            MainAgentIntent::SplitTasks {
+                titles: vec![
+                    "investigate issue".to_owned(),
+                    "write fix".to_owned(),
+                    "run tests".to_owned(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{62c6}\u{5206}\u{76ee}\u{6807}\u{ff1a}\u{5206}\u{6790} issue\u{ff1b}\u{4fee}\u{590d}\u{4ee3}\u{7801}\u{ff1b}\u{8fd0}\u{884c}\u{6d4b}\u{8bd5}"
+            ),
+            MainAgentIntent::SplitTasks {
+                titles: vec![
+                    "\u{5206}\u{6790} issue".to_owned(),
+                    "\u{4fee}\u{590d}\u{4ee3}\u{7801}".to_owned(),
+                    "\u{8fd0}\u{884c}\u{6d4b}\u{8bd5}".to_owned(),
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn parses_recurring_chinese_create_task() {
         let content = "\u{521b}\u{5efa}\u{5faa}\u{73af}\u{4efb}\u{52a1}\u{ff1a}\u{6bcf}\u{5929}\u{68c0}\u{67e5}\u{4ed3}\u{5e93} issue \u{4f18}\u{5148}\u{7ea7} 3 \u{6bcf} 60 \u{79d2}";
         let intent = parse_intent(content);
@@ -1996,6 +2113,32 @@ mod tests {
                 .any(|action| action.action_type == "request_user_clarification")
         );
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_split_goal_into_tasks() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "split goal: investigate issue; write fix; run tests".to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+
+        assert_eq!(response.changed_tasks.len(), 3);
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().any(|task| task.title == "investigate issue"));
+        assert!(tasks.iter().all(|task| task.task_type == TaskType::OneOff));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Created 3 split task")
+        );
 
         Ok(())
     }
