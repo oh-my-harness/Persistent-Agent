@@ -3,6 +3,7 @@ import type {
   MainAgentMessageResponse,
   Memory,
   SchedulerTick,
+  Skill,
   Task,
   TaskPoolSummary,
   TaskType,
@@ -89,4 +90,23 @@ export function approveMemory(id: string): Promise<Memory> {
 
 export function rejectMemory(id: string): Promise<Memory> {
   return request<Memory>(`/api/memories/${id}/reject`, { method: "POST" });
+}
+
+export interface CreateSkillInput {
+  name: string;
+  description: string;
+  trigger_rules: string[];
+  tool_subset: string[];
+  resource_path?: string | null;
+}
+
+export function listSkills(): Promise<Skill[]> {
+  return request<Skill[]>("/api/skills");
+}
+
+export function createSkill(input: CreateSkillInput): Promise<Skill> {
+  return request<Skill>("/api/skills", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }

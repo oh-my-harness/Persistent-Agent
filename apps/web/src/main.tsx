@@ -5,10 +5,12 @@ import { Bot, CirclePause, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } 
 import {
   approveMemory,
   cancelTask,
+  createSkill,
   createTask,
   getTaskPoolSummary,
   listMainAgentMessages,
   listMemories,
+  listSkills,
   listTasks,
   pauseTask,
   rejectMemory,
@@ -17,6 +19,7 @@ import {
   sendMainAgentMessage,
 } from "./api";
 import type { ConversationMessage, Memory, Task, TaskType } from "./types";
+import type { Skill } from "./types";
 import "./styles.css";
 
 const queryClient = new QueryClient();
@@ -44,6 +47,7 @@ function Shell() {
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
       void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
       void queryClient.invalidateQueries({ queryKey: ["memories"] });
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
     });
     source.onerror = () => setLastEvent("Event stream disconnected");
     return () => source.close();
@@ -88,6 +92,7 @@ function Shell() {
         <section className="content-grid">
           <TaskComposer />
           <MainAgentChat />
+          <SkillManager />
           <MemoryReview />
           <section className="panel task-list-panel">
             <div className="panel-heading">
@@ -112,6 +117,86 @@ function Shell() {
       </section>
     </main>
   );
+}
+
+function SkillManager() {
+  const queryClient = useQueryClient();
+  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [rules, setRules] = useState("");
+  const mutation = useMutation({
+    mutationFn: createSkill,
+    onSuccess: async () => {
+      setName("");
+      setDescription("");
+      setRules("");
+      await queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+  });
+
+  const visibleSkills = skills.data ?? [];
+
+  return (
+    <section className="panel skill-panel">
+      <div className="panel-heading">
+        <h2>Skills</h2>
+        <span>{visibleSkills.length} defined</span>
+      </div>
+      <form
+        className="skill-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!name.trim()) return;
+          mutation.mutate({
+            name: name.trim(),
+            description,
+            trigger_rules: splitCsv(rules),
+            tool_subset: [],
+            resource_path: null,
+          });
+        }}
+      >
+        <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Skill name" />
+        <input
+          value={rules}
+          onChange={(event) => setRules(event.target.value)}
+          placeholder="Triggers, comma separated"
+        />
+        <textarea
+          value={description}
+          onChange={(event) => setDescription(event.target.value)}
+          placeholder="What this skill helps with"
+        />
+        <button className="primary" type="submit" disabled={mutation.isPending}>
+          <Plus size={16} /> Add skill
+        </button>
+      </form>
+      <div className="skill-list">
+        {visibleSkills.map((skill) => (
+          <SkillRow key={skill.id} skill={skill} />
+        ))}
+        {visibleSkills.length === 0 && <p className="empty">Add a skill to enable automatic task matching.</p>}
+      </div>
+    </section>
+  );
+}
+
+function SkillRow({ skill }: { skill: Skill }) {
+  return (
+    <article className="skill-row">
+      <strong>{skill.name}</strong>
+      <p>{skill.description || "No description"}</p>
+      <span>{skill.trigger_rules.join(", ") || "no triggers"}</span>
+    </article>
+  );
+}
+
+function splitCsv(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function MemoryReview() {
@@ -351,6 +436,7 @@ function TaskRow({ task }: { task: Task }) {
           <span>{task.task_type.replace("_", " ")}</span>
           <span>priority {task.priority}</span>
           <span>attempts {task.attempt_count}</span>
+          {task.matched_skills.length > 0 && <span>matched {task.matched_skills.join(", ")}</span>}
           {task.next_run_at && <span>next {new Date(task.next_run_at).toLocaleString()}</span>}
         </div>
       </div>

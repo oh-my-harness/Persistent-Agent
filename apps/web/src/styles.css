@@ -218,6 +218,40 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.skill-panel {
+  grid-column: 1 / -1;
+}
+
+.skill-form {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(220px, 1fr) minmax(260px, 1.2fr) auto;
+  margin-bottom: 14px;
+}
+
+.skill-form textarea {
+  min-height: 42px;
+}
+
+.skill-list {
+  display: grid;
+  gap: 10px;
+}
+
+.skill-row {
+  border: 1px solid #d9e0e3;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+}
+
+.skill-row p,
+.skill-row span {
+  color: #657680;
+  margin: 0;
+}
+
 .memory-list {
   display: grid;
   gap: 10px;
@@ -432,6 +466,10 @@ pre {
 
   .summary-strip {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+
+  .skill-form {
+    grid-template-columns: 1fr;
   }
 
   .topbar {

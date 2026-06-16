@@ -1,7 +1,8 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
-    Conversation, ConversationId, ConversationMessage, CreateMemory, CreateTask, Memory, MemoryId,
-    MemoryStatus, Task, TaskAction, TaskAttempt, TaskId, TaskStatus, TaskType, UpdateTask,
+    Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
+    Memory, MemoryId, MemoryStatus, Skill, Task, TaskAction, TaskAttempt, TaskId, TaskStatus,
+    TaskType, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -35,6 +36,8 @@ impl Db {
         let conversation_id = Uuid::now_v7();
         let queue_position = self.next_queue_position().await?;
         let requested_skills = serde_json::to_string(&input.requested_skills)?;
+        let matched_skill_names = self.match_skills(&input.title, &input.description).await?;
+        let matched_skills = serde_json::to_string(&matched_skill_names)?;
         let schedule = input
             .schedule
             .as_ref()
@@ -48,7 +51,7 @@ impl Db {
               conversation_id, requested_skills, matched_skills, schedule, attempt_count,
               created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             "#,
         )
         .bind(id.to_string())
@@ -61,6 +64,7 @@ impl Db {
         .bind(&input.created_by)
         .bind(conversation_id.to_string())
         .bind(requested_skills)
+        .bind(matched_skills)
         .bind(schedule)
         .bind(now)
         .bind(now)
@@ -614,6 +618,72 @@ impl Db {
         row_to_memory(row)
     }
 
+    pub async fn create_skill(&self, input: CreateSkill, actor: &str) -> anyhow::Result<Skill> {
+        let now = Utc::now();
+        let skill = Skill {
+            id: Uuid::now_v7(),
+            name: input.name,
+            description: input.description,
+            trigger_rules: input.trigger_rules,
+            tool_subset: input.tool_subset,
+            resource_path: input.resource_path,
+            created_at: now,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO skills (id, name, description, trigger_rules, tool_subset, resource_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(skill.id.to_string())
+        .bind(&skill.name)
+        .bind(&skill.description)
+        .bind(serde_json::to_string(&skill.trigger_rules)?)
+        .bind(serde_json::to_string(&skill.tool_subset)?)
+        .bind(&skill.resource_path)
+        .bind(skill.created_at)
+        .bind(skill.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            None,
+            actor,
+            "create_skill",
+            json!({ "skill_id": skill.id, "name": skill.name }),
+        )
+        .await?;
+
+        Ok(skill)
+    }
+
+    pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {
+        let rows = sqlx::query("SELECT * FROM skills ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(row_to_skill).collect()
+    }
+
+    async fn match_skills(&self, title: &str, description: &str) -> anyhow::Result<Vec<String>> {
+        let skills = self.list_skills().await?;
+        let haystack = format!("{title}\n{description}").to_lowercase();
+        let matched = skills
+            .into_iter()
+            .filter(|skill| {
+                skill.trigger_rules.iter().any(|rule| {
+                    let rule = rule.trim().to_lowercase();
+                    !rule.is_empty() && haystack.contains(&rule)
+                })
+            })
+            .map(|skill| skill.name)
+            .collect();
+
+        Ok(matched)
+    }
+
     async fn next_queue_position(&self) -> anyhow::Result<i64> {
         let value: Option<i64> = sqlx::query_scalar("SELECT MAX(queue_position) + 1 FROM tasks")
             .fetch_one(&self.pool)
@@ -647,6 +717,21 @@ fn row_to_memory(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Memory> {
         status: status.parse()?,
         confidence: row.try_get("confidence")?,
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
+fn row_to_skill(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Skill> {
+    let trigger_rules: String = row.try_get("trigger_rules")?;
+    let tool_subset: String = row.try_get("tool_subset")?;
+    Ok(Skill {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        trigger_rules: serde_json::from_str(&trigger_rules)?,
+        tool_subset: serde_json::from_str(&tool_subset)?,
+        resource_path: row.try_get("resource_path")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
     })
 }
 
@@ -790,6 +875,41 @@ mod tests {
         assert_eq!(approved.status, MemoryStatus::Approved);
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "Prefer focused tests.");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_creation_matches_skills_by_trigger_rules() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "github".to_owned(),
+                description: "GitHub repository work".to_owned(),
+                trigger_rules: vec!["github".to_owned(), "issue".to_owned()],
+                tool_subset: vec!["github_search".to_owned()],
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Check GitHub issue".to_owned(),
+                    description: "Look for open issues".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        assert_eq!(task.matched_skills, vec!["github"]);
 
         Ok(())
     }

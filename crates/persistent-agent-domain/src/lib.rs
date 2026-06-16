@@ -8,6 +8,7 @@ pub type TaskId = Uuid;
 pub type ConversationId = Uuid;
 pub type TaskAttemptId = Uuid;
 pub type MemoryId = Uuid;
+pub type SkillId = Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -254,4 +255,25 @@ pub struct CreateMemory {
     pub source_task_id: Option<TaskId>,
     pub status: MemoryStatus,
     pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: SkillId,
+    pub name: String,
+    pub description: String,
+    pub trigger_rules: Vec<String>,
+    pub tool_subset: Vec<String>,
+    pub resource_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSkill {
+    pub name: String,
+    pub description: String,
+    pub trigger_rules: Vec<String>,
+    pub tool_subset: Vec<String>,
+    pub resource_path: Option<String>,
 }

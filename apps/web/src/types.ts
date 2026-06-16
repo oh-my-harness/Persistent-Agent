@@ -79,3 +79,14 @@ export interface Memory {
   confidence: number;
   created_at: string;
 }
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  trigger_rules: string[];
+  tool_subset: string[];
+  resource_path?: string | null;
+  created_at: string;
+  updated_at: string;
+}

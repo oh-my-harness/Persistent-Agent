@@ -13,7 +13,8 @@ use axum::{
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task, TaskId, UpdateTask,
+    ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, Task,
+    TaskId, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memories", get(list_memories))
         .route("/api/memories/{id}/approve", post(approve_memory))
         .route("/api/memories/{id}/reject", post(reject_memory))
+        .route("/api/skills", get(list_skills).post(create_skill))
         .route("/api/scheduler/tick", post(run_scheduler_tick))
         .route("/api/events", get(events))
         .layer(CorsLayer::permissive())
@@ -281,6 +283,17 @@ async fn reject_memory(
             .set_memory_status(id, MemoryStatus::Rejected, "main_agent")
             .await?,
     ))
+}
+
+async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<Skill>>, ApiError> {
+    Ok(Json(state.db.list_skills().await?))
+}
+
+async fn create_skill(
+    State(state): State<AppState>,
+    Json(input): Json<CreateSkill>,
+) -> Result<Json<Skill>, ApiError> {
+    Ok(Json(state.db.create_skill(input, "main_agent").await?))
 }
 
 async fn events(
