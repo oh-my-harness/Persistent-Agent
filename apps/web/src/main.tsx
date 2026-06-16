@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient
 import { Bot, Check, CirclePause, History, ListTodo, Pencil, Play, Plus, RotateCw, Send, SquareX, X, Zap } from "lucide-react";
 import {
   approveMemory,
+  addTaskResourceLock,
   cancelTask,
   createSkill,
   createTask,
@@ -18,6 +19,7 @@ import {
   listTasks,
   pauseTask,
   rejectMemory,
+  removeTaskResourceLock,
   reorderTask,
   reprioritizeTask,
   resumeTask,
@@ -938,6 +940,8 @@ function TaskEditForm({ task }: { task: Task }) {
 }
 
 function TaskHistoryPanel({ taskId }: { taskId: string }) {
+  const queryClient = useQueryClient();
+  const [resourceKey, setResourceKey] = useState("");
   const history = useQuery({
     queryKey: ["task-history", taskId],
     queryFn: () => getTaskHistory(taskId),
@@ -945,8 +949,22 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const attempts = history.data?.attempts ?? [];
   const attemptEvents = history.data?.attempt_events ?? [];
   const artifacts = history.data?.artifacts ?? [];
+  const resourceLocks = history.data?.resource_locks ?? [];
   const notes = history.data?.notes ?? [];
   const actions = history.data?.actions ?? [];
+  const addLock = useMutation({
+    mutationFn: (value: string) => addTaskResourceLock(taskId, value),
+    onSuccess: async () => {
+      setResourceKey("");
+      await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+    },
+  });
+  const removeLock = useMutation({
+    mutationFn: (value: string) => removeTaskResourceLock(taskId, value),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+    },
+  });
 
   return (
     <div className="task-history">
@@ -990,6 +1008,45 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && artifacts.length === 0 && <p className="empty">No artifacts yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Resource Locks</h4>
+        <form
+          className="resource-lock-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const value = resourceKey.trim();
+            if (value) {
+              addLock.mutate(value);
+            }
+          }}
+        >
+          <input
+            placeholder="repo:owner/name"
+            value={resourceKey}
+            onChange={(event) => setResourceKey(event.target.value)}
+          />
+          <button disabled={addLock.isPending || !resourceKey.trim()} title="Add resource lock">
+            <Plus size={14} />
+          </button>
+        </form>
+        {resourceLocks.map((lock) => (
+          <div className="history-item resource-lock-item" key={`${lock.task_id}-${lock.resource_key}`}>
+            <div>
+              <strong>{lock.resource_key}</strong>
+              <button
+                disabled={removeLock.isPending}
+                title="Remove resource lock"
+                onClick={() => removeLock.mutate(lock.resource_key)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <p>{lock.lock_mode}</p>
+            <time>{new Date(lock.created_at).toLocaleString()}</time>
+          </div>
+        ))}
+        {!history.isLoading && resourceLocks.length === 0 && <p className="empty">No resource locks yet.</p>}
       </div>
       <div className="history-column">
         <h4>Notes</h4>

@@ -10,6 +10,7 @@ import type {
   TaskMessageResponse,
   TaskNote,
   TaskPoolSummary,
+  TaskResourceLock,
   TaskType,
 } from "./types";
 
@@ -123,6 +124,24 @@ export function addTaskNote(id: string, content: string): Promise<TaskNote> {
   return request<TaskNote>(`/api/tasks/${id}/notes`, {
     method: "POST",
     body: JSON.stringify({ content }),
+  });
+}
+
+export function listTaskResourceLocks(id: string): Promise<TaskResourceLock[]> {
+  return request<TaskResourceLock[]>(`/api/tasks/${id}/resource-locks`);
+}
+
+export function addTaskResourceLock(id: string, resourceKey: string): Promise<TaskResourceLock> {
+  return request<TaskResourceLock>(`/api/tasks/${id}/resource-locks`, {
+    method: "POST",
+    body: JSON.stringify({ resource_key: resourceKey }),
+  });
+}
+
+export function removeTaskResourceLock(id: string, resourceKey: string): Promise<TaskResourceLock> {
+  return request<TaskResourceLock>(`/api/tasks/${id}/resource-locks`, {
+    method: "DELETE",
+    body: JSON.stringify({ resource_key: resourceKey }),
   });
 }
 

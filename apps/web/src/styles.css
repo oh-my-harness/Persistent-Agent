@@ -731,6 +731,34 @@ textarea {
   white-space: pre-wrap;
 }
 
+.resource-lock-form {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) 34px;
+}
+
+.resource-lock-form input {
+  min-width: 0;
+}
+
+.resource-lock-form button,
+.resource-lock-item button {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0;
+}
+
+.resource-lock-item button {
+  min-height: 28px;
+  width: 28px;
+}
+
+.resource-lock-item strong {
+  overflow-wrap: anywhere;
+}
+
 .event-panel {
   grid-column: 1 / -1;
 }
