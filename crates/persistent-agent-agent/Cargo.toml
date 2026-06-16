@@ -12,3 +12,6 @@ persistent-agent-domain = { path = "../persistent-agent-domain" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

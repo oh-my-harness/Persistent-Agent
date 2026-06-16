@@ -129,6 +129,59 @@ impl MainAgent {
                 changed_tasks.push(task);
                 reply
             }
+            MainAgentIntent::PauseTask { selector } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.pause_task(task.id).await?;
+                    let reply = format!("Paused task '{}'.", task.title);
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::ResumeTask { selector } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.resume_task(task.id).await?;
+                    let reply = format!("Resumed task '{}'.", task.title);
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::CancelTask { selector } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.cancel_task(task.id).await?;
+                    let reply = format!("Cancelled task '{}'.", task.title);
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::ReprioritizeTask { selector, priority } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => {
+                        let task = self.reprioritize_task(task.id, priority).await?;
+                        let reply = format!("Set task '{}' priority to {}.", task.title, task.priority);
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    Err(reply) => reply,
+                }
+            }
+            MainAgentIntent::ReorderTask {
+                selector,
+                queue_position,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.reorder_task(task.id, queue_position).await?;
+                    let reply = format!(
+                        "Moved task '{}' to queue position {}.",
+                        task.title, task.queue_position
+                    );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -157,6 +210,37 @@ impl MainAgent {
             assistant_message,
             changed_tasks,
         })
+    }
+
+    async fn find_task(&self, selector: &str) -> anyhow::Result<Result<Task, String>> {
+        let needle = selector.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Err(
+                "Tell me which task to change, by title text or task id.".to_owned(),
+            ));
+        }
+
+        let matches = self
+            .db
+            .list_tasks()
+            .await?
+            .into_iter()
+            .filter(|task| {
+                task.id.to_string().starts_with(&needle)
+                    || task.title.to_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [task] => Ok(Ok(task.clone())),
+            [] => Ok(Err(format!(
+                "I could not find a task matching '{selector}'."
+            ))),
+            _ => Ok(Err(format!(
+                "I found {} tasks matching '{selector}'. Please use a more specific title or id.",
+                matches.len()
+            ))),
+        }
     }
 }
 
@@ -195,6 +279,23 @@ enum MainAgentIntent {
         task_type: TaskType,
         priority: i64,
     },
+    PauseTask {
+        selector: String,
+    },
+    ResumeTask {
+        selector: String,
+    },
+    CancelTask {
+        selector: String,
+    },
+    ReprioritizeTask {
+        selector: String,
+        priority: i64,
+    },
+    ReorderTask {
+        selector: String,
+        queue_position: i64,
+    },
     Summarize,
     Help,
 }
@@ -212,13 +313,64 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         return MainAgentIntent::Summarize;
     }
 
-    if normalized.contains("创建")
-        || normalized.contains("新建")
-        || normalized.contains("添加")
-        || normalized.contains("加一个")
-        || normalized.contains("create")
-        || normalized.contains("add task")
+    if let Some(priority) = extract_priority(&normalized) {
+        if !is_create_request(&normalized)
+            && (normalized.contains("reprioritize")
+                || normalized.contains("set priority")
+                || normalized.contains("change priority")
+                || normalized.contains("优先级"))
+        {
+            return MainAgentIntent::ReprioritizeTask {
+                selector: extract_task_selector(trimmed, &["priority", "to", "优先级"]),
+                priority,
+            };
+        }
+    }
+
+    if let Some(queue_position) = extract_queue_position(&normalized) {
+        if !is_create_request(&normalized)
+            && (normalized.contains("reorder")
+                || normalized.contains("queue position")
+                || normalized.contains("move task")
+                || normalized.contains("队列")
+                || normalized.contains("排序"))
+        {
+            return MainAgentIntent::ReorderTask {
+                selector: extract_task_selector(trimmed, &["queue", "position", "to", "队列"]),
+                queue_position,
+            };
+        }
+    }
+
+    if normalized.contains("pause task")
+        || normalized.starts_with("pause ")
+        || normalized.contains("暂停任务")
     {
+        return MainAgentIntent::PauseTask {
+            selector: extract_task_selector(trimmed, &[]),
+        };
+    }
+
+    if normalized.contains("resume task")
+        || normalized.starts_with("resume ")
+        || normalized.contains("unpause task")
+        || normalized.contains("恢复任务")
+    {
+        return MainAgentIntent::ResumeTask {
+            selector: extract_task_selector(trimmed, &[]),
+        };
+    }
+
+    if normalized.contains("cancel task")
+        || normalized.starts_with("cancel ")
+        || normalized.contains("取消任务")
+    {
+        return MainAgentIntent::CancelTask {
+            selector: extract_task_selector(trimmed, &[]),
+        };
+    }
+
+    if is_create_request(&normalized) {
         let task_type = if normalized.contains("循环")
             || normalized.contains("定期")
             || normalized.contains("recurring")
@@ -241,6 +393,15 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     MainAgentIntent::Help
+}
+
+fn is_create_request(normalized: &str) -> bool {
+    normalized.contains("创建")
+        || normalized.contains("新建")
+        || normalized.contains("添加")
+        || normalized.contains("加一个")
+        || normalized.contains("create")
+        || normalized.contains("add task")
 }
 
 fn extract_title(content: &str) -> String {
@@ -270,6 +431,52 @@ fn extract_title(content: &str) -> String {
     }
 }
 
+fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
+    let normalized = content.to_lowercase();
+    let action_words = [
+        "reprioritize",
+        "set priority",
+        "change priority",
+        "reorder",
+        "move task",
+        "pause task",
+        "pause",
+        "resume task",
+        "resume",
+        "unpause task",
+        "cancel task",
+        "cancel",
+        "task",
+        "任务",
+        "暂停",
+        "恢复",
+        "取消",
+    ];
+
+    let mut start = 0;
+    for word in action_words {
+        if let Some(index) = normalized.find(word) {
+            start = (index + word.len()).max(start);
+        }
+    }
+
+    let mut selector = content[start..].trim().trim_matches(['"', '\'']).to_owned();
+    let selector_lower = selector.to_lowercase();
+    let mut end = selector.len();
+    for word in stop_words {
+        if let Some(index) = selector_lower.find(word) {
+            end = end.min(index);
+        }
+    }
+    selector.truncate(end);
+
+    selector
+        .trim()
+        .trim_matches([':', ',', '.', '：', '，', '"', '\''])
+        .trim()
+        .to_owned()
+}
+
 fn clamp_title(title: &str) -> String {
     let mut chars = title.chars();
     let clipped: String = chars.by_ref().take(80).collect();
@@ -297,9 +504,27 @@ fn extract_priority(normalized: &str) -> Option<i64> {
     None
 }
 
+fn extract_queue_position(normalized: &str) -> Option<i64> {
+    for marker in ["queue position", "queue", "position", "队列", "排序"] {
+        if let Some(index) = normalized.find(marker) {
+            let after = &normalized[index + marker.len()..];
+            let digits: String = after
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit() && *ch != '-')
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+                .collect();
+            if let Ok(value) = digits.parse() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use persistent_agent_db::Db;
 
     #[test]
     fn parses_create_task_with_priority() {
@@ -334,5 +559,71 @@ mod tests {
     #[test]
     fn parses_task_pool_summary() {
         assert_eq!(parse_intent("总结任务池"), MainAgentIntent::Summarize);
+    }
+
+    #[test]
+    fn parses_task_management_intents() {
+        assert_eq!(
+            parse_intent("pause task Check GitHub issues"),
+            MainAgentIntent::PauseTask {
+                selector: "Check GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("resume task Check GitHub issues"),
+            MainAgentIntent::ResumeTask {
+                selector: "Check GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("cancel task Check GitHub issues"),
+            MainAgentIntent::CancelTask {
+                selector: "Check GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("set priority task Check GitHub issues to 8"),
+            MainAgentIntent::ReprioritizeTask {
+                selector: "Check GitHub issues".to_owned(),
+                priority: 8,
+            }
+        );
+        assert_eq!(
+            parse_intent("reorder task Check GitHub issues queue 4"),
+            MainAgentIntent::ReorderTask {
+                selector: "Check GitHub issues".to_owned(),
+                queue_position: 4,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Check GitHub issues".to_owned(),
+                description: "Look for open issues".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "pause task Check GitHub issues".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Paused);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Paused task"));
+
+        Ok(())
     }
 }

@@ -304,7 +304,7 @@ function MainAgentChat() {
         <input
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          placeholder="Ask the main agent to create or summarize tasks"
+          placeholder="Ask the main agent to create, pause, resume, reprioritize, or summarize tasks"
         />
         <button className="primary icon-button" type="submit" disabled={mutation.isPending}>
           <Send size={16} />
