@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 const ZH_SUMMARY: &str = "\u{603b}\u{7ed3}";
 const ZH_OVERVIEW: &str = "\u{6982}\u{89c8}";
 const ZH_TASK_POOL: &str = "\u{4efb}\u{52a1}\u{6c60}";
+const ZH_LIST: &str = "\u{5217}\u{51fa}";
 const ZH_CREATE: &str = "\u{521b}\u{5efa}";
 const ZH_NEW: &str = "\u{65b0}\u{5efa}";
 const ZH_ADD: &str = "\u{6dfb}\u{52a0}";
@@ -161,6 +162,19 @@ impl MainAgent {
         }
 
         Ok(summary)
+    }
+
+    pub async fn list_task_pool(&self) -> anyhow::Result<Vec<Task>> {
+        let tasks = self.db.list_tasks().await?;
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_tasks",
+                serde_json::json!({ "count": tasks.len() }),
+            )
+            .await?;
+        Ok(tasks)
     }
 
     pub async fn main_conversation_messages(
@@ -352,8 +366,12 @@ impl MainAgent {
                     summary.paused
                 )
             }
+            MainAgentIntent::ListTasks => {
+                let tasks = self.list_task_pool().await?;
+                format_task_list(&tasks)
+            }
             MainAgentIntent::Help => {
-                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: add note to task Deploy release: wait for staging approval.".to_owned()
+                "I can create tasks, list tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: list tasks.".to_owned()
             }
         };
 
@@ -470,6 +488,7 @@ enum MainAgentIntent {
         selector: String,
         content: String,
     },
+    ListTasks,
     Summarize,
     Help,
 }
@@ -489,6 +508,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         ],
     ) {
         return MainAgentIntent::Summarize;
+    }
+
+    if is_list_tasks_request(&normalized) {
+        return MainAgentIntent::ListTasks;
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
@@ -669,6 +692,45 @@ fn is_convert_request(normalized: &str) -> bool {
             ZH_SET_AS,
         ],
     )
+}
+
+fn is_list_tasks_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "list tasks",
+            "show tasks",
+            "show task list",
+            "task list",
+            "queue list",
+            ZH_LIST,
+            "\u{4efb}\u{52a1}\u{5217}\u{8868}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
+fn format_task_list(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "Task pool is empty.".to_owned();
+    }
+
+    let mut lines = vec![format!("Task pool has {} task(s):", tasks.len())];
+    for task in tasks.iter().take(10) {
+        lines.push(format!(
+            "- {} [{} {} priority {} queue {}] {}",
+            task.id.to_string().chars().take(8).collect::<String>(),
+            task.status,
+            task.task_type,
+            task.priority,
+            task.queue_position,
+            task.title
+        ));
+    }
+    if tasks.len() > 10 {
+        lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+
+    lines.join("\n")
 }
 
 fn parse_dependency_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
@@ -998,6 +1060,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_list_intents() {
+        assert_eq!(parse_intent("list tasks"), MainAgentIntent::ListTasks);
+        assert_eq!(
+            parse_intent("\u{5217}\u{51fa}\u{4efb}\u{52a1}"),
+            MainAgentIntent::ListTasks
+        );
+    }
+
+    #[test]
     fn parses_task_management_intents() {
         assert_eq!(
             parse_intent("pause task Check GitHub issues"),
@@ -1307,6 +1378,51 @@ mod tests {
         assert_eq!(notes[0].content, "wait for staging approval");
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Added note"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_tasks_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        agent
+            .create_task(CreateTask {
+                title: "Check repository issues".to_owned(),
+                description: "Look for open issues".to_owned(),
+                task_type: TaskType::Recurring,
+                priority: 3,
+                requested_skills: Vec::new(),
+                schedule: Some(serde_json::json!({ "interval_seconds": 300 })),
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "list tasks".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task pool has 1")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Check repository issues")
+        );
+        assert!(response.assistant_message.content.contains("recurring"));
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "list_tasks")
+        );
 
         Ok(())
     }

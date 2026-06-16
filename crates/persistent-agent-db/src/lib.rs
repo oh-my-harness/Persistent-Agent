@@ -830,6 +830,20 @@ impl Db {
         rows.into_iter().map(row_to_task_action).collect()
     }
 
+    pub async fn list_global_actions(&self) -> anyhow::Result<Vec<TaskAction>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_actions
+            WHERE task_id IS NULL
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_action).collect()
+    }
+
     pub async fn get_or_create_main_conversation(&self) -> anyhow::Result<Conversation> {
         if let Some(conversation) = self.get_main_conversation().await? {
             return Ok(conversation);
