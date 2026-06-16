@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, Check, CirclePause, History, ListTodo, Pencil, Play, Plus, RotateCw, Send, SquareX, X, Zap } from "lucide-react";
 import {
+  addTaskDependency,
   approveMemory,
   addTaskResourceLock,
   cancelTask,
@@ -20,6 +21,7 @@ import {
   listTasks,
   pauseTask,
   rejectMemory,
+  removeTaskDependency,
   removeTaskResourceLock,
   reorderTask,
   reprioritizeTask,
@@ -1037,6 +1039,7 @@ function TaskEditForm({ task }: { task: Task }) {
 
 function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const queryClient = useQueryClient();
+  const [dependencyTaskId, setDependencyTaskId] = useState("");
   const [resourceKey, setResourceKey] = useState("");
   const history = useQuery({
     queryKey: ["task-history", taskId],
@@ -1046,6 +1049,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const attemptEvents = history.data?.attempt_events ?? [];
   const artifacts = history.data?.artifacts ?? [];
   const memoryCandidates = history.data?.memory_candidates ?? [];
+  const dependencies = history.data?.dependencies ?? [];
   const resourceLocks = history.data?.resource_locks ?? [];
   const notes = history.data?.notes ?? [];
   const actions = history.data?.actions ?? [];
@@ -1054,6 +1058,21 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
     onSuccess: async () => {
       setResourceKey("");
       await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+    },
+  });
+  const addDependency = useMutation({
+    mutationFn: (value: string) => addTaskDependency(taskId, value),
+    onSuccess: async () => {
+      setDependencyTaskId("");
+      await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+  });
+  const removeDependency = useMutation({
+    mutationFn: (value: string) => removeTaskDependency(taskId, value),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
   const removeLock = useMutation({
@@ -1118,6 +1137,45 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && memoryCandidates.length === 0 && <p className="empty">No memory candidates yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Dependencies</h4>
+        <form
+          className="resource-lock-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const value = dependencyTaskId.trim();
+            if (value) {
+              addDependency.mutate(value);
+            }
+          }}
+        >
+          <input
+            placeholder="depends_on_task_id"
+            value={dependencyTaskId}
+            onChange={(event) => setDependencyTaskId(event.target.value)}
+          />
+          <button disabled={addDependency.isPending || !dependencyTaskId.trim()} title="Add dependency">
+            <Plus size={14} />
+          </button>
+        </form>
+        {dependencies.map((dependency) => (
+          <div className="history-item resource-lock-item" key={`${dependency.task_id}-${dependency.depends_on_task_id}`}>
+            <div>
+              <strong>{dependency.depends_on_task_id}</strong>
+              <button
+                disabled={removeDependency.isPending}
+                title="Remove dependency"
+                onClick={() => removeDependency.mutate(dependency.depends_on_task_id)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <p>depends on</p>
+            <time>{new Date(dependency.created_at).toLocaleString()}</time>
+          </div>
+        ))}
+        {!history.isLoading && dependencies.length === 0 && <p className="empty">No dependencies yet.</p>}
       </div>
       <div className="history-column">
         <h4>Resource Locks</h4>
