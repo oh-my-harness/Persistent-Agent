@@ -32,6 +32,9 @@ const ZH_ADJUST: &str = "\u{8c03}\u{6574}";
 const ZH_EXPLAIN: &str = "\u{89e3}\u{91ca}";
 const ZH_WHY: &str = "\u{4e3a}\u{4ec0}\u{4e48}";
 const ZH_STATE: &str = "\u{72b6}\u{6001}";
+const ZH_CLARIFY: &str = "\u{6f84}\u{6e05}";
+const ZH_QUESTION: &str = "\u{95ee}\u{9898}";
+const ZH_NEED: &str = "\u{9700}\u{8981}";
 const ZH_CONVERT_TASK: &str = "\u{8f6c}\u{6362}\u{4efb}\u{52a1}";
 const ZH_CHANGE_TO: &str = "\u{6539}\u{6210}";
 const ZH_CHANGE_AS: &str = "\u{6539}\u{4e3a}";
@@ -141,6 +144,41 @@ impl MainAgent {
 
     pub async fn add_task_note(&self, task_id: TaskId, content: &str) -> anyhow::Result<TaskNote> {
         self.db.add_task_note(task_id, content, "main_agent").await
+    }
+
+    pub async fn request_user_clarification(
+        &self,
+        task_id: TaskId,
+        question: &str,
+    ) -> anyhow::Result<Task> {
+        let task = self.db.get_task(task_id).await?;
+        let question = question.trim();
+        if question.is_empty() {
+            anyhow::bail!("clarification question cannot be empty");
+        }
+
+        if let Some(conversation_id) = task.conversation_id {
+            self.db
+                .add_conversation_message(conversation_id, Some(task_id), "assistant", question)
+                .await?;
+        }
+
+        self.db
+            .record_action(
+                Some(task_id),
+                "main_agent",
+                "request_user_clarification",
+                serde_json::json!({ "question": question }),
+            )
+            .await?;
+        self.db
+            .set_task_status(
+                task_id,
+                TaskStatus::WaitingForUser,
+                "main_agent",
+                Some(question),
+            )
+            .await
     }
 
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
@@ -390,6 +428,19 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::RequestClarification { selector, question } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => {
+                        let task = self.request_user_clarification(task.id, &question).await?;
+                        changed_tasks.push(task.clone());
+                        format!(
+                            "Requested user clarification for '{}': {}",
+                            task.title, question
+                        )
+                    }
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -414,7 +465,7 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::Help => {
-                "I can create tasks, list tasks, explain task state, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: why is task Deploy release not running?".to_owned()
+                "I can create tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: ask clarification for task Deploy release: Which environment should I deploy to?".to_owned()
             }
         };
 
@@ -531,6 +582,10 @@ enum MainAgentIntent {
         selector: String,
         content: String,
     },
+    RequestClarification {
+        selector: String,
+        question: String,
+    },
     ListTasks,
     ExplainTaskPool,
     ExplainTask {
@@ -570,6 +625,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_note_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_clarification_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -1077,6 +1136,58 @@ fn parse_note_intent(content: &str, normalized: &str) -> Option<MainAgentIntent>
         .map(|(selector, content)| MainAgentIntent::AddTaskNote { selector, content })
 }
 
+fn parse_clarification_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "ask clarification",
+            "request clarification",
+            "ask user",
+            "need clarification",
+            ZH_CLARIFY,
+        ],
+    ) {
+        return None;
+    }
+
+    split_clarification_selector_and_question(content)
+        .map(|(selector, question)| MainAgentIntent::RequestClarification { selector, question })
+}
+
+fn split_clarification_selector_and_question(content: &str) -> Option<(String, String)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector_head = if head.contains(ZH_NEED) {
+                head.split(ZH_NEED).next().unwrap_or(head)
+            } else if head.contains(ZH_CLARIFY) {
+                head.split(ZH_CLARIFY).next().unwrap_or(head)
+            } else {
+                head
+            };
+            let selector = extract_task_selector(
+                selector_head,
+                &[
+                    "ask",
+                    "request",
+                    "clarification",
+                    "user",
+                    "for",
+                    "about",
+                    ZH_CLARIFY,
+                    ZH_QUESTION,
+                    ZH_TO,
+                ],
+            );
+            let question = tail.trim();
+            if !selector.is_empty() && !question.is_empty() {
+                return Some((selector, question.to_owned()));
+            }
+        }
+    }
+
+    None
+}
+
 fn split_note_selector_and_content(content: &str) -> Option<(String, String)> {
     for separator in ["\u{ff1a}", ":", "\n"] {
         if let Some((head, tail)) = content.split_once(separator) {
@@ -1173,6 +1284,12 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "note to task",
         "note task",
         "note",
+        "ask clarification for task",
+        "request clarification for task",
+        "ask user for task",
+        "ask clarification",
+        "request clarification",
+        "ask user",
         "reprioritize",
         "set priority",
         "change priority",
@@ -1192,6 +1309,9 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         ZH_RESUME,
         ZH_CANCEL,
         ZH_NOTE,
+        ZH_CLARIFY,
+        ZH_QUESTION,
+        ZH_NEED,
         ZH_ADJUST,
         ZH_MOVE,
         ZH_CHANGE_TO,
@@ -1513,6 +1633,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_clarification_intents() {
+        assert_eq!(
+            parse_intent("ask clarification for task Deploy release: Which environment?"),
+            MainAgentIntent::RequestClarification {
+                selector: "Deploy release".to_owned(),
+                question: "Which environment?".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}\u{8981}\u{53d1}\u{5e03}\u{5230}\u{54ea}\u{4e2a}\u{73af}\u{5883}\u{ff1f}"
+            ),
+            MainAgentIntent::RequestClarification {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                question:
+                    "\u{8981}\u{53d1}\u{5e03}\u{5230}\u{54ea}\u{4e2a}\u{73af}\u{5883}\u{ff1f}"
+                        .to_owned(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
@@ -1808,6 +1950,52 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "explain_task_state")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_request_user_clarification() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "ask clarification for task Deploy release: Which environment?".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 20).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::WaitingForUser);
+        assert_eq!(
+            updated.blocked_reason.as_deref(),
+            Some("Which environment?")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "assistant"
+                    && message.content == "Which environment?")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "request_user_clarification")
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
 
         Ok(())
     }
