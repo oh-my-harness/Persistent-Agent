@@ -763,6 +763,38 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.execution-state {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-bottom: 12px;
+}
+
+.execution-state-item {
+  background: #f7f9fa;
+  border: 1px solid #e1e7ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.execution-state-item span {
+  color: #657680;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.execution-state-item strong {
+  color: #172026;
+  overflow-wrap: anywhere;
+}
+
+.execution-state-item small {
+  color: #52636c;
+}
+
 .event-timeline {
   display: grid;
   gap: 10px;

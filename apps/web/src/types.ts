@@ -56,6 +56,14 @@ export interface SchedulerTick {
     | { type: "failed"; error: string };
 }
 
+export interface SchedulerState {
+  running_tasks: Task[];
+  next_queued_task?: Task | null;
+  queued_count: number;
+  waiting_for_user_count: number;
+  waiting_for_schedule_count: number;
+}
+
 export type AppEvent =
   | { type: "task_changed"; task: Task }
   | { type: "main_agent_reply"; message: ConversationMessage }

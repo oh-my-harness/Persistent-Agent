@@ -110,6 +110,7 @@ REST:
 - skill CRUD;
 - memory review and editing;
 - manual scheduler trigger.
+- scheduler state summary.
 
 SSE:
 
@@ -305,7 +306,7 @@ MVP screens:
 - task detail: metadata, attempt history, logs, artifacts, linked conversation;
 - main conversation: user talks with the main agent to create, update, prioritize, pause, resume, or discuss tasks;
 - task conversation: user replies for blocked tasks and active task discussion;
-- execution monitor: current run, events, tool calls, output stream;
+- execution monitor: current run, next queued task, events, tool calls, output stream;
 - skills: list, create/edit, activation rules, tool subsets;
 - memory: pending candidates, approved memories, edit/delete.
 

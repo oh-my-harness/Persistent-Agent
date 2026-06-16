@@ -2,6 +2,7 @@ import type {
   ConversationMessage,
   MainAgentMessageResponse,
   Memory,
+  SchedulerState,
   SchedulerTick,
   Skill,
   Task,
@@ -147,6 +148,10 @@ export function removeTaskResourceLock(id: string, resourceKey: string): Promise
 
 export function runSchedulerTick(): Promise<SchedulerTick> {
   return request<SchedulerTick>("/api/scheduler/tick", { method: "POST" });
+}
+
+export function getSchedulerState(): Promise<SchedulerState> {
+  return request<SchedulerState>("/api/scheduler/state");
 }
 
 export function listMainAgentMessages(): Promise<ConversationMessage[]> {

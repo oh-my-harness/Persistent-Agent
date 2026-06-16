@@ -12,6 +12,7 @@ import {
   deleteSkill,
   getTaskHistory,
   getTaskPoolSummary,
+  getSchedulerState,
   listMainAgentMessages,
   listMemories,
   listSkills,
@@ -30,7 +31,7 @@ import {
   updateSkill,
   updateTask,
 } from "./api";
-import type { AppEvent, ConversationMessage, Memory, SchedulerTick, Task, TaskType } from "./types";
+import type { AppEvent, ConversationMessage, Memory, SchedulerState, SchedulerTick, Task, TaskType } from "./types";
 import type { Skill } from "./types";
 import "./styles.css";
 
@@ -50,6 +51,11 @@ function Shell() {
 
   const tasks = useQuery({ queryKey: ["tasks"], queryFn: listTasks });
   const summary = useQuery({ queryKey: ["summary"], queryFn: getTaskPoolSummary });
+  const schedulerState = useQuery({
+    queryKey: ["scheduler-state"],
+    queryFn: getSchedulerState,
+    refetchInterval: 10_000,
+  });
 
   useEffect(() => {
     const source = new EventSource("/api/events");
@@ -58,6 +64,7 @@ function Shell() {
       setEventLog((current) => [toTimelineEvent(parsed, event.data), ...current].slice(0, 20));
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
+      void queryClient.invalidateQueries({ queryKey: ["scheduler-state"] });
       void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
       void queryClient.invalidateQueries({ queryKey: ["memories"] });
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
@@ -134,6 +141,7 @@ function Shell() {
               <h2>Execution Monitor</h2>
               <span>SSE</span>
             </div>
+            <ExecutionStatePanel state={schedulerState.data} loading={schedulerState.isLoading} />
             <EventTimeline events={eventLog} />
           </section>
         </section>
@@ -649,6 +657,35 @@ function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): Timelin
   }
 }
 
+function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: SchedulerState }) {
+  const running = state?.running_tasks ?? [];
+  const primaryRunning = running[0];
+  const nextQueued = state?.next_queued_task;
+
+  return (
+    <div className="execution-state">
+      <div className="execution-state-item">
+        <span>Current run</span>
+        <strong>{loading ? "Loading" : primaryRunning?.title ?? "Idle"}</strong>
+        {running.length > 1 && <small>{running.length} running tasks</small>}
+      </div>
+      <div className="execution-state-item">
+        <span>Next queued</span>
+        <strong>{nextQueued?.title ?? "None"}</strong>
+        <small>{state ? `${state.queued_count} queued` : "Waiting for state"}</small>
+      </div>
+      <div className="execution-state-item">
+        <span>Needs user</span>
+        <strong>{state?.waiting_for_user_count ?? 0}</strong>
+      </div>
+      <div className="execution-state-item">
+        <span>Scheduled</span>
+        <strong>{state?.waiting_for_schedule_count ?? 0}</strong>
+      </div>
+    </div>
+  );
+}
+
 function taskEventTone(status: Task["status"]): TimelineEvent["tone"] {
   if (status === "completed") return "success";
   if (status === "failed" || status === "cancelled") return "danger";
@@ -1133,6 +1170,7 @@ function SchedulerButton() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["summary"] });
+      await queryClient.invalidateQueries({ queryKey: ["scheduler-state"] });
     },
   });
 

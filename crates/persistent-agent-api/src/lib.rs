@@ -133,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memories/{id}/reject", post(reject_memory))
         .route("/api/skills", get(list_skills).post(create_skill))
         .route("/api/skills/{id}", patch(update_skill).delete(delete_skill))
+        .route("/api/scheduler/state", get(scheduler_state))
         .route("/api/scheduler/tick", post(run_scheduler_tick))
         .route("/api/events", get(events))
         .layer(CorsLayer::permissive())
@@ -495,6 +496,51 @@ async fn run_scheduler_tick(
         .events
         .send(AppEvent::SchedulerTick { tick: tick.clone() });
     Ok(Json(tick))
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerStateResponse {
+    running_tasks: Vec<Task>,
+    next_queued_task: Option<Task>,
+    queued_count: usize,
+    waiting_for_user_count: usize,
+    waiting_for_schedule_count: usize,
+}
+
+async fn scheduler_state(
+    State(state): State<AppState>,
+) -> Result<Json<SchedulerStateResponse>, ApiError> {
+    let tasks = state.db.list_tasks().await?;
+    let mut queued_tasks = tasks
+        .iter()
+        .filter(|task| task.status == persistent_agent_domain::TaskStatus::Queued)
+        .cloned()
+        .collect::<Vec<_>>();
+    queued_tasks.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.queue_position.cmp(&right.queue_position))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+
+    Ok(Json(SchedulerStateResponse {
+        running_tasks: tasks
+            .iter()
+            .filter(|task| task.status == persistent_agent_domain::TaskStatus::Running)
+            .cloned()
+            .collect(),
+        next_queued_task: queued_tasks.first().cloned(),
+        queued_count: queued_tasks.len(),
+        waiting_for_user_count: tasks
+            .iter()
+            .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForUser)
+            .count(),
+        waiting_for_schedule_count: tasks
+            .iter()
+            .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForSchedule)
+            .count(),
+    }))
 }
 
 async fn list_memories(State(state): State<AppState>) -> Result<Json<Vec<Memory>>, ApiError> {
