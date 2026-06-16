@@ -87,6 +87,7 @@ export interface MainAgentMessageResponse {
   user_message: ConversationMessage;
   assistant_message: ConversationMessage;
   changed_tasks: Task[];
+  scheduler_tick_requested: boolean;
 }
 
 export interface TaskMessageResponse {

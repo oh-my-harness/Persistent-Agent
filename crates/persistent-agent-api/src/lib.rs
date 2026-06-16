@@ -487,6 +487,12 @@ async fn send_main_agent_message(
     state.events.send(AppEvent::MainAgentReply {
         message: response.assistant_message.clone(),
     });
+    if response.scheduler_tick_requested {
+        let tick = state.scheduler.tick().await?;
+        state
+            .events
+            .send(AppEvent::SchedulerTick { tick: tick.clone() });
+    }
     Ok(Json(response))
 }
 

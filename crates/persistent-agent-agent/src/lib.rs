@@ -56,6 +56,9 @@ const ZH_APPROVE: &str = "\u{91c7}\u{7eb3}";
 const ZH_ACCEPT: &str = "\u{63a5}\u{53d7}";
 const ZH_REJECT: &str = "\u{62d2}\u{7edd}";
 const ZH_SKILL: &str = "\u{6280}\u{80fd}";
+const ZH_SCAN: &str = "\u{626b}\u{63cf}";
+const ZH_RUN: &str = "\u{8fd0}\u{884c}";
+const ZH_SCHEDULER: &str = "\u{8c03}\u{5ea6}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -379,6 +382,7 @@ impl MainAgent {
             .await?;
 
         let intent = parse_intent(&input.content);
+        let scheduler_tick_requested = matches!(intent, MainAgentIntent::RunSchedulerTick);
         let mut changed_tasks = Vec::new();
         let reply = match intent {
             MainAgentIntent::SplitTasks { titles } => {
@@ -673,8 +677,12 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::RunSchedulerTick => {
+                "Scheduler scan requested. I will ask the scheduler to check the task pool now."
+                    .to_owned()
+            }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -688,6 +696,7 @@ impl MainAgent {
             user_message,
             assistant_message,
             changed_tasks,
+            scheduler_tick_requested,
         })
     }
 
@@ -777,6 +786,7 @@ pub struct MainAgentMessageResponse {
     pub user_message: ConversationMessage,
     pub assistant_message: ConversationMessage,
     pub changed_tasks: Vec<Task>,
+    pub scheduler_tick_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -856,6 +866,7 @@ enum MainAgentIntent {
     RejectMemory {
         selector: String,
     },
+    RunSchedulerTick,
     Summarize,
     Help,
 }
@@ -870,6 +881,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(intent) = parse_split_intent(trimmed, &normalized) {
         return intent;
+    }
+
+    if is_scheduler_scan_request(&normalized) {
+        return MainAgentIntent::RunSchedulerTick;
     }
 
     if contains_any(
@@ -1177,6 +1192,34 @@ fn is_list_tasks_request(normalized: &str) -> bool {
             "queue list",
             ZH_LIST,
             "\u{4efb}\u{52a1}\u{5217}\u{8868}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
+fn is_scheduler_scan_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "run scheduler",
+            "scheduler tick",
+            "scheduler scan",
+            "scan task pool",
+            "scan tasks",
+            "check task pool now",
+            "run task pool",
+            ZH_SCAN,
+            ZH_RUN,
+            ZH_SCHEDULER,
+        ],
+    ) && contains_any(
+        normalized,
+        &[
+            "scheduler",
+            "task pool",
+            "tasks",
+            ZH_SCHEDULER,
+            ZH_TASK_POOL,
+            ZH_TASK,
         ],
     ) && !is_create_request(normalized)
 }
@@ -2236,6 +2279,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_scheduler_scan_intents() {
+        assert_eq!(
+            parse_intent("run scheduler tick"),
+            MainAgentIntent::RunSchedulerTick
+        );
+        assert_eq!(
+            parse_intent("\u{626b}\u{63cf}\u{4efb}\u{52a1}\u{6c60}"),
+            MainAgentIntent::RunSchedulerTick
+        );
+    }
+
+    #[test]
     fn parses_explain_intents() {
         assert_eq!(
             parse_intent("explain task pool state"),
@@ -2867,6 +2922,28 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "list_tasks")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_request_scheduler_scan_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db);
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "run scheduler tick".to_owned(),
+            })
+            .await?;
+
+        assert!(response.scheduler_tick_requested);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Scheduler scan requested")
         );
 
         Ok(())

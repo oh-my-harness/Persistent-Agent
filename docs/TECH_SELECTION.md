@@ -208,7 +208,7 @@ It should:
 - split vague user requests into concrete task proposals;
 - summarize the task pool and explain why work is or is not running;
 - perform lightweight local inspection when that helps task planning;
-- scan runnable tasks;
+- scan runnable tasks through scheduled ticks, manual API calls, or main-agent conversation requests;
 - claim a task lease;
 - resolve requested and matched skills;
 - construct or request a worker agent;
