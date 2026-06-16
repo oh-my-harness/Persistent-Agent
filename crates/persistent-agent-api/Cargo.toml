@@ -1,0 +1,22 @@
+[package]
+name = "persistent-agent-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+persistent-agent-agent = { path = "../persistent-agent-agent" }
+persistent-agent-db = { path = "../persistent-agent-db" }
+persistent-agent-domain = { path = "../persistent-agent-domain" }
+persistent-agent-scheduler = { path = "../persistent-agent-scheduler" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true

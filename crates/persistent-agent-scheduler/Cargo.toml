@@ -1,0 +1,16 @@
+[package]
+name = "persistent-agent-scheduler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+persistent-agent-db = { path = "../persistent-agent-db" }
+persistent-agent-domain = { path = "../persistent-agent-domain" }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

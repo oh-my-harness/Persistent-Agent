@@ -8,6 +8,33 @@ The first milestone focuses on reliable serial execution. The architecture shoul
 
 - [Technical Selection](docs/TECH_SELECTION.md)
 
+## Current Implementation
+
+The repository now contains the first executable skeleton:
+
+- Rust workspace backend under `crates/` and `apps/server`.
+- SQLite migrations and repositories for task lifecycle state.
+- Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
+- Serial scheduler tick with a stub worker that exercises task claiming, attempts, completion, and event emission.
+- Axum API with REST endpoints and an SSE event stream.
+- Vite React Web UI under `apps/web`.
+
+Run the backend:
+
+```powershell
+cargo run -p persistent-agent-server
+```
+
+Run the Web UI:
+
+```powershell
+cd apps/web
+npm install
+npm run dev
+```
+
+The Web UI defaults to <http://127.0.0.1:5173> and proxies API calls to <http://127.0.0.1:8080>.
+
 ## Product Goals
 
 1. Let users create, prioritize, inspect, and discuss tasks through both conversation and structured UI controls.

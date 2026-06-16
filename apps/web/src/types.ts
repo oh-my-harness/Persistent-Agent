@@ -1,0 +1,52 @@
+export type TaskType = "one_off" | "recurring";
+
+export type TaskStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "waiting_for_user"
+  | "waiting_for_schedule"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "paused";
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string;
+  task_type: TaskType;
+  status: TaskStatus;
+  priority: number;
+  queue_position: number;
+  created_by: string;
+  conversation_id?: string | null;
+  requested_skills: string[];
+  matched_skills: string[];
+  schedule?: unknown;
+  attempt_count: number;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  blocked_reason?: string | null;
+  result_summary?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskPoolSummary {
+  total: number;
+  draft: number;
+  queued: number;
+  running: number;
+  waiting_for_user: number;
+  waiting_for_schedule: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  paused: number;
+}
+
+export interface SchedulerTick {
+  claimed_task?: Task | null;
+  outcome: { type: "idle" } | { type: "completed"; summary: string } | { type: "blocked"; reason: string };
+}

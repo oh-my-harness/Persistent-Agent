@@ -1,0 +1,31 @@
+[workspace]
+members = [
+  "apps/server",
+  "crates/persistent-agent-agent",
+  "crates/persistent-agent-api",
+  "crates/persistent-agent-db",
+  "crates/persistent-agent-domain",
+  "crates/persistent-agent-scheduler",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/oh-my-harness/Persistent-Agent"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
