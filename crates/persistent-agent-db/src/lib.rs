@@ -366,6 +366,35 @@ impl Db {
         self.get_task(task.id).await.map(Some)
     }
 
+    pub async fn heartbeat_task_lease(
+        &self,
+        id: TaskId,
+        lease_owner: &str,
+        lease_seconds: i64,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let now = Utc::now();
+        let lease_expires_at = now + Duration::seconds(lease_seconds.max(1));
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running' AND lease_owner = ?
+            "#,
+        )
+        .bind(lease_expires_at)
+        .bind(now)
+        .bind(id.to_string())
+        .bind(lease_owner)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(lease_expires_at))
+        }
+    }
+
     pub async fn requeue_due_recurring_tasks(&self, actor: &str) -> anyhow::Result<Vec<Task>> {
         let now = Utc::now();
         let rows = sqlx::query(
@@ -2003,6 +2032,39 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "fail_task")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_task_lease_can_be_refreshed_by_owner() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Heartbeat check".to_owned(),
+                    description: "Refresh running lease".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.claim_next_runnable("worker-a", 1).await?;
+
+        let wrong_owner = db.heartbeat_task_lease(task.id, "worker-b", 60).await?;
+        let refreshed = db.heartbeat_task_lease(task.id, "worker-a", 60).await?;
+
+        assert!(wrong_owner.is_none());
+        assert!(refreshed.is_some());
+
+        db.complete_task(task.id, "done", "worker-a").await?;
+
+        let completed = db.heartbeat_task_lease(task.id, "worker-a", 60).await?;
+        assert!(completed.is_none());
 
         Ok(())
     }

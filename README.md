@@ -26,7 +26,8 @@ The repository now contains the first executable skeleton:
 - DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
-- Worker attempt event logs for context preparation, completion, and blockers.
+- Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
+- Running task leases are refreshed while workers execute, preventing long attempts from looking stale.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill context for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep};
 
 #[derive(Clone)]
 pub struct Scheduler<W> {
@@ -124,7 +125,10 @@ where
                 }),
             )
             .await?;
-        let result = match self.worker.execute(task.clone(), context).await {
+        let result = match self
+            .execute_worker_with_heartbeat(task.clone(), context, attempt.id)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 let error = error.to_string();
@@ -238,6 +242,59 @@ where
             }
         }
     }
+
+    async fn execute_worker_with_heartbeat(
+        &self,
+        task: Task,
+        context: WorkerContext,
+        attempt_id: persistent_agent_domain::TaskAttemptId,
+    ) -> anyhow::Result<WorkerResult> {
+        let task_id = task.id;
+        let worker = self.worker.clone();
+        let worker_task = tokio::spawn(async move { worker.execute(task, context).await });
+        tokio::pin!(worker_task);
+
+        let heartbeat_every = heartbeat_interval(self.policy.lease_seconds);
+        let heartbeat_delay = sleep(heartbeat_every);
+        tokio::pin!(heartbeat_delay);
+
+        loop {
+            tokio::select! {
+                result = &mut worker_task => {
+                    return result?;
+                }
+                _ = &mut heartbeat_delay => {
+                    match self
+                        .db
+                        .heartbeat_task_lease(task_id, &self.lease_owner, self.policy.lease_seconds)
+                        .await
+                    {
+                        Ok(Some(lease_expires_at)) => {
+                            if let Err(error) = self.db
+                                .record_attempt_event(
+                                    attempt_id,
+                                    task_id,
+                                    "worker_heartbeat",
+                                    "Refreshed running task lease.",
+                                    json!({ "lease_owner": self.lease_owner, "lease_expires_at": lease_expires_at }),
+                                )
+                                .await
+                            {
+                                tracing::warn!(task_id = %task_id, %error, "failed to record worker heartbeat event");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(task_id = %task_id, %error, "failed to refresh running task lease");
+                        }
+                    }
+                    heartbeat_delay
+                        .as_mut()
+                        .reset(Instant::now() + heartbeat_every);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -250,6 +307,11 @@ pub struct WorkerContext {
     pub memories: Vec<Memory>,
     pub notes: Vec<TaskNote>,
     pub conversation_messages: Vec<ConversationMessage>,
+}
+
+fn heartbeat_interval(lease_seconds: i64) -> std::time::Duration {
+    let seconds = (lease_seconds.max(1) / 3).clamp(1, 60) as u64;
+    std::time::Duration::from_secs(seconds)
 }
 
 #[derive(Debug, Clone)]
@@ -1259,6 +1321,66 @@ mod tests {
         first?;
         second?;
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct DelayedWorker {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl TaskWorker for DelayedWorker {
+        async fn execute(
+            &self,
+            task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            tokio::time::sleep(self.delay).await;
+            Ok(WorkerResult::Completed {
+                summary: format!("completed {}", task.title),
+                memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_refreshes_running_task_lease() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Long running work".to_owned(),
+                    description: "Run long enough for heartbeat".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let scheduler = Scheduler::with_policy(
+            db.clone(),
+            DelayedWorker {
+                delay: Duration::from_millis(1_100),
+            },
+            SchedulerPolicy::new(1, 1),
+        );
+
+        let tick = scheduler.tick().await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(tick.outcome, SchedulerOutcome::Completed { .. }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_heartbeat")
+        );
 
         Ok(())
     }
