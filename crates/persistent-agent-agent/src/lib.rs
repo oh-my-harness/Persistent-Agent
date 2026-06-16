@@ -55,6 +55,7 @@ const ZH_LONG_TERM_MEMORY: &str = "\u{957f}\u{671f}\u{8bb0}\u{5fc6}";
 const ZH_APPROVE: &str = "\u{91c7}\u{7eb3}";
 const ZH_ACCEPT: &str = "\u{63a5}\u{53d7}";
 const ZH_REJECT: &str = "\u{62d2}\u{7edd}";
+const ZH_SKILL: &str = "\u{6280}\u{80fd}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -153,6 +154,69 @@ impl MainAgent {
 
     pub async fn add_task_note(&self, task_id: TaskId, content: &str) -> anyhow::Result<TaskNote> {
         self.db.add_task_note(task_id, content, "main_agent").await
+    }
+
+    pub async fn add_requested_skills(
+        &self,
+        task_id: TaskId,
+        skill_names: Vec<String>,
+    ) -> anyhow::Result<Task> {
+        let task = self.db.get_task(task_id).await?;
+        let mut requested_skills = task.requested_skills;
+        for skill_name in normalize_skill_names(skill_names) {
+            if !requested_skills
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&skill_name))
+            {
+                requested_skills.push(skill_name);
+            }
+        }
+
+        self.db
+            .update_task(
+                task_id,
+                UpdateTask {
+                    title: None,
+                    description: None,
+                    priority: None,
+                    requested_skills: Some(requested_skills),
+                    schedule: None,
+                },
+                "main_agent",
+            )
+            .await
+    }
+
+    pub async fn remove_requested_skills(
+        &self,
+        task_id: TaskId,
+        skill_names: Vec<String>,
+    ) -> anyhow::Result<Task> {
+        let task = self.db.get_task(task_id).await?;
+        let skill_names = normalize_skill_names(skill_names);
+        let requested_skills = task
+            .requested_skills
+            .into_iter()
+            .filter(|existing| {
+                !skill_names
+                    .iter()
+                    .any(|skill_name| existing.eq_ignore_ascii_case(skill_name))
+            })
+            .collect();
+
+        self.db
+            .update_task(
+                task_id,
+                UpdateTask {
+                    title: None,
+                    description: None,
+                    priority: None,
+                    requested_skills: Some(requested_skills),
+                    schedule: None,
+                },
+                "main_agent",
+            )
+            .await
     }
 
     pub async fn add_task_resource_lock(
@@ -486,6 +550,38 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::AddRequestedSkills {
+                selector,
+                skill_names,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.add_requested_skills(task.id, skill_names).await?;
+                    let reply = format!(
+                        "Updated requested skills for '{}': {}.",
+                        task.title,
+                        format_skill_list(&task.requested_skills)
+                    );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::RemoveRequestedSkills {
+                selector,
+                skill_names,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.remove_requested_skills(task.id, skill_names).await?;
+                    let reply = format!(
+                        "Updated requested skills for '{}': {}.",
+                        task.title,
+                        format_skill_list(&task.requested_skills)
+                    );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::AddResourceLock {
                 selector,
                 resource_key,
@@ -578,7 +674,7 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -729,6 +825,14 @@ enum MainAgentIntent {
         selector: String,
         content: String,
     },
+    AddRequestedSkills {
+        selector: String,
+        skill_names: Vec<String>,
+    },
+    RemoveRequestedSkills {
+        selector: String,
+        skill_names: Vec<String>,
+    },
     AddResourceLock {
         selector: String,
         resource_key: String,
@@ -790,6 +894,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_note_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_requested_skill_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -1390,6 +1498,52 @@ fn parse_note_intent(content: &str, normalized: &str) -> Option<MainAgentIntent>
         .map(|(selector, content)| MainAgentIntent::AddTaskNote { selector, content })
 }
 
+fn parse_requested_skill_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "requested skill",
+            "requested skills",
+            "skill",
+            "skills",
+            ZH_SKILL,
+        ],
+    ) || contains_any(normalized, &["skill management", "skills page"])
+    {
+        return None;
+    }
+
+    let is_remove = contains_any(
+        normalized,
+        &[
+            "remove skill",
+            "remove requested skill",
+            "delete skill",
+            "clear skill",
+            "detach skill",
+            ZH_CANCEL,
+            ZH_REJECT,
+        ],
+    );
+
+    let (selector, skill_names) = split_skill_selector_and_names(content, normalized, is_remove)?;
+    if skill_names.is_empty() {
+        return None;
+    }
+
+    if is_remove {
+        Some(MainAgentIntent::RemoveRequestedSkills {
+            selector,
+            skill_names,
+        })
+    } else {
+        Some(MainAgentIntent::AddRequestedSkills {
+            selector,
+            skill_names,
+        })
+    }
+}
+
 fn parse_resource_lock_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -1588,6 +1742,159 @@ fn split_resource_lock_selector_and_key(content: &str) -> Option<(String, String
     None
 }
 
+fn split_skill_selector_and_names(
+    content: &str,
+    normalized: &str,
+    is_remove: bool,
+) -> Option<(String, Vec<String>)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector_head = if head.contains(ZH_SKILL) && head.contains(ZH_TASK) {
+                let before_skill = head.split(ZH_SKILL).next().unwrap_or(head);
+                before_skill.split(ZH_ADD).next().unwrap_or(before_skill)
+            } else {
+                head
+            };
+            let selector = extract_task_selector(
+                selector_head,
+                &[
+                    "requested",
+                    "skill",
+                    "skills",
+                    "to",
+                    "for",
+                    "from",
+                    ZH_ADD,
+                    ZH_SKILL,
+                    ZH_TO,
+                ],
+            );
+            let skill_names = parse_skill_names(tail);
+            if !selector.is_empty() && !skill_names.is_empty() {
+                return Some((selector, skill_names));
+            }
+        }
+    }
+
+    if is_remove {
+        split_inline_skill_selector_and_names(
+            content,
+            normalized,
+            &[
+                " from task ",
+                " from ",
+                " for task ",
+                " for ",
+                " task ",
+                ZH_TO,
+                ZH_TASK,
+            ],
+            &[
+                "remove requested skills",
+                "remove requested skill",
+                "remove skills",
+                "remove skill",
+                "delete skill",
+                "detach skill",
+                "clear skill",
+                ZH_CANCEL,
+                ZH_REJECT,
+                ZH_SKILL,
+            ],
+        )
+    } else {
+        split_inline_skill_selector_and_names(
+            content,
+            normalized,
+            &[
+                " to task ",
+                " to ",
+                " for task ",
+                " for ",
+                " task ",
+                ZH_TO,
+                ZH_TASK,
+            ],
+            &[
+                "add requested skills",
+                "add requested skill",
+                "add skills",
+                "add skill",
+                "attach skill",
+                "use skill",
+                ZH_ADD,
+                ZH_SKILL,
+            ],
+        )
+    }
+}
+
+fn split_inline_skill_selector_and_names(
+    content: &str,
+    normalized: &str,
+    relation_markers: &[&str],
+    action_words: &[&str],
+) -> Option<(String, Vec<String>)> {
+    relation_markers
+        .iter()
+        .filter_map(|marker| normalized.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)
+        .and_then(|(index, marker)| {
+            let skill_part = content[..index].trim();
+            let selector_part = content[index + marker.len()..].trim();
+            let mut skill_text = skill_part.to_owned();
+            for action_word in action_words {
+                skill_text = replace_case_insensitive(&skill_text, action_word, "");
+            }
+
+            let selector = extract_task_selector(selector_part, &[]);
+            let skill_names = parse_skill_names(&skill_text);
+            (!selector.is_empty() && !skill_names.is_empty()).then_some((selector, skill_names))
+        })
+}
+
+fn parse_skill_names(content: &str) -> Vec<String> {
+    normalize_skill_names(
+        content
+            .split([',', ';', '\n', '\u{ff0c}', '\u{ff1b}', '\u{3001}'])
+            .flat_map(|part| part.split(" and "))
+            .flat_map(|part| part.split(" with "))
+            .map(|part| part.trim().trim_matches(['"', '\'', '`']).to_owned())
+            .collect(),
+    )
+}
+
+fn normalize_skill_names(skill_names: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for skill_name in skill_names {
+        let skill_name = skill_name
+            .trim()
+            .trim_matches([
+                ':', '\u{ff1a}', ',', '\u{ff0c}', '.', '\u{3002}', '"', '\'', '`',
+            ])
+            .trim()
+            .to_owned();
+        if skill_name.is_empty()
+            || normalized
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&skill_name))
+        {
+            continue;
+        }
+        normalized.push(skill_name);
+    }
+
+    normalized
+}
+
+fn format_skill_list(skill_names: &[String]) -> String {
+    if skill_names.is_empty() {
+        "none".to_owned()
+    } else {
+        skill_names.join(", ")
+    }
+}
+
 fn extract_memory_selector(content: &str) -> String {
     for separator in ["\u{ff1a}", ":", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
@@ -1703,6 +2010,25 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "note to task",
         "note task",
         "note",
+        "add requested skills to task",
+        "add requested skill to task",
+        "add requested skills",
+        "add requested skill",
+        "add skills to task",
+        "add skill to task",
+        "add skills",
+        "add skill",
+        "remove requested skills from task",
+        "remove requested skill from task",
+        "remove requested skills",
+        "remove requested skill",
+        "remove skills from task",
+        "remove skill from task",
+        "remove skills",
+        "remove skill",
+        "attach skill",
+        "detach skill",
+        "use skill",
         "ask clarification for task",
         "request clarification for task",
         "ask user for task",
@@ -1728,6 +2054,7 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         ZH_RESUME,
         ZH_CANCEL,
         ZH_NOTE,
+        ZH_SKILL,
         ZH_CLARIFY,
         ZH_QUESTION,
         ZH_NEED,
@@ -2079,6 +2406,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_requested_skill_intents() {
+        assert_eq!(
+            parse_intent("add skill to task Deploy release: github, browser"),
+            MainAgentIntent::AddRequestedSkills {
+                selector: "Deploy release".to_owned(),
+                skill_names: vec!["github".to_owned(), "browser".to_owned()],
+            }
+        );
+        assert_eq!(
+            parse_intent("remove skill browser from task Deploy release"),
+            MainAgentIntent::RemoveRequestedSkills {
+                selector: "Deploy release".to_owned(),
+                skill_names: vec!["browser".to_owned()],
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{7ed9}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{6dfb}\u{52a0}\u{6280}\u{80fd}\u{ff1a}github"
+            ),
+            MainAgentIntent::AddRequestedSkills {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                skill_names: vec!["github".to_owned()],
+            }
+        );
+    }
+
+    #[test]
     fn parses_task_resource_lock_intents() {
         assert_eq!(
             parse_intent("add resource lock to task Deploy release: repo:persistent-agent"),
@@ -2239,6 +2593,50 @@ mod tests {
                 .content
                 .contains("Rejected memory")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_manage_requested_skills_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Prepare release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: vec!["shell".to_owned()],
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "add skill to task Deploy release: github, shell".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.requested_skills, vec!["shell", "github"]);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Updated requested skills")
+        );
+
+        agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "remove skill shell from task Deploy release".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.requested_skills, vec!["github"]);
 
         Ok(())
     }

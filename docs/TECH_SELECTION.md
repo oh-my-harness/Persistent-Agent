@@ -260,6 +260,8 @@ Recommended main-agent tools:
 - `resume_task`;
 - `cancel_task`;
 - `convert_task_type`;
+- `add_requested_skill`;
+- `remove_requested_skill`;
 - `add_task_dependency`;
 - `remove_task_dependency`;
 - `add_resource_lock`;
