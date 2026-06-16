@@ -8,13 +8,13 @@ use axum::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, Task,
-    TaskAction, TaskAttempt, TaskId, UpdateTask,
+    TaskAction, TaskAttempt, TaskId, UpdateMemory, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,10 @@ pub fn router(state: AppState) -> Router {
             get(main_agent_messages).post(send_main_agent_message),
         )
         .route("/api/memories", get(list_memories))
+        .route(
+            "/api/memories/{id}",
+            patch(update_memory).delete(delete_memory),
+        )
         .route("/api/memories/{id}/approve", post(approve_memory))
         .route("/api/memories/{id}/reject", post(reject_memory))
         .route("/api/skills", get(list_skills).post(create_skill))
@@ -352,6 +356,21 @@ async fn run_scheduler_tick(
 
 async fn list_memories(State(state): State<AppState>) -> Result<Json<Vec<Memory>>, ApiError> {
     Ok(Json(state.db.list_memories().await?))
+}
+
+async fn update_memory(
+    State(state): State<AppState>,
+    Path(id): Path<MemoryId>,
+    Json(input): Json<UpdateMemory>,
+) -> Result<Json<Memory>, ApiError> {
+    Ok(Json(state.db.update_memory(id, input, "main_agent").await?))
+}
+
+async fn delete_memory(
+    State(state): State<AppState>,
+    Path(id): Path<MemoryId>,
+) -> Result<Json<Memory>, ApiError> {
+    Ok(Json(state.db.delete_memory(id, "main_agent").await?))
 }
 
 async fn approve_memory(

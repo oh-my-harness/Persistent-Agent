@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
     Memory, MemoryId, MemoryStatus, Skill, Task, TaskAction, TaskAttempt, TaskId, TaskStatus,
-    TaskType, UpdateTask,
+    TaskType, UpdateMemory, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -672,6 +672,53 @@ impl Db {
         Ok(memory)
     }
 
+    pub async fn update_memory(
+        &self,
+        id: MemoryId,
+        input: UpdateMemory,
+        actor: &str,
+    ) -> anyhow::Result<Memory> {
+        let current = self.get_memory(id).await?;
+        let scope = input.scope.unwrap_or(current.scope);
+        let content = input.content.unwrap_or(current.content);
+        let confidence = input.confidence.unwrap_or(current.confidence);
+
+        sqlx::query("UPDATE memories SET scope = ?, content = ?, confidence = ? WHERE id = ?")
+            .bind(&scope)
+            .bind(&content)
+            .bind(confidence)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        let memory = self.get_memory(id).await?;
+        self.record_action(
+            memory.source_task_id,
+            actor,
+            "update_memory",
+            json!({ "memory_id": id, "scope": scope, "confidence": confidence }),
+        )
+        .await?;
+        Ok(memory)
+    }
+
+    pub async fn delete_memory(&self, id: MemoryId, actor: &str) -> anyhow::Result<Memory> {
+        let memory = self.get_memory(id).await?;
+        sqlx::query("DELETE FROM memories WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.record_action(
+            memory.source_task_id,
+            actor,
+            "delete_memory",
+            json!({ "memory_id": id, "scope": memory.scope, "status": memory.status }),
+        )
+        .await?;
+        Ok(memory)
+    }
+
     pub async fn get_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
         let row = sqlx::query("SELECT * FROM memories WHERE id = ?")
             .bind(id.to_string())
@@ -998,6 +1045,45 @@ mod tests {
         assert_eq!(approved.len(), 1);
         assert_eq!(approved[0].content, "Approved memory");
         assert_ne!(approved[0].id, pending.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_can_be_updated_and_deleted() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let memory = db
+            .create_memory(
+                CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Old content".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Approved,
+                    confidence: 0.4,
+                },
+                "test",
+            )
+            .await?;
+
+        let updated = db
+            .update_memory(
+                memory.id,
+                UpdateMemory {
+                    scope: Some("repository".to_owned()),
+                    content: Some("New content".to_owned()),
+                    confidence: Some(0.8),
+                },
+                "test",
+            )
+            .await?;
+        let deleted = db.delete_memory(memory.id, "test").await?;
+        let memories = db.list_memories().await?;
+
+        assert_eq!(updated.scope, "repository");
+        assert_eq!(updated.content, "New content");
+        assert_eq!(updated.confidence, 0.8);
+        assert_eq!(deleted.id, memory.id);
+        assert!(memories.is_empty());
 
         Ok(())
     }

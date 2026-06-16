@@ -123,6 +123,23 @@ export function rejectMemory(id: string): Promise<Memory> {
   return request<Memory>(`/api/memories/${id}/reject`, { method: "POST" });
 }
 
+export interface UpdateMemoryInput {
+  scope?: string;
+  content?: string;
+  confidence?: number;
+}
+
+export function updateMemory(id: string, input: UpdateMemoryInput): Promise<Memory> {
+  return request<Memory>(`/api/memories/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteMemory(id: string): Promise<Memory> {
+  return request<Memory>(`/api/memories/${id}`, { method: "DELETE" });
+}
+
 export interface CreateSkillInput {
   name: string;
   description: string;

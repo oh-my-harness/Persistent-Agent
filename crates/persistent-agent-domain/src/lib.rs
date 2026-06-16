@@ -257,6 +257,13 @@ pub struct CreateMemory {
     pub confidence: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateMemory {
+    pub scope: Option<String>,
+    pub content: Option<String>,
+    pub confidence: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub id: SkillId,

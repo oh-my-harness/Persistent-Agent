@@ -319,9 +319,34 @@ textarea {
   margin: 0;
 }
 
-.memory-actions {
-  display: flex;
+.memory-confidence {
+  color: #657680;
+  display: inline-block;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.memory-edit {
+  display: grid;
   gap: 8px;
+  margin-top: 10px;
+  max-width: 720px;
+}
+
+.memory-edit textarea {
+  min-height: 72px;
+}
+
+.memory-edit input[type="number"] {
+  max-width: 120px;
+}
+
+.memory-actions {
+  align-content: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: end;
 }
 
 .memory-actions button {

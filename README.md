@@ -20,7 +20,7 @@ The repository now contains the first executable skeleton:
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - Task execution history API and UI for attempts and auditable task actions.
 - Skill management with automatic matching, explicit task selection, and active-skill context for workers.
-- Long-term memory candidate review plus approved-memory injection into worker context.
+- Long-term memory candidate review, edit/delete controls, and approved-memory injection into worker context.
 - Axum API with REST endpoints and an SSE event stream.
 - Vite React Web UI under `apps/web`.
 

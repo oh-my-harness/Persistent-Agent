@@ -7,6 +7,7 @@ import {
   cancelTask,
   createSkill,
   createTask,
+  deleteMemory,
   getTaskHistory,
   getTaskPoolSummary,
   listMainAgentMessages,
@@ -22,6 +23,7 @@ import {
   runSchedulerTick,
   sendMainAgentMessage,
   sendTaskMessage,
+  updateMemory,
 } from "./api";
 import type { ConversationMessage, Memory, Task, TaskType } from "./types";
 import type { Skill } from "./types";
@@ -212,6 +214,12 @@ function MemoryReview() {
   };
   const approve = useMutation({ mutationFn: approveMemory, onSuccess: refresh });
   const reject = useMutation({ mutationFn: rejectMemory, onSuccess: refresh });
+  const update = useMutation({
+    mutationFn: ({ id, scope, content, confidence }: { id: string; scope: string; content: string; confidence: number }) =>
+      updateMemory(id, { scope, content, confidence }),
+    onSuccess: refresh,
+  });
+  const remove = useMutation({ mutationFn: deleteMemory, onSuccess: refresh });
   const visibleMemories = memories.data ?? [];
 
   return (
@@ -227,6 +235,10 @@ function MemoryReview() {
             memory={memory}
             onApprove={() => approve.mutate(memory.id)}
             onReject={() => reject.mutate(memory.id)}
+            onDelete={() => remove.mutate(memory.id)}
+            onUpdate={(scope, content, confidence) =>
+              update.mutate({ id: memory.id, scope, content, confidence })
+            }
           />
         ))}
         {visibleMemories.length === 0 && <p className="empty">Worker memory candidates will appear here.</p>}
@@ -238,12 +250,27 @@ function MemoryReview() {
 function MemoryRow({
   memory,
   onApprove,
+  onDelete,
   onReject,
+  onUpdate,
 }: {
   memory: Memory;
   onApprove: () => void;
+  onDelete: () => void;
   onReject: () => void;
+  onUpdate: (scope: string, content: string, confidence: number) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [scope, setScope] = useState(memory.scope);
+  const [content, setContent] = useState(memory.content);
+  const [confidence, setConfidence] = useState(memory.confidence);
+
+  useEffect(() => {
+    setScope(memory.scope);
+    setContent(memory.content);
+    setConfidence(memory.confidence);
+  }, [memory.scope, memory.content, memory.confidence]);
+
   return (
     <article className="memory-row">
       <div>
@@ -252,13 +279,48 @@ function MemoryRow({
           <span className={`status ${memory.status}`}>{memory.status}</span>
         </div>
         <p>{memory.content}</p>
+        <span className="memory-confidence">confidence {memory.confidence.toFixed(2)}</span>
+        {editing && (
+          <div className="memory-edit">
+            <label>
+              Scope
+              <input value={scope} onChange={(event) => setScope(event.target.value)} />
+            </label>
+            <label>
+              Content
+              <textarea value={content} onChange={(event) => setContent(event.target.value)} />
+            </label>
+            <label>
+              Confidence
+              <input
+                max="1"
+                min="0"
+                step="0.05"
+                type="number"
+                value={confidence}
+                onChange={(event) => setConfidence(Number(event.target.value))}
+              />
+            </label>
+          </div>
+        )}
       </div>
-      {memory.status === "pending" && (
-        <div className="memory-actions">
+      <div className="memory-actions">
+        {memory.status === "pending" && (
+          <>
           <button onClick={onApprove}>Approve</button>
           <button onClick={onReject}>Reject</button>
-        </div>
-      )}
+          </>
+        )}
+        {editing ? (
+          <>
+            <button onClick={() => onUpdate(scope, content, confidence)}>Save</button>
+            <button onClick={() => setEditing(false)}>Close</button>
+          </>
+        ) : (
+          <button onClick={() => setEditing(true)}>Edit</button>
+        )}
+        <button onClick={onDelete}>Delete</button>
+      </div>
     </article>
   );
 }
