@@ -6,7 +6,7 @@ use llm_adapter::{
     core::{CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole},
 };
 use persistent_agent_db::Db;
-use persistent_agent_domain::{CreateMemory, MemoryStatus, Task, TaskStatus};
+use persistent_agent_domain::{CreateMemory, Memory, MemoryStatus, Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -58,7 +58,10 @@ where
             .create_attempt(task.id, TaskStatus::Running, Some("worker started"))
             .await?;
 
-        let result = self.worker.execute(task.clone()).await?;
+        let context = WorkerContext {
+            memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
+        };
+        let result = self.worker.execute(task.clone(), context).await?;
         match result {
             WorkerResult::Completed { summary } => {
                 self.db
@@ -112,7 +115,12 @@ where
 
 #[async_trait]
 pub trait TaskWorker: Clone + Send + Sync + 'static {
-    async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult>;
+    async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult>;
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerContext {
+    pub memories: Vec<Memory>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,7 +128,7 @@ pub struct StubWorker;
 
 #[async_trait]
 impl TaskWorker for StubWorker {
-    async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+    async fn execute(&self, task: Task, _context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let marker_text = format!("{} {}", task.title, task.description).to_lowercase();
         if marker_text.contains("blocked")
             || marker_text.contains("needs_user")
@@ -151,10 +159,10 @@ pub enum WorkerBackend {
 
 #[async_trait]
 impl TaskWorker for WorkerBackend {
-    async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+    async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         match self {
-            Self::Stub(worker) => worker.execute(task).await,
-            Self::Llm(worker) => worker.execute(task).await,
+            Self::Stub(worker) => worker.execute(task, context).await,
+            Self::Llm(worker) => worker.execute(task, context).await,
         }
     }
 }
@@ -191,9 +199,9 @@ impl LlmWorkerConfig {
 
 #[async_trait]
 impl TaskWorker for LlmWorker {
-    async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+    async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let config = self.config.clone();
-        let prompt = task_prompt(&task);
+        let prompt = task_prompt(&task, &context.memories);
         let summary =
             tokio::task::spawn_blocking(move || dispatch_task_prompt(config, prompt)).await??;
 
@@ -244,9 +252,9 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
     Ok(extract_response_text(&response))
 }
 
-fn task_prompt(task: &Task) -> String {
+fn task_prompt(task: &Task, memories: &[Memory]) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nRelevant approved memories:\n{}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -261,8 +269,102 @@ fn task_prompt(task: &Task) -> String {
             task.matched_skills.join(", ")
         },
         active_skills(task).join(", "),
+        format_memories(memories),
         task.description
     )
+}
+
+fn format_memories(memories: &[Memory]) -> String {
+    if memories.is_empty() {
+        return "none".to_owned();
+    }
+
+    memories
+        .iter()
+        .map(|memory| {
+            format!(
+                "- [{} confidence {:.2}] {}",
+                memory.scope, memory.confidence, memory.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn select_relevant_memories(task: &Task, memories: Vec<Memory>, limit: usize) -> Vec<Memory> {
+    let tokens = task_memory_tokens(task);
+    let mut scored = memories
+        .into_iter()
+        .filter_map(|memory| {
+            let haystack = format!("{} {}", memory.scope, memory.content).to_lowercase();
+            let score = tokens
+                .iter()
+                .filter(|token| haystack.contains(token.as_str()))
+                .count();
+            (score > 0).then_some((score, memory))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|(left_score, left_memory), (right_score, right_memory)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right_memory.confidence.total_cmp(&left_memory.confidence))
+            .then_with(|| right_memory.created_at.cmp(&left_memory.created_at))
+    });
+
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, memory)| memory)
+        .collect()
+}
+
+fn task_memory_tokens(task: &Task) -> Vec<String> {
+    let text = format!(
+        "{} {} {}",
+        task.title,
+        task.description,
+        active_skills(task).join(" ")
+    )
+    .to_lowercase();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            current.push(ch);
+            continue;
+        }
+
+        if is_memory_token(&current) && !tokens.contains(&current) {
+            tokens.push(current.clone());
+        }
+        current.clear();
+    }
+
+    if is_memory_token(&current) && !tokens.contains(&current) {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_memory_token(token: &str) -> bool {
+    token.chars().count() >= 3
+        && !matches!(
+            token,
+            "and"
+                | "for"
+                | "the"
+                | "use"
+                | "with"
+                | "task"
+                | "run"
+                | "this"
+                | "that"
+                | "from"
+                | "into"
+        )
 }
 
 fn active_skills(task: &Task) -> Vec<String> {
@@ -346,7 +448,7 @@ mod tests {
     use persistent_agent_domain::{CreateTask, TaskType};
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -397,13 +499,64 @@ mod tests {
             updated_at: now,
         };
 
-        let prompt = task_prompt(&task);
+        let prompt = task_prompt(&task, &[]);
 
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
         assert!(prompt.contains("github"));
         assert!(prompt.contains("Matched skills: rust, github"));
         assert!(prompt.contains("Active skills: github, rust"));
+    }
+
+    #[test]
+    fn injects_relevant_approved_memories_into_prompt() {
+        let now = Utc::now();
+        let task = Task {
+            id: Uuid::now_v7(),
+            title: "Run cargo tests".to_owned(),
+            description: "Use the repository workflow.".to_owned(),
+            task_type: TaskType::OneOff,
+            status: TaskStatus::Queued,
+            priority: 0,
+            queue_position: 0,
+            created_by: "user".to_owned(),
+            conversation_id: None,
+            requested_skills: vec!["rust".to_owned()],
+            matched_skills: Vec::new(),
+            schedule: None,
+            attempt_count: 0,
+            last_run_at: None,
+            next_run_at: None,
+            blocked_reason: None,
+            result_summary: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let relevant = Memory {
+            id: Uuid::now_v7(),
+            scope: "project".to_owned(),
+            content: "Prefer cargo test --workspace before committing.".to_owned(),
+            source_task_id: None,
+            status: MemoryStatus::Approved,
+            confidence: 0.9,
+            created_at: now,
+        };
+        let unrelated = Memory {
+            id: Uuid::now_v7(),
+            scope: "project".to_owned(),
+            content: "Use design screenshots for frontend polish.".to_owned(),
+            source_task_id: None,
+            status: MemoryStatus::Approved,
+            confidence: 1.0,
+            created_at: now,
+        };
+
+        let memories = select_relevant_memories(&task, vec![unrelated, relevant], 5);
+        let prompt = task_prompt(&task, &memories);
+
+        assert_eq!(memories.len(), 1);
+        assert!(prompt.contains("Prefer cargo test --workspace"));
+        assert!(!prompt.contains("design screenshots"));
     }
 
     #[test]
@@ -477,7 +630,11 @@ mod tests {
 
     #[async_trait]
     impl TaskWorker for SlowCountingWorker {
-        async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+        async fn execute(
+            &self,
+            task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -521,6 +678,82 @@ mod tests {
         first?;
         second?;
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct ContextRecordingWorker {
+        memory_counts: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl TaskWorker for ContextRecordingWorker {
+        async fn execute(
+            &self,
+            task: Task,
+            context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            self.memory_counts
+                .lock()
+                .expect("memory count lock")
+                .push(context.memories.len());
+
+            Ok(WorkerResult::Completed {
+                summary: format!("completed {}", task.title),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_passes_relevant_approved_memories_to_worker() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "For cargo work, run cargo test --workspace.".to_owned(),
+                source_task_id: None,
+                status: MemoryStatus::Approved,
+                confidence: 0.9,
+            },
+            "test",
+        )
+        .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "Frontend visual checks use browser screenshots.".to_owned(),
+                source_task_id: None,
+                status: MemoryStatus::Pending,
+                confidence: 0.9,
+            },
+            "test",
+        )
+        .await?;
+        db.create_task(
+            CreateTask {
+                title: "Run cargo checks".to_owned(),
+                description: "Validate the Rust workspace.".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: vec!["rust".to_owned()],
+                schedule: None,
+                created_by: "test".to_owned(),
+            },
+            "test",
+        )
+        .await?;
+        let memory_counts = Arc::new(StdMutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
+            db,
+            ContextRecordingWorker {
+                memory_counts: memory_counts.clone(),
+            },
+        );
+
+        scheduler.tick().await?;
+
+        assert_eq!(*memory_counts.lock().expect("memory count lock"), vec![1]);
 
         Ok(())
     }

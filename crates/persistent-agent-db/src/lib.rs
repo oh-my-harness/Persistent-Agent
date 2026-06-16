@@ -633,6 +633,22 @@ impl Db {
         rows.into_iter().map(row_to_memory).collect()
     }
 
+    pub async fn list_approved_memories(&self, limit: i64) -> anyhow::Result<Vec<Memory>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM memories
+            WHERE status = 'approved'
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_memory).collect()
+    }
+
     pub async fn set_memory_status(
         &self,
         id: MemoryId,
@@ -946,6 +962,42 @@ mod tests {
         assert_eq!(approved.status, MemoryStatus::Approved);
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "Prefer focused tests.");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approved_memories_are_listed_for_injection() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let pending = db
+            .create_memory(
+                CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Pending memory".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.4,
+                },
+                "test",
+            )
+            .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "Approved memory".to_owned(),
+                source_task_id: None,
+                status: MemoryStatus::Approved,
+                confidence: 0.9,
+            },
+            "test",
+        )
+        .await?;
+
+        let approved = db.list_approved_memories(10).await?;
+
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].content, "Approved memory");
+        assert_ne!(approved[0].id, pending.id);
 
         Ok(())
     }
