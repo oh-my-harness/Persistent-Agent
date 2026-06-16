@@ -7,7 +7,8 @@ use llm_adapter::{
 };
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationMessage, CreateMemory, Memory, MemoryStatus, Skill, Task, TaskNote, TaskStatus,
+    ConversationMessage, CreateMemory, CreateTask, Memory, MemoryStatus, Skill, Task, TaskNote,
+    TaskStatus, TaskType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -177,6 +178,7 @@ where
                 summary,
                 memory_candidates,
                 artifacts,
+                follow_up_tasks,
             } => {
                 self.db
                     .record_attempt_event(
@@ -188,6 +190,7 @@ where
                             "summary": summary,
                             "memory_candidate_count": memory_candidates.len(),
                             "artifact_count": artifacts.len(),
+                            "follow_up_task_count": follow_up_tasks.len(),
                         }),
                     )
                     .await?;
@@ -231,12 +234,18 @@ where
                         )
                         .await?;
                 }
+                let created_follow_up_tasks = self
+                    .create_follow_up_tasks(task.id, attempt.id, &follow_up_tasks)
+                    .await?;
                 self.db.complete_task(task.id, &summary, "worker").await?;
                 Ok(SchedulerTick {
                     recovered_tasks,
                     requeued_tasks,
                     claimed_task: Some(task),
-                    outcome: SchedulerOutcome::Completed { summary },
+                    outcome: SchedulerOutcome::Completed {
+                        summary,
+                        follow_up_tasks: created_follow_up_tasks,
+                    },
                 })
             }
             WorkerResult::Blocked { reason } => {
@@ -321,6 +330,61 @@ where
             status: current.status,
             reason,
         }))
+    }
+
+    async fn create_follow_up_tasks(
+        &self,
+        source_task_id: persistent_agent_domain::TaskId,
+        attempt_id: persistent_agent_domain::TaskAttemptId,
+        follow_up_tasks: &[WorkerFollowUpTask],
+    ) -> anyhow::Result<Vec<Task>> {
+        let mut created_tasks = Vec::new();
+        for follow_up in follow_up_tasks {
+            let created = self
+                .db
+                .create_task(
+                    CreateTask {
+                        title: follow_up.title.clone(),
+                        description: follow_up.description.clone(),
+                        task_type: TaskType::OneOff,
+                        priority: follow_up.priority,
+                        requested_skills: follow_up.requested_skills.clone(),
+                        schedule: None,
+                        created_by: "worker".to_owned(),
+                    },
+                    "worker",
+                )
+                .await?;
+            self.db
+                .record_action(
+                    Some(source_task_id),
+                    "worker",
+                    "create_follow_up_task",
+                    json!({
+                        "follow_up_task_id": created.id,
+                        "title": created.title,
+                    }),
+                )
+                .await?;
+            created_tasks.push(created);
+        }
+
+        if !created_tasks.is_empty() {
+            self.db
+                .record_attempt_event(
+                    attempt_id,
+                    source_task_id,
+                    "follow_up_tasks_created",
+                    "Created follow-up tasks requested by worker result.",
+                    json!({
+                        "count": created_tasks.len(),
+                        "task_ids": created_tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
+                    }),
+                )
+                .await?;
+        }
+
+        Ok(created_tasks)
     }
 
     async fn execute_worker_with_heartbeat(
@@ -418,6 +482,7 @@ impl TaskWorker for StubWorker {
                     ),
                     memory_candidates: Vec::new(),
                     artifacts: Vec::new(),
+                    follow_up_tasks: Vec::new(),
                 });
             }
 
@@ -436,6 +501,7 @@ impl TaskWorker for StubWorker {
             ),
             memory_candidates: Vec::new(),
             artifacts: Vec::new(),
+            follow_up_tasks: Vec::new(),
         })
     }
 }
@@ -519,7 +585,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
             CoreMessage {
                 role: CoreRole::System,
                 content: vec![CoreContent::Text {
-                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts.".to_owned(),
+                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}],\"follow_up_tasks\":[{\"title\":\"...\",\"description\":\"...\",\"priority\":0,\"requested_skills\":[\"...\"]}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts. Use follow_up_tasks only for concrete one-off work that should be queued after this task succeeds.".to_owned(),
                 }],
             },
             CoreMessage {
@@ -528,7 +594,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
             },
         ],
         stream: false,
-        max_tokens: Some(700),
+        max_tokens: Some(900),
         temperature: Some(0.2),
         tools: Vec::new(),
         tool_choice: None,
@@ -801,6 +867,7 @@ struct StructuredWorkerResult {
     reason: Option<String>,
     memory_candidates: Option<Vec<String>>,
     artifacts: Option<Vec<WorkerArtifact>>,
+    follow_up_tasks: Option<Vec<WorkerFollowUpTask>>,
 }
 
 fn parse_worker_result_text(text: &str) -> WorkerResult {
@@ -822,6 +889,7 @@ fn parse_worker_result_text(text: &str) -> WorkerResult {
                     .unwrap_or_else(|| "Worker completed the task.".to_owned()),
                 memory_candidates: clean_memory_candidates(parsed.memory_candidates),
                 artifacts: clean_artifacts(parsed.artifacts),
+                follow_up_tasks: clean_follow_up_tasks(parsed.follow_up_tasks),
             },
             _ => fallback_worker_result(text),
         };
@@ -878,6 +946,39 @@ fn clean_artifacts(artifacts: Option<Vec<WorkerArtifact>>) -> Vec<WorkerArtifact
         .collect()
 }
 
+fn clean_follow_up_tasks(tasks: Option<Vec<WorkerFollowUpTask>>) -> Vec<WorkerFollowUpTask> {
+    tasks
+        .unwrap_or_default()
+        .into_iter()
+        .take(10)
+        .filter_map(|task| {
+            let title = task.title.trim().to_owned();
+            if title.is_empty() {
+                return None;
+            }
+
+            let description = task.description.trim().to_owned();
+            let requested_skills = task
+                .requested_skills
+                .into_iter()
+                .map(|skill| skill.trim().to_owned())
+                .filter(|skill| !skill.is_empty())
+                .collect();
+
+            Some(WorkerFollowUpTask {
+                title: title.clone(),
+                description: if description.is_empty() {
+                    title
+                } else {
+                    description
+                },
+                priority: task.priority.clamp(-100, 100),
+                requested_skills,
+            })
+        })
+        .collect()
+}
+
 fn fallback_worker_result(text: &str) -> WorkerResult {
     let trimmed = text.trim();
     let normalized = text.to_lowercase();
@@ -910,6 +1011,7 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
             },
             memory_candidates: Vec::new(),
             artifacts: Vec::new(),
+            follow_up_tasks: Vec::new(),
         }
     }
 }
@@ -921,6 +1023,7 @@ pub enum WorkerResult {
         summary: String,
         memory_candidates: Vec<String>,
         artifacts: Vec<WorkerArtifact>,
+        follow_up_tasks: Vec<WorkerFollowUpTask>,
     },
     Blocked {
         reason: String,
@@ -935,6 +1038,17 @@ pub struct WorkerArtifact {
     pub summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerFollowUpTask {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub requested_skills: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerTick {
     pub recovered_tasks: Vec<Task>,
@@ -947,10 +1061,20 @@ pub struct SchedulerTick {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SchedulerOutcome {
     Idle,
-    Completed { summary: String },
-    Blocked { reason: String },
-    Failed { error: String },
-    Superseded { status: TaskStatus, reason: String },
+    Completed {
+        summary: String,
+        follow_up_tasks: Vec<Task>,
+    },
+    Blocked {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
+    Superseded {
+        status: TaskStatus,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1092,6 +1216,32 @@ mod tests {
                     uri: "file://report.md".to_owned(),
                     summary: Some("Run report".to_owned()),
                 }]
+        ));
+    }
+
+    #[test]
+    fn parses_structured_worker_follow_up_tasks() {
+        let result = parse_worker_result_text(
+            r#"{"status":"completed","summary":"Finished.","follow_up_tasks":[{"title":"Run regression tests","description":"Run the regression test suite","priority":7,"requested_skills":[" testing ",""]},{"title":" ","description":"ignored","priority":1},{"title":"Write release note","description":"","priority":999,"requested_skills":[]}]}"#,
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed { ref follow_up_tasks, .. }
+                if follow_up_tasks == &vec![
+                    WorkerFollowUpTask {
+                        title: "Run regression tests".to_owned(),
+                        description: "Run the regression test suite".to_owned(),
+                        priority: 7,
+                        requested_skills: vec!["testing".to_owned()],
+                    },
+                    WorkerFollowUpTask {
+                        title: "Write release note".to_owned(),
+                        description: "Write release note".to_owned(),
+                        priority: 100,
+                        requested_skills: Vec::new(),
+                    },
+                ]
         ));
     }
 
@@ -1453,6 +1603,7 @@ mod tests {
                 summary: format!("completed {}", task.title),
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
             })
         }
     }
@@ -1510,6 +1661,7 @@ mod tests {
                 summary: format!("completed {}", task.title),
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
             })
         }
     }
@@ -1633,6 +1785,7 @@ mod tests {
                 summary: format!("completed {}", task.title),
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
             })
         }
     }
@@ -1767,6 +1920,7 @@ mod tests {
                     "Avoid broad UI selectors in browser checks.".to_owned(),
                 ],
                 artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
             })
         }
     }
@@ -1831,6 +1985,7 @@ mod tests {
                     uri: "file://report.md".to_owned(),
                     summary: Some("Run report".to_owned()),
                 }],
+                follow_up_tasks: Vec::new(),
             })
         }
     }
@@ -1864,6 +2019,80 @@ mod tests {
         assert_eq!(artifacts[0].summary.as_deref(), Some("Run report"));
         assert!(events.iter().any(|event| {
             event.event_type == "worker_completed" && event.details["artifact_count"] == 1
+        }));
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct FollowUpWorker;
+
+    #[async_trait]
+    impl TaskWorker for FollowUpWorker {
+        async fn execute(
+            &self,
+            _task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            Ok(WorkerResult::Completed {
+                summary: "finished and found next work".to_owned(),
+                memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
+                follow_up_tasks: vec![WorkerFollowUpTask {
+                    title: "Run regression tests".to_owned(),
+                    description: "Validate the follow-up fix".to_owned(),
+                    priority: 5,
+                    requested_skills: vec!["testing".to_owned()],
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_creates_worker_follow_up_tasks() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Investigate issue".to_owned(),
+                    description: "Worker should find a follow-up task".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), FollowUpWorker);
+
+        let tick = scheduler.tick().await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_task_actions(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+        let follow_up = tasks
+            .iter()
+            .find(|task| task.title == "Run regression tests")
+            .expect("follow-up task");
+
+        assert_eq!(follow_up.status, TaskStatus::Queued);
+        assert_eq!(follow_up.created_by, "worker");
+        assert_eq!(follow_up.requested_skills, vec!["testing".to_owned()]);
+        assert!(matches!(
+            tick.outcome,
+            SchedulerOutcome::Completed {
+                ref follow_up_tasks,
+                ..
+            } if follow_up_tasks.len() == 1
+        ));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "create_follow_up_task")
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "follow_up_tasks_created" && event.details["count"] == 1
         }));
 
         Ok(())

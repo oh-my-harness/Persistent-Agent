@@ -619,10 +619,12 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
 function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): TimelineEvent {
   const recovered = tick.recovered_tasks.length;
   const requeued = tick.requeued_tasks.length;
+  const followUps = tick.outcome.type === "completed" ? tick.outcome.follow_up_tasks.length : 0;
   const taskTitle = tick.claimed_task?.title ?? "No runnable task";
   const suffixParts = [
     recovered > 0 ? `${recovered} expired running task(s) recovered` : "",
     requeued > 0 ? `${requeued} recurring task(s) requeued` : "",
+    followUps > 0 ? `${followUps} follow-up task(s) created` : "",
   ].filter(Boolean);
   const suffix = suffixParts.length > 0 ? ` ${suffixParts.join("; ")}.` : "";
 

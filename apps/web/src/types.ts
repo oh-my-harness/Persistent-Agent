@@ -52,7 +52,7 @@ export interface SchedulerTick {
   claimed_task?: Task | null;
   outcome:
     | { type: "idle" }
-    | { type: "completed"; summary: string }
+    | { type: "completed"; summary: string; follow_up_tasks: Task[] }
     | { type: "blocked"; reason: string }
     | { type: "failed"; error: string }
     | { type: "superseded"; status: TaskStatus; reason: string };
