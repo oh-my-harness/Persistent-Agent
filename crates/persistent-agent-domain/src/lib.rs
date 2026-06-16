@@ -109,6 +109,37 @@ impl fmt::Display for ParseEnumError {
 
 impl std::error::Error for ParseEnumError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl fmt::Display for MemoryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
+impl FromStr for MemoryStatus {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            _ => Err(ParseEnumError::new("MemoryStatus", value)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -211,6 +242,16 @@ pub struct Memory {
     pub scope: String,
     pub content: String,
     pub source_task_id: Option<TaskId>,
+    pub status: MemoryStatus,
     pub confidence: f64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMemory {
+    pub scope: String,
+    pub content: String,
+    pub source_task_id: Option<TaskId>,
+    pub status: MemoryStatus,
+    pub confidence: f64,
 }

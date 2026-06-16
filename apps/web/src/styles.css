@@ -214,6 +214,50 @@ textarea {
   min-height: 420px;
 }
 
+.memory-panel {
+  grid-column: 1 / -1;
+}
+
+.memory-list {
+  display: grid;
+  gap: 10px;
+}
+
+.memory-row {
+  border: 1px solid #d9e0e3;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr auto;
+  padding: 12px;
+}
+
+.memory-title-line {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.memory-row p {
+  color: #34444d;
+  margin: 0;
+}
+
+.memory-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.memory-actions button {
+  background: #ffffff;
+  border: 1px solid #cad4d9;
+  border-radius: 6px;
+  font-weight: 700;
+  min-height: 34px;
+  padding: 6px 10px;
+}
+
 .chat-panel {
   min-height: 362px;
 }
@@ -320,6 +364,21 @@ textarea {
 .status.waiting-for-schedule {
   background: #eceff1;
   color: #52636c;
+}
+
+.status.pending {
+  background: #fff1c7;
+  color: #765500;
+}
+
+.status.approved {
+  background: #e7f4ee;
+  color: #1c6b52;
+}
+
+.status.rejected {
+  background: #fee2e2;
+  color: #b91c1c;
 }
 
 .task-meta {

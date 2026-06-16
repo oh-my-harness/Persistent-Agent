@@ -6,7 +6,7 @@ use llm_adapter::{
     core::{CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole},
 };
 use persistent_agent_db::Db;
-use persistent_agent_domain::{Task, TaskStatus};
+use persistent_agent_domain::{CreateMemory, MemoryStatus, Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -55,6 +55,18 @@ where
             WorkerResult::Completed { summary } => {
                 self.db
                     .create_attempt(task.id, TaskStatus::Completed, Some(&summary))
+                    .await?;
+                self.db
+                    .create_memory(
+                        CreateMemory {
+                            scope: "task".to_owned(),
+                            content: memory_candidate_content(&task, &summary),
+                            source_task_id: Some(task.id),
+                            status: MemoryStatus::Pending,
+                            confidence: 0.6,
+                        },
+                        "worker",
+                    )
                     .await?;
                 self.db.complete_task(task.id, &summary, "worker").await?;
                 Ok(SchedulerTick {
@@ -216,6 +228,14 @@ fn task_prompt(task: &Task) -> String {
     )
 }
 
+fn memory_candidate_content(task: &Task, summary: &str) -> String {
+    format!(
+        "Task '{}' completed with summary: {}",
+        task.title,
+        summary.trim()
+    )
+}
+
 fn extract_response_text(response: &CoreResponse) -> String {
     let text = response
         .message
@@ -318,5 +338,36 @@ mod tests {
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
         assert!(prompt.contains("github"));
+    }
+
+    #[test]
+    fn builds_memory_candidate_from_summary() {
+        let now = Utc::now();
+        let task = Task {
+            id: Uuid::now_v7(),
+            title: "Remember setup".to_owned(),
+            description: "Capture setup details.".to_owned(),
+            task_type: TaskType::OneOff,
+            status: TaskStatus::Queued,
+            priority: 0,
+            queue_position: 0,
+            created_by: "user".to_owned(),
+            conversation_id: None,
+            requested_skills: Vec::new(),
+            matched_skills: Vec::new(),
+            schedule: None,
+            attempt_count: 0,
+            last_run_at: None,
+            next_run_at: None,
+            blocked_reason: None,
+            result_summary: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let candidate = memory_candidate_content(&task, "Use cargo test.");
+
+        assert!(candidate.contains("Remember setup"));
+        assert!(candidate.contains("Use cargo test."));
     }
 }

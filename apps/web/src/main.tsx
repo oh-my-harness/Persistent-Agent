@@ -3,17 +3,20 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, CirclePause, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
 import {
+  approveMemory,
   cancelTask,
   createTask,
   getTaskPoolSummary,
   listMainAgentMessages,
+  listMemories,
   listTasks,
   pauseTask,
+  rejectMemory,
   resumeTask,
   runSchedulerTick,
   sendMainAgentMessage,
 } from "./api";
-import type { ConversationMessage, Task, TaskType } from "./types";
+import type { ConversationMessage, Memory, Task, TaskType } from "./types";
 import "./styles.css";
 
 const queryClient = new QueryClient();
@@ -40,6 +43,7 @@ function Shell() {
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
       void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
+      void queryClient.invalidateQueries({ queryKey: ["memories"] });
     });
     source.onerror = () => setLastEvent("Event stream disconnected");
     return () => source.close();
@@ -84,6 +88,7 @@ function Shell() {
         <section className="content-grid">
           <TaskComposer />
           <MainAgentChat />
+          <MemoryReview />
           <section className="panel task-list-panel">
             <div className="panel-heading">
               <h2>Queue</h2>
@@ -106,6 +111,65 @@ function Shell() {
         </section>
       </section>
     </main>
+  );
+}
+
+function MemoryReview() {
+  const queryClient = useQueryClient();
+  const memories = useQuery({ queryKey: ["memories"], queryFn: listMemories });
+  const refresh = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["memories"] });
+  };
+  const approve = useMutation({ mutationFn: approveMemory, onSuccess: refresh });
+  const reject = useMutation({ mutationFn: rejectMemory, onSuccess: refresh });
+  const visibleMemories = memories.data ?? [];
+
+  return (
+    <section className="panel memory-panel">
+      <div className="panel-heading">
+        <h2>Memory Review</h2>
+        <span>{visibleMemories.filter((memory) => memory.status === "pending").length} pending</span>
+      </div>
+      <div className="memory-list">
+        {visibleMemories.map((memory) => (
+          <MemoryRow
+            key={memory.id}
+            memory={memory}
+            onApprove={() => approve.mutate(memory.id)}
+            onReject={() => reject.mutate(memory.id)}
+          />
+        ))}
+        {visibleMemories.length === 0 && <p className="empty">Worker memory candidates will appear here.</p>}
+      </div>
+    </section>
+  );
+}
+
+function MemoryRow({
+  memory,
+  onApprove,
+  onReject,
+}: {
+  memory: Memory;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  return (
+    <article className="memory-row">
+      <div>
+        <div className="memory-title-line">
+          <strong>{memory.scope}</strong>
+          <span className={`status ${memory.status}`}>{memory.status}</span>
+        </div>
+        <p>{memory.content}</p>
+      </div>
+      {memory.status === "pending" && (
+        <div className="memory-actions">
+          <button onClick={onApprove}>Approve</button>
+          <button onClick={onReject}>Reject</button>
+        </div>
+      )}
+    </article>
   );
 }
 

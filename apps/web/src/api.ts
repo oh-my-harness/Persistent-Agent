@@ -1,4 +1,12 @@
-import type { ConversationMessage, MainAgentMessageResponse, SchedulerTick, Task, TaskPoolSummary, TaskType } from "./types";
+import type {
+  ConversationMessage,
+  MainAgentMessageResponse,
+  Memory,
+  SchedulerTick,
+  Task,
+  TaskPoolSummary,
+  TaskType,
+} from "./types";
 
 const apiBase = "";
 
@@ -69,4 +77,16 @@ export function sendMainAgentMessage(content: string): Promise<MainAgentMessageR
     method: "POST",
     body: JSON.stringify({ content }),
   });
+}
+
+export function listMemories(): Promise<Memory[]> {
+  return request<Memory[]>("/api/memories");
+}
+
+export function approveMemory(id: string): Promise<Memory> {
+  return request<Memory>(`/api/memories/${id}/approve`, { method: "POST" });
+}
+
+export function rejectMemory(id: string): Promise<Memory> {
+  return request<Memory>(`/api/memories/${id}/reject`, { method: "POST" });
 }

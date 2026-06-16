@@ -67,3 +67,15 @@ export interface MainAgentMessageResponse {
   assistant_message: ConversationMessage;
   changed_tasks: Task[];
 }
+
+export type MemoryStatus = "pending" | "approved" | "rejected";
+
+export interface Memory {
+  id: string;
+  scope: string;
+  content: string;
+  source_task_id?: string | null;
+  status: MemoryStatus;
+  confidence: number;
+  created_at: string;
+}

@@ -12,7 +12,9 @@ use axum::{
 };
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
-use persistent_agent_domain::{ConversationMessage, CreateTask, Task, TaskId, UpdateTask};
+use persistent_agent_domain::{
+    ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task, TaskId, UpdateTask,
+};
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -92,6 +94,9 @@ pub fn router(state: AppState) -> Router {
             "/api/main-agent/messages",
             get(main_agent_messages).post(send_main_agent_message),
         )
+        .route("/api/memories", get(list_memories))
+        .route("/api/memories/{id}/approve", post(approve_memory))
+        .route("/api/memories/{id}/reject", post(reject_memory))
         .route("/api/scheduler/tick", post(run_scheduler_tick))
         .route("/api/events", get(events))
         .layer(CorsLayer::permissive())
@@ -248,6 +253,34 @@ async fn run_scheduler_tick(
         .events
         .send(AppEvent::SchedulerTick { tick: tick.clone() });
     Ok(Json(tick))
+}
+
+async fn list_memories(State(state): State<AppState>) -> Result<Json<Vec<Memory>>, ApiError> {
+    Ok(Json(state.db.list_memories().await?))
+}
+
+async fn approve_memory(
+    State(state): State<AppState>,
+    Path(id): Path<MemoryId>,
+) -> Result<Json<Memory>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .set_memory_status(id, MemoryStatus::Approved, "main_agent")
+            .await?,
+    ))
+}
+
+async fn reject_memory(
+    State(state): State<AppState>,
+    Path(id): Path<MemoryId>,
+) -> Result<Json<Memory>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .set_memory_status(id, MemoryStatus::Rejected, "main_agent")
+            .await?,
+    ))
 }
 
 async fn events(

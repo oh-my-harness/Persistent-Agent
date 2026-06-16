@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
-    Conversation, ConversationId, ConversationMessage, CreateTask, Task, TaskAction, TaskAttempt,
-    TaskId, TaskStatus, TaskType, UpdateTask,
+    Conversation, ConversationId, ConversationMessage, CreateMemory, CreateTask, Memory, MemoryId,
+    MemoryStatus, Task, TaskAction, TaskAttempt, TaskId, TaskStatus, TaskType, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -529,6 +529,91 @@ impl Db {
         Ok(messages)
     }
 
+    pub async fn create_memory(&self, input: CreateMemory, actor: &str) -> anyhow::Result<Memory> {
+        let memory = Memory {
+            id: Uuid::now_v7(),
+            scope: input.scope,
+            content: input.content,
+            source_task_id: input.source_task_id,
+            status: input.status,
+            confidence: input.confidence,
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT INTO memories (id, scope, content, source_task_id, status, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(memory.id.to_string())
+        .bind(&memory.scope)
+        .bind(&memory.content)
+        .bind(memory.source_task_id.map(|id| id.to_string()))
+        .bind(memory.status.to_string())
+        .bind(memory.confidence)
+        .bind(memory.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            memory.source_task_id,
+            actor,
+            "create_memory",
+            json!({ "memory_id": memory.id, "status": memory.status, "scope": memory.scope }),
+        )
+        .await?;
+
+        Ok(memory)
+    }
+
+    pub async fn list_memories(&self) -> anyhow::Result<Vec<Memory>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM memories
+            ORDER BY
+              CASE status
+                WHEN 'pending' THEN 0
+                WHEN 'approved' THEN 1
+                ELSE 2
+              END,
+              created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_memory).collect()
+    }
+
+    pub async fn set_memory_status(
+        &self,
+        id: MemoryId,
+        status: MemoryStatus,
+        actor: &str,
+    ) -> anyhow::Result<Memory> {
+        sqlx::query("UPDATE memories SET status = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        let memory = self.get_memory(id).await?;
+        self.record_action(
+            memory.source_task_id,
+            actor,
+            "set_memory_status",
+            json!({ "memory_id": id, "status": status }),
+        )
+        .await?;
+        Ok(memory)
+    }
+
+    pub async fn get_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
+        let row = sqlx::query("SELECT * FROM memories WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        row_to_memory(row)
+    }
+
     async fn next_queue_position(&self) -> anyhow::Result<i64> {
         let value: Option<i64> = sqlx::query_scalar("SELECT MAX(queue_position) + 1 FROM tasks")
             .fetch_one(&self.pool)
@@ -549,6 +634,20 @@ fn recurring_interval_seconds(schedule: Option<&Value>) -> i64 {
         .unwrap_or(300);
 
     seconds.max(0)
+}
+
+fn row_to_memory(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Memory> {
+    let source_task_id: Option<String> = row.try_get("source_task_id")?;
+    let status: String = row.try_get("status")?;
+    Ok(Memory {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        scope: row.try_get("scope")?,
+        content: row.try_get("content")?,
+        source_task_id: source_task_id.map(parse_uuid).transpose()?,
+        status: status.parse()?,
+        confidence: row.try_get("confidence")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
 }
 
 fn row_to_conversation(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Conversation> {
@@ -665,5 +764,33 @@ mod tests {
             0
         );
         assert_eq!(recurring_interval_seconds(None), 300);
+    }
+
+    #[tokio::test]
+    async fn memory_candidate_can_be_approved() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let memory = db
+            .create_memory(
+                CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Prefer focused tests.".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.7,
+                },
+                "test",
+            )
+            .await?;
+
+        let approved = db
+            .set_memory_status(memory.id, MemoryStatus::Approved, "test")
+            .await?;
+        let memories = db.list_memories().await?;
+
+        assert_eq!(approved.status, MemoryStatus::Approved);
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "Prefer focused tests.");
+
+        Ok(())
     }
 }
