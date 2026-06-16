@@ -17,6 +17,7 @@ The repository now contains the first executable skeleton:
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - Task execution history API and UI for attempts and auditable task actions.
+- Skill management with automatic matching, explicit task selection, and active-skill context for workers.
 - Axum API with REST endpoints and an SSE event stream.
 - Vite React Web UI under `apps/web`.
 

@@ -332,11 +332,13 @@ function Metric({ label, value }: { label: string; value: number }) {
 
 function TaskComposer() {
   const queryClient = useQueryClient();
+  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [taskType, setTaskType] = useState<TaskType>("one_off");
   const [priority, setPriority] = useState(0);
   const [intervalSeconds, setIntervalSeconds] = useState(300);
+  const [requestedSkills, setRequestedSkills] = useState<string[]>([]);
 
   const mutation = useMutation({
     mutationFn: createTask,
@@ -345,10 +347,12 @@ function TaskComposer() {
       setDescription("");
       setPriority(0);
       setIntervalSeconds(300);
+      setRequestedSkills([]);
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["summary"] });
     },
   });
+  const visibleSkills = skills.data ?? [];
 
   return (
     <section className="panel composer">
@@ -365,7 +369,7 @@ function TaskComposer() {
             description,
             task_type: taskType,
             priority,
-            requested_skills: [],
+            requested_skills: requestedSkills,
             schedule: taskType === "recurring" ? { interval_seconds: intervalSeconds } : undefined,
             created_by: "user",
           });
@@ -407,6 +411,29 @@ function TaskComposer() {
             />
           </label>
         )}
+        {visibleSkills.length > 0 && (
+          <fieldset className="skill-picker">
+            <legend>Requested skills</legend>
+            <div>
+              {visibleSkills.map((skill) => (
+                <label className="skill-choice" key={skill.id}>
+                  <input
+                    checked={requestedSkills.includes(skill.name)}
+                    type="checkbox"
+                    onChange={(event) => {
+                      setRequestedSkills((current) =>
+                        event.target.checked
+                          ? [...current, skill.name]
+                          : current.filter((name) => name !== skill.name),
+                      );
+                    }}
+                  />
+                  <span>{skill.name}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+        )}
         <button className="primary" type="submit" disabled={mutation.isPending}>
           <Plus size={16} /> Create task
         </button>
@@ -442,6 +469,7 @@ function TaskRow({ task }: { task: Task }) {
           <span>{task.task_type.replace("_", " ")}</span>
           <span>priority {task.priority}</span>
           <span>attempts {task.attempt_count}</span>
+          {task.requested_skills.length > 0 && <span>requested {task.requested_skills.join(", ")}</span>}
           {task.matched_skills.length > 0 && <span>matched {task.matched_skills.join(", ")}</span>}
           {task.next_run_at && <span>next {new Date(task.next_run_at).toLocaleString()}</span>}
         </div>

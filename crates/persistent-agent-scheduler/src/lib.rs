@@ -246,7 +246,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
 
 fn task_prompt(task: &Task) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -255,8 +255,33 @@ fn task_prompt(task: &Task) -> String {
         } else {
             task.requested_skills.join(", ")
         },
+        if task.matched_skills.is_empty() {
+            "none".to_owned()
+        } else {
+            task.matched_skills.join(", ")
+        },
+        active_skills(task).join(", "),
         task.description
     )
+}
+
+fn active_skills(task: &Task) -> Vec<String> {
+    let mut skills = Vec::new();
+    for skill in task
+        .requested_skills
+        .iter()
+        .chain(task.matched_skills.iter())
+    {
+        if !skills.contains(skill) {
+            skills.push(skill.clone());
+        }
+    }
+
+    if skills.is_empty() {
+        vec!["none".to_owned()]
+    } else {
+        skills
+    }
 }
 
 fn memory_candidate_content(task: &Task, summary: &str) -> String {
@@ -361,7 +386,7 @@ mod tests {
             created_by: "user".to_owned(),
             conversation_id: None,
             requested_skills: vec!["github".to_owned()],
-            matched_skills: Vec::new(),
+            matched_skills: vec!["rust".to_owned(), "github".to_owned()],
             schedule: None,
             attempt_count: 0,
             last_run_at: None,
@@ -377,6 +402,8 @@ mod tests {
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
         assert!(prompt.contains("github"));
+        assert!(prompt.contains("Matched skills: rust, github"));
+        assert!(prompt.contains("Active skills: github, rust"));
     }
 
     #[test]

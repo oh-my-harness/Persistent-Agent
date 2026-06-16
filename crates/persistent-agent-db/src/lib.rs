@@ -135,13 +135,14 @@ impl Db {
         let description = input.description.unwrap_or(current.description);
         let priority = input.priority.unwrap_or(current.priority);
         let requested_skills = input.requested_skills.unwrap_or(current.requested_skills);
+        let matched_skills = self.match_skills(&title, &description).await?;
         let schedule = input.schedule.or(current.schedule);
         let now = Utc::now();
 
         sqlx::query(
             r#"
             UPDATE tasks
-            SET title = ?, description = ?, priority = ?, requested_skills = ?, schedule = ?, updated_at = ?
+            SET title = ?, description = ?, priority = ?, requested_skills = ?, matched_skills = ?, schedule = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
@@ -149,6 +150,7 @@ impl Db {
         .bind(&description)
         .bind(priority)
         .bind(serde_json::to_string(&requested_skills)?)
+        .bind(serde_json::to_string(&matched_skills)?)
         .bind(schedule.as_ref().map(serde_json::to_string).transpose()?)
         .bind(now)
         .bind(id.to_string())
@@ -159,7 +161,7 @@ impl Db {
             Some(id),
             actor,
             "update_task",
-            json!({ "title": title, "priority": priority }),
+            json!({ "title": title, "priority": priority, "requested_skills": requested_skills, "matched_skills": matched_skills }),
         )
         .await?;
 
@@ -979,6 +981,54 @@ mod tests {
             .await?;
 
         assert_eq!(task.matched_skills, vec!["github"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_update_refreshes_matched_skills() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "github".to_owned(),
+                description: "GitHub repository work".to_owned(),
+                trigger_rules: vec!["github".to_owned()],
+                tool_subset: Vec::new(),
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Plain task".to_owned(),
+                    description: "No repository trigger yet".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let updated = db
+            .update_task(
+                task.id,
+                UpdateTask {
+                    title: Some("Check GitHub issue".to_owned()),
+                    description: None,
+                    priority: None,
+                    requested_skills: None,
+                    schedule: None,
+                },
+                "test",
+            )
+            .await?;
+
+        assert_eq!(updated.matched_skills, vec!["github"]);
 
         Ok(())
     }

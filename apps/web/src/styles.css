@@ -238,6 +238,47 @@ textarea {
   gap: 10px;
 }
 
+.skill-picker {
+  border: 1px solid #d9e0e3;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+
+.skill-picker legend {
+  color: #52636c;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 0 4px;
+}
+
+.skill-picker > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skill-choice {
+  align-items: center;
+  border: 1px solid #cad4d9;
+  border-radius: 999px;
+  color: #34444d;
+  display: inline-flex;
+  flex-direction: row;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 10px;
+}
+
+.skill-choice input {
+  accent-color: #246b57;
+  margin: 0;
+  width: auto;
+}
+
 .skill-row {
   border: 1px solid #d9e0e3;
   border-radius: 8px;
