@@ -13,8 +13,8 @@ use axum::{
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, Task,
-    TaskAction, TaskAttempt, TaskId, UpdateMemory, UpdateTask,
+    ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, SkillId,
+    Task, TaskAction, TaskAttempt, TaskId, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memories/{id}/approve", post(approve_memory))
         .route("/api/memories/{id}/reject", post(reject_memory))
         .route("/api/skills", get(list_skills).post(create_skill))
+        .route("/api/skills/{id}", patch(update_skill).delete(delete_skill))
         .route("/api/scheduler/tick", post(run_scheduler_tick))
         .route("/api/events", get(events))
         .layer(CorsLayer::permissive())
@@ -406,6 +407,21 @@ async fn create_skill(
     Json(input): Json<CreateSkill>,
 ) -> Result<Json<Skill>, ApiError> {
     Ok(Json(state.db.create_skill(input, "main_agent").await?))
+}
+
+async fn update_skill(
+    State(state): State<AppState>,
+    Path(id): Path<SkillId>,
+    Json(input): Json<UpdateSkill>,
+) -> Result<Json<Skill>, ApiError> {
+    Ok(Json(state.db.update_skill(id, input, "main_agent").await?))
+}
+
+async fn delete_skill(
+    State(state): State<AppState>,
+    Path(id): Path<SkillId>,
+) -> Result<Json<Skill>, ApiError> {
+    Ok(Json(state.db.delete_skill(id, "main_agent").await?))
 }
 
 async fn events(

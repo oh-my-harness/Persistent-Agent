@@ -284,3 +284,12 @@ pub struct CreateSkill {
     pub tool_subset: Vec<String>,
     pub resource_path: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateSkill {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub trigger_rules: Option<Vec<String>>,
+    pub tool_subset: Option<Vec<String>>,
+    pub resource_path: Option<String>,
+}

@@ -283,6 +283,7 @@ textarea {
   border: 1px solid #d9e0e3;
   border-radius: 8px;
   display: grid;
+  grid-template-columns: 1fr auto;
   gap: 4px;
   padding: 12px;
 }
@@ -290,7 +291,40 @@ textarea {
 .skill-row p,
 .skill-row span {
   color: #657680;
+  display: block;
   margin: 0;
+}
+
+.skill-edit {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  margin-top: 10px;
+}
+
+.skill-edit label:last-child {
+  grid-column: 1 / -1;
+}
+
+.skill-edit textarea {
+  min-height: 72px;
+}
+
+.skill-actions {
+  align-content: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: end;
+}
+
+.skill-actions button {
+  background: #ffffff;
+  border: 1px solid #cad4d9;
+  border-radius: 6px;
+  font-weight: 700;
+  min-height: 34px;
+  padding: 6px 10px;
 }
 
 .memory-list {

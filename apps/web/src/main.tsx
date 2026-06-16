@@ -8,6 +8,7 @@ import {
   createSkill,
   createTask,
   deleteMemory,
+  deleteSkill,
   getTaskHistory,
   getTaskPoolSummary,
   listMainAgentMessages,
@@ -24,6 +25,7 @@ import {
   sendMainAgentMessage,
   sendTaskMessage,
   updateMemory,
+  updateSkill,
   updateTask,
 } from "./api";
 import type { ConversationMessage, Memory, Task, TaskType } from "./types";
@@ -133,15 +135,45 @@ function SkillManager() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [rules, setRules] = useState("");
+  const refresh = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["skills"] });
+    await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  };
   const mutation = useMutation({
     mutationFn: createSkill,
     onSuccess: async () => {
       setName("");
       setDescription("");
       setRules("");
-      await queryClient.invalidateQueries({ queryKey: ["skills"] });
+      await refresh();
     },
   });
+  const update = useMutation({
+    mutationFn: ({
+      id,
+      description,
+      name,
+      resourcePath,
+      rules,
+      tools,
+    }: {
+      id: string;
+      description: string;
+      name: string;
+      resourcePath: string;
+      rules: string;
+      tools: string;
+    }) =>
+      updateSkill(id, {
+        name: name.trim(),
+        description,
+        trigger_rules: splitCsv(rules),
+        tool_subset: splitCsv(tools),
+        resource_path: resourcePath.trim() || null,
+      }),
+    onSuccess: refresh,
+  });
+  const remove = useMutation({ mutationFn: deleteSkill, onSuccess: refresh });
 
   const visibleSkills = skills.data ?? [];
 
@@ -182,7 +214,14 @@ function SkillManager() {
       </form>
       <div className="skill-list">
         {visibleSkills.map((skill) => (
-          <SkillRow key={skill.id} skill={skill} />
+          <SkillRow
+            key={skill.id}
+            skill={skill}
+            onDelete={() => remove.mutate(skill.id)}
+            onUpdate={(name, description, rules, tools, resourcePath) =>
+              update.mutate({ id: skill.id, name, description, rules, tools, resourcePath })
+            }
+          />
         ))}
         {visibleSkills.length === 0 && <p className="empty">Add a skill to enable automatic task matching.</p>}
       </div>
@@ -190,12 +229,94 @@ function SkillManager() {
   );
 }
 
-function SkillRow({ skill }: { skill: Skill }) {
+function SkillRow({
+  skill,
+  onDelete,
+  onUpdate,
+}: {
+  skill: Skill;
+  onDelete: () => void;
+  onUpdate: (name: string, description: string, rules: string, tools: string, resourcePath: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(skill.name);
+  const [description, setDescription] = useState(skill.description);
+  const [rules, setRules] = useState(skill.trigger_rules.join(", "));
+  const [tools, setTools] = useState(skill.tool_subset.join(", "));
+  const [resourcePath, setResourcePath] = useState(skill.resource_path ?? "");
+
+  useEffect(() => {
+    setName(skill.name);
+    setDescription(skill.description);
+    setRules(skill.trigger_rules.join(", "));
+    setTools(skill.tool_subset.join(", "));
+    setResourcePath(skill.resource_path ?? "");
+  }, [skill.description, skill.name, skill.resource_path, skill.tool_subset, skill.trigger_rules]);
+
   return (
     <article className="skill-row">
-      <strong>{skill.name}</strong>
-      <p>{skill.description || "No description"}</p>
-      <span>{skill.trigger_rules.join(", ") || "no triggers"}</span>
+      <div>
+        <strong>{skill.name}</strong>
+        <p>{skill.description || "No description"}</p>
+        <span>{skill.trigger_rules.join(", ") || "no triggers"}</span>
+        {skill.tool_subset.length > 0 && <span>tools {skill.tool_subset.join(", ")}</span>}
+        {skill.resource_path && <span>resource {skill.resource_path}</span>}
+        {editing && (
+          <div className="skill-edit">
+            <label>
+              Name
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+            </label>
+            <label>
+              Triggers
+              <input value={rules} onChange={(event) => setRules(event.target.value)} />
+            </label>
+            <label>
+              Tool subset
+              <input value={tools} onChange={(event) => setTools(event.target.value)} />
+            </label>
+            <label>
+              Resource path
+              <input value={resourcePath} onChange={(event) => setResourcePath(event.target.value)} />
+            </label>
+            <label>
+              Description
+              <textarea value={description} onChange={(event) => setDescription(event.target.value)} />
+            </label>
+          </div>
+        )}
+      </div>
+      <div className="skill-actions">
+        {editing ? (
+          <>
+            <button
+              onClick={() => {
+                if (name.trim()) {
+                  onUpdate(name, description, rules, tools, resourcePath);
+                  setEditing(false);
+                }
+              }}
+            >
+              Save
+            </button>
+            <button
+              onClick={() => {
+                setName(skill.name);
+                setDescription(skill.description);
+                setRules(skill.trigger_rules.join(", "));
+                setTools(skill.tool_subset.join(", "));
+                setResourcePath(skill.resource_path ?? "");
+                setEditing(false);
+              }}
+            >
+              Close
+            </button>
+          </>
+        ) : (
+          <button onClick={() => setEditing(true)}>Edit</button>
+        )}
+        <button onClick={onDelete}>Delete</button>
+      </div>
     </article>
   );
 }

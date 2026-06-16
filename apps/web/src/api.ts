@@ -163,6 +163,14 @@ export interface CreateSkillInput {
   resource_path?: string | null;
 }
 
+export interface UpdateSkillInput {
+  name?: string;
+  description?: string;
+  trigger_rules?: string[];
+  tool_subset?: string[];
+  resource_path?: string | null;
+}
+
 export function listSkills(): Promise<Skill[]> {
   return request<Skill[]>("/api/skills");
 }
@@ -172,4 +180,15 @@ export function createSkill(input: CreateSkillInput): Promise<Skill> {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+export function updateSkill(id: string, input: UpdateSkillInput): Promise<Skill> {
+  return request<Skill>(`/api/skills/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteSkill(id: string): Promise<Skill> {
+  return request<Skill>(`/api/skills/${id}`, { method: "DELETE" });
 }

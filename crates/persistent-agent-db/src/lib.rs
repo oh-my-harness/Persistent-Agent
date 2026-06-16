@@ -1,8 +1,8 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
-    Memory, MemoryId, MemoryStatus, Skill, Task, TaskAction, TaskAttempt, TaskId, TaskStatus,
-    TaskType, UpdateMemory, UpdateTask,
+    Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskAttempt, TaskId,
+    TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -783,6 +783,79 @@ impl Db {
         rows.into_iter().map(row_to_skill).collect()
     }
 
+    pub async fn get_skill(&self, id: SkillId) -> anyhow::Result<Skill> {
+        let row = sqlx::query("SELECT * FROM skills WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+
+        row_to_skill(row)
+    }
+
+    pub async fn update_skill(
+        &self,
+        id: SkillId,
+        input: UpdateSkill,
+        actor: &str,
+    ) -> anyhow::Result<Skill> {
+        let current = self.get_skill(id).await?;
+        let name = input.name.unwrap_or(current.name);
+        let description = input.description.unwrap_or(current.description);
+        let trigger_rules = input.trigger_rules.unwrap_or(current.trigger_rules);
+        let tool_subset = input.tool_subset.unwrap_or(current.tool_subset);
+        let resource_path = input.resource_path.or(current.resource_path);
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            UPDATE skills
+            SET name = ?, description = ?, trigger_rules = ?, tool_subset = ?,
+                resource_path = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&name)
+        .bind(&description)
+        .bind(serde_json::to_string(&trigger_rules)?)
+        .bind(serde_json::to_string(&tool_subset)?)
+        .bind(&resource_path)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            None,
+            actor,
+            "update_skill",
+            json!({ "skill_id": id, "name": name, "trigger_rules": trigger_rules, "tool_subset": tool_subset }),
+        )
+        .await?;
+        self.refresh_all_task_skill_matches(actor).await?;
+
+        self.get_skill(id).await
+    }
+
+    pub async fn delete_skill(&self, id: SkillId, actor: &str) -> anyhow::Result<Skill> {
+        let skill = self.get_skill(id).await?;
+
+        sqlx::query("DELETE FROM skills WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.record_action(
+            None,
+            actor,
+            "delete_skill",
+            json!({ "skill_id": id, "name": skill.name }),
+        )
+        .await?;
+        self.refresh_all_task_skill_matches(actor).await?;
+
+        Ok(skill)
+    }
+
     async fn match_skills(&self, title: &str, description: &str) -> anyhow::Result<Vec<String>> {
         let skills = self.list_skills().await?;
         let haystack = format!("{title}\n{description}").to_lowercase();
@@ -798,6 +871,36 @@ impl Db {
             .collect();
 
         Ok(matched)
+    }
+
+    async fn refresh_all_task_skill_matches(&self, actor: &str) -> anyhow::Result<()> {
+        let rows = sqlx::query("SELECT * FROM tasks")
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let task = row_to_task(row)?;
+            let matched_skills = self.match_skills(&task.title, &task.description).await?;
+            if matched_skills == task.matched_skills {
+                continue;
+            }
+
+            sqlx::query("UPDATE tasks SET matched_skills = ?, updated_at = ? WHERE id = ?")
+                .bind(serde_json::to_string(&matched_skills)?)
+                .bind(Utc::now())
+                .bind(task.id.to_string())
+                .execute(&self.pool)
+                .await?;
+
+            self.record_action(
+                Some(task.id),
+                actor,
+                "refresh_matched_skills",
+                json!({ "matched_skills": matched_skills }),
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn next_queue_position(&self) -> anyhow::Result<i64> {
@@ -1174,6 +1277,65 @@ mod tests {
             .await?;
 
         assert_eq!(updated.matched_skills, vec!["github"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_can_be_updated_and_deleted() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let skill = db
+            .create_skill(
+                CreateSkill {
+                    name: "repo".to_owned(),
+                    description: "Repository work".to_owned(),
+                    trigger_rules: vec!["repository".to_owned()],
+                    tool_subset: vec!["shell".to_owned()],
+                    resource_path: None,
+                },
+                "test",
+            )
+            .await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Check GitHub issue".to_owned(),
+                    description: "Look for open issues".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        assert!(task.matched_skills.is_empty());
+
+        let updated = db
+            .update_skill(
+                skill.id,
+                UpdateSkill {
+                    name: Some("github".to_owned()),
+                    description: Some("GitHub issue work".to_owned()),
+                    trigger_rules: Some(vec!["github".to_owned(), "issue".to_owned()]),
+                    tool_subset: Some(vec!["github_search".to_owned()]),
+                    resource_path: Some("skills/github".to_owned()),
+                },
+                "test",
+            )
+            .await?;
+        let matched = db.get_task(task.id).await?;
+        let deleted = db.delete_skill(skill.id, "test").await?;
+        let unmatched = db.get_task(task.id).await?;
+
+        assert_eq!(updated.name, "github");
+        assert_eq!(updated.trigger_rules, vec!["github", "issue"]);
+        assert_eq!(updated.tool_subset, vec!["github_search"]);
+        assert_eq!(updated.resource_path.as_deref(), Some("skills/github"));
+        assert_eq!(matched.matched_skills, vec!["github"]);
+        assert_eq!(deleted.id, skill.id);
+        assert!(unmatched.matched_skills.is_empty());
 
         Ok(())
     }
