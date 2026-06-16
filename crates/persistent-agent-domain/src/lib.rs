@@ -234,6 +234,13 @@ pub struct TaskArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDependency {
+    pub task_id: TaskId,
+    pub depends_on_task_id: TaskId,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAction {
     pub id: Uuid,
     pub task_id: Option<TaskId>,

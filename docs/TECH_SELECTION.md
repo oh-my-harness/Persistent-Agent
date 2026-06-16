@@ -76,6 +76,7 @@ MVP behavior:
 
 - serial worker capacity: `1`;
 - deterministic queue ordering by `priority`, `queue_position`, and creation time;
+- dependency-aware claiming, so a queued task is skipped until its prerequisites are satisfied;
 - task lease before execution;
 - heartbeat while running;
 - explicit state transitions;
@@ -99,6 +100,7 @@ REST:
 
 - task CRUD;
 - queue reorder;
+- task dependency management;
 - pause, resume, cancel;
 - conversation message creation;
 - main-agent conversation message creation;

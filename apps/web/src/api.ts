@@ -5,6 +5,7 @@ import type {
   SchedulerTick,
   Skill,
   Task,
+  TaskDependency,
   TaskHistory,
   TaskMessageResponse,
   TaskPoolSummary,
@@ -93,6 +94,23 @@ export function reorderTask(id: string, queuePosition: number): Promise<Task> {
   return request<Task>(`/api/tasks/${id}/reorder`, {
     method: "POST",
     body: JSON.stringify({ queue_position: queuePosition }),
+  });
+}
+
+export function listTaskDependencies(id: string): Promise<TaskDependency[]> {
+  return request<TaskDependency[]>(`/api/tasks/${id}/dependencies`);
+}
+
+export function addTaskDependency(id: string, dependsOnTaskId: string): Promise<TaskDependency> {
+  return request<TaskDependency>(`/api/tasks/${id}/dependencies`, {
+    method: "POST",
+    body: JSON.stringify({ depends_on_task_id: dependsOnTaskId }),
+  });
+}
+
+export function removeTaskDependency(id: string, dependsOnTaskId: string): Promise<TaskDependency> {
+  return request<TaskDependency>(`/api/tasks/${id}/dependencies/${dependsOnTaskId}`, {
+    method: "DELETE",
   });
 }
 

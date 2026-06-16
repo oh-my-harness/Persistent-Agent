@@ -19,6 +19,7 @@ The repository now contains the first executable skeleton:
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
+- Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
@@ -88,6 +89,7 @@ Recommended fields:
 - `attempt_count`: execution attempts.
 - `last_run_at`: last execution timestamp.
 - `next_run_at`: next eligible execution timestamp.
+- `dependencies`: other tasks that must reach a satisfied state before this task can be claimed.
 - `blocked_reason`: reason the task needs user input.
 - `result_summary`: latest outcome summary.
 - `memory_candidates`: summaries proposed by worker agents.
@@ -135,16 +137,17 @@ The main agent owns a single execution loop:
 
 1. Wake on a timer or explicit user action.
 2. Find the first runnable task by queue order and priority.
-3. Resolve applicable skills.
-4. Start one worker agent for that task.
-5. Track logs, state, artifacts, and conversation messages.
-6. On success:
+3. Skip tasks whose dependencies are not yet satisfied.
+4. Resolve applicable skills.
+5. Start one worker agent for that task.
+6. Track logs, state, artifacts, and conversation messages.
+7. On success:
    - Mark one-off tasks as `completed`.
    - Move recurring tasks to `waiting_for_schedule` or the tail of the queue.
-7. On blocker:
+8. On blocker:
    - Mark task as `waiting_for_user`.
    - Post a concise request in the linked conversation.
-8. Review worker memory candidates and optionally promote useful ones into long-term memory.
+9. Review worker memory candidates and optionally promote useful ones into long-term memory.
 
 ### Future: Parallel Execution
 

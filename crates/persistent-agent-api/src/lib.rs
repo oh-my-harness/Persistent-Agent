@@ -8,14 +8,14 @@ use axum::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, SkillId,
-    Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskId, UpdateMemory,
-    UpdateSkill, UpdateTask,
+    Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskDependency, TaskId,
+    UpdateMemory, UpdateSkill, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}", get(get_task).patch(update_task))
         .route("/api/tasks/{id}/reprioritize", post(reprioritize_task))
         .route("/api/tasks/{id}/reorder", post(reorder_task))
+        .route(
+            "/api/tasks/{id}/dependencies",
+            get(task_dependencies).post(add_task_dependency),
+        )
+        .route(
+            "/api/tasks/{id}/dependencies/{depends_on_id}",
+            delete(remove_task_dependency),
+        )
         .route(
             "/api/tasks/{id}/messages",
             get(task_messages).post(send_task_message),
@@ -271,6 +279,7 @@ struct TaskHistoryResponse {
     attempts: Vec<TaskAttempt>,
     attempt_events: Vec<TaskAttemptEvent>,
     artifacts: Vec<TaskArtifact>,
+    dependencies: Vec<TaskDependency>,
     actions: Vec<TaskAction>,
 }
 
@@ -283,8 +292,49 @@ async fn task_history(
         attempts: state.db.list_task_attempts(id).await?,
         attempt_events: state.db.list_task_attempt_events(id).await?,
         artifacts: state.db.list_task_artifacts(id).await?,
+        dependencies: state.db.list_task_dependencies(id).await?,
         actions: state.db.list_task_actions(id).await?,
     }))
+}
+
+async fn task_dependencies(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Vec<TaskDependency>>, ApiError> {
+    state.db.get_task(id).await?;
+    Ok(Json(state.db.list_task_dependencies(id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskDependencyRequest {
+    depends_on_task_id: TaskId,
+}
+
+async fn add_task_dependency(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(input): Json<TaskDependencyRequest>,
+) -> Result<Json<TaskDependency>, ApiError> {
+    let dependency = state
+        .db
+        .add_task_dependency(id, input.depends_on_task_id, "main_agent")
+        .await?;
+    let task = state.db.get_task(id).await?;
+    state.events.send(AppEvent::TaskChanged { task });
+    Ok(Json(dependency))
+}
+
+async fn remove_task_dependency(
+    State(state): State<AppState>,
+    Path((id, depends_on_id)): Path<(TaskId, TaskId)>,
+) -> Result<Json<TaskDependency>, ApiError> {
+    let dependency = state
+        .db
+        .remove_task_dependency(id, depends_on_id, "main_agent")
+        .await?;
+    let task = state.db.get_task(id).await?;
+    state.events.send(AppEvent::TaskChanged { task });
+    Ok(Json(dependency))
 }
 
 async fn pause_task(

@@ -2,8 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
     Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskArtifact, TaskAttempt,
-    TaskAttemptEvent, TaskAttemptId, TaskId, TaskStatus, TaskType, UpdateMemory, UpdateSkill,
-    UpdateTask,
+    TaskAttemptEvent, TaskAttemptId, TaskDependency, TaskId, TaskStatus, TaskType, UpdateMemory,
+    UpdateSkill, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -302,6 +302,13 @@ impl Db {
             WHERE status = 'queued'
               AND (next_run_at IS NULL OR next_run_at <= ?)
               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM task_dependencies
+                JOIN tasks dependency_tasks ON dependency_tasks.id = task_dependencies.depends_on_task_id
+                WHERE task_dependencies.task_id = tasks.id
+                  AND dependency_tasks.status NOT IN ('completed', 'waiting_for_schedule')
+              )
             ORDER BY priority DESC, queue_position ASC, created_at ASC
             LIMIT 1
             "#,
@@ -612,6 +619,113 @@ impl Db {
         .await?;
 
         rows.into_iter().map(row_to_task_artifact).collect()
+    }
+
+    pub async fn add_task_dependency(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+        actor: &str,
+    ) -> anyhow::Result<TaskDependency> {
+        if task_id == depends_on_task_id {
+            anyhow::bail!("task cannot depend on itself");
+        }
+
+        self.get_task(task_id).await?;
+        self.get_task(depends_on_task_id).await?;
+
+        if self
+            .dependency_would_create_cycle(task_id, depends_on_task_id)
+            .await?
+        {
+            anyhow::bail!("task dependency would create a cycle");
+        }
+
+        let dependency = TaskDependency {
+            task_id,
+            depends_on_task_id,
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(dependency.task_id.to_string())
+        .bind(dependency.depends_on_task_id.to_string())
+        .bind(dependency.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            Some(task_id),
+            actor,
+            "add_task_dependency",
+            json!({ "depends_on_task_id": depends_on_task_id }),
+        )
+        .await?;
+
+        self.get_task_dependency(task_id, depends_on_task_id).await
+    }
+
+    pub async fn remove_task_dependency(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+        actor: &str,
+    ) -> anyhow::Result<TaskDependency> {
+        let dependency = self
+            .get_task_dependency(task_id, depends_on_task_id)
+            .await?;
+
+        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?")
+            .bind(task_id.to_string())
+            .bind(depends_on_task_id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.record_action(
+            Some(task_id),
+            actor,
+            "remove_task_dependency",
+            json!({ "depends_on_task_id": depends_on_task_id }),
+        )
+        .await?;
+
+        Ok(dependency)
+    }
+
+    pub async fn get_task_dependency(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+    ) -> anyhow::Result<TaskDependency> {
+        let row = sqlx::query(
+            "SELECT * FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?",
+        )
+        .bind(task_id.to_string())
+        .bind(depends_on_task_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row_to_task_dependency(row)
+    }
+
+    pub async fn list_task_dependencies(
+        &self,
+        task_id: TaskId,
+    ) -> anyhow::Result<Vec<TaskDependency>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_dependencies
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_dependency).collect()
     }
 
     pub async fn record_action(
@@ -1098,6 +1212,37 @@ impl Db {
             .await?;
         Ok(value.unwrap_or(0))
     }
+
+    async fn dependency_would_create_cycle(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+    ) -> anyhow::Result<bool> {
+        let mut stack = vec![depends_on_task_id];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(current_id) = stack.pop() {
+            if current_id == task_id {
+                return Ok(true);
+            }
+
+            if !visited.insert(current_id) {
+                continue;
+            }
+
+            let rows =
+                sqlx::query("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?")
+                    .bind(current_id.to_string())
+                    .fetch_all(&self.pool)
+                    .await?;
+
+            for row in rows {
+                stack.push(parse_uuid(row.try_get::<String, _>("depends_on_task_id")?)?);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 fn recurring_interval_seconds(schedule: Option<&Value>) -> i64 {
@@ -1203,6 +1348,14 @@ fn row_to_task_artifact(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskArti
         artifact_type: row.try_get("artifact_type")?,
         uri: row.try_get("uri")?,
         summary: row.try_get("summary")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
+fn row_to_task_dependency(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskDependency> {
+    Ok(TaskDependency {
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        depends_on_task_id: parse_uuid(row.try_get::<String, _>("depends_on_task_id")?)?,
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
     })
 }
@@ -1686,6 +1839,101 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "convert_task_type")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_dependency_blocks_claim_until_dependency_is_satisfied() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let dependency = db
+            .create_task(
+                CreateTask {
+                    title: "Prepare context".to_owned(),
+                    description: "Must run first".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 1,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let dependent = db
+            .create_task(
+                CreateTask {
+                    title: "Use prepared context".to_owned(),
+                    description: "Should wait for dependency".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 10,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        db.add_task_dependency(dependent.id, dependency.id, "test")
+            .await?;
+
+        let claimed_first = db.claim_next_runnable("worker", 60).await?;
+        assert_eq!(claimed_first.map(|task| task.id), Some(dependency.id));
+
+        db.complete_task(dependency.id, "done", "worker").await?;
+
+        let claimed_second = db.claim_next_runnable("worker", 60).await?;
+        assert_eq!(claimed_second.map(|task| task.id), Some(dependent.id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_dependency_rejects_self_and_cycles() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let first = db
+            .create_task(
+                CreateTask {
+                    title: "First".to_owned(),
+                    description: "First task".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let second = db
+            .create_task(
+                CreateTask {
+                    title: "Second".to_owned(),
+                    description: "Second task".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        assert!(
+            db.add_task_dependency(first.id, first.id, "test")
+                .await
+                .is_err()
+        );
+
+        db.add_task_dependency(first.id, second.id, "test").await?;
+
+        assert!(
+            db.add_task_dependency(second.id, first.id, "test")
+                .await
+                .is_err()
         );
 
         Ok(())

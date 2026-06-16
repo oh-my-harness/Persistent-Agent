@@ -114,6 +114,12 @@ export interface TaskArtifact {
   created_at: string;
 }
 
+export interface TaskDependency {
+  task_id: string;
+  depends_on_task_id: string;
+  created_at: string;
+}
+
 export interface TaskAction {
   id: string;
   task_id?: string | null;
@@ -127,6 +133,7 @@ export interface TaskHistory {
   attempts: TaskAttempt[];
   attempt_events: TaskAttemptEvent[];
   artifacts: TaskArtifact[];
+  dependencies: TaskDependency[];
   actions: TaskAction[];
 }
 
