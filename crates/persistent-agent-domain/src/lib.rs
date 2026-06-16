@@ -9,6 +9,7 @@ pub type ConversationId = Uuid;
 pub type TaskAttemptId = Uuid;
 pub type TaskAttemptEventId = Uuid;
 pub type TaskArtifactId = Uuid;
+pub type TaskNoteId = Uuid;
 pub type MemoryId = Uuid;
 pub type SkillId = Uuid;
 
@@ -237,6 +238,15 @@ pub struct TaskArtifact {
 pub struct TaskDependency {
     pub task_id: TaskId,
     pub depends_on_task_id: TaskId,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNote {
+    pub id: TaskNoteId,
+    pub task_id: TaskId,
+    pub actor: String,
+    pub content: String,
     pub created_at: DateTime<Utc>,
 }
 

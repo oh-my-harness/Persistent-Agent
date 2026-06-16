@@ -20,6 +20,7 @@ The repository now contains the first executable skeleton:
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
+- Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
@@ -90,6 +91,7 @@ Recommended fields:
 - `last_run_at`: last execution timestamp.
 - `next_run_at`: next eligible execution timestamp.
 - `dependencies`: other tasks that must reach a satisfied state before this task can be claimed.
+- `notes`: durable context, decisions, or reminders attached by the user or main agent.
 - `blocked_reason`: reason the task needs user input.
 - `result_summary`: latest outcome summary.
 - `memory_candidates`: summaries proposed by worker agents.

@@ -2,8 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
     Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskArtifact, TaskAttempt,
-    TaskAttemptEvent, TaskAttemptId, TaskDependency, TaskId, TaskStatus, TaskType, UpdateMemory,
-    UpdateSkill, UpdateTask,
+    TaskAttemptEvent, TaskAttemptId, TaskDependency, TaskId, TaskNote, TaskStatus, TaskType,
+    UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -728,6 +728,62 @@ impl Db {
         rows.into_iter().map(row_to_task_dependency).collect()
     }
 
+    pub async fn add_task_note(
+        &self,
+        task_id: TaskId,
+        content: &str,
+        actor: &str,
+    ) -> anyhow::Result<TaskNote> {
+        self.get_task(task_id).await?;
+        let note = TaskNote {
+            id: Uuid::now_v7(),
+            task_id,
+            actor: actor.to_owned(),
+            content: content.trim().to_owned(),
+            created_at: Utc::now(),
+        };
+
+        if note.content.is_empty() {
+            anyhow::bail!("task note content cannot be empty");
+        }
+
+        sqlx::query(
+            "INSERT INTO task_notes (id, task_id, actor, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(note.id.to_string())
+        .bind(note.task_id.to_string())
+        .bind(&note.actor)
+        .bind(&note.content)
+        .bind(note.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            Some(task_id),
+            actor,
+            "add_task_note",
+            json!({ "note_id": note.id, "content": note.content }),
+        )
+        .await?;
+
+        Ok(note)
+    }
+
+    pub async fn list_task_notes(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskNote>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_notes
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_note).collect()
+    }
+
     pub async fn record_action(
         &self,
         task_id: Option<TaskId>,
@@ -1360,6 +1416,16 @@ fn row_to_task_dependency(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskDe
     })
 }
 
+fn row_to_task_note(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskNote> {
+    Ok(TaskNote {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        actor: row.try_get("actor")?,
+        content: row.try_get("content")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
 fn row_to_task_action(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAction> {
     let task_id: Option<String> = row.try_get("task_id")?;
     let details: String = row.try_get("details")?;
@@ -1935,6 +2001,41 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_notes_can_be_recorded_and_listed() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Note check".to_owned(),
+                    description: "Record task notes".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let note = db
+            .add_task_note(task.id, "Remember staging approval.", "test")
+            .await?;
+        let notes = db.list_task_notes(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(note.content, "Remember staging approval.");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note.id);
+        assert!(actions.iter().any(|action| {
+            action.action_type == "add_task_note"
+                && action.details["note_id"] == note.id.to_string()
+        }));
 
         Ok(())
     }

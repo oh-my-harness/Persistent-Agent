@@ -101,6 +101,7 @@ REST:
 - task CRUD;
 - queue reorder;
 - task dependency management;
+- task note creation and listing;
 - pause, resume, cancel;
 - conversation message creation;
 - main-agent conversation message creation;

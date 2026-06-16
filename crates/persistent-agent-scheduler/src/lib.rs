@@ -7,7 +7,7 @@ use llm_adapter::{
 };
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationMessage, CreateMemory, Memory, MemoryStatus, Task, TaskStatus,
+    ConversationMessage, CreateMemory, Memory, MemoryStatus, Task, TaskNote, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -64,6 +64,7 @@ where
 
         let context = WorkerContext {
             memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
+            notes: self.db.list_task_notes(task.id).await?,
             conversation_messages: self.db.list_task_conversation_messages(task.id, 20).await?,
         };
         self.db
@@ -74,6 +75,7 @@ where
                 "Prepared worker context.",
                 json!({
                     "memory_count": context.memories.len(),
+                    "note_count": context.notes.len(),
                     "conversation_message_count": context.conversation_messages.len(),
                     "requested_skills": &task.requested_skills,
                     "matched_skills": &task.matched_skills,
@@ -204,6 +206,7 @@ pub trait TaskWorker: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerContext {
     pub memories: Vec<Memory>,
+    pub notes: Vec<TaskNote>,
     pub conversation_messages: Vec<ConversationMessage>,
 }
 
@@ -302,7 +305,12 @@ impl LlmWorkerConfig {
 impl TaskWorker for LlmWorker {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let config = self.config.clone();
-        let prompt = task_prompt(&task, &context.memories, &context.conversation_messages);
+        let prompt = task_prompt(
+            &task,
+            &context.memories,
+            &context.notes,
+            &context.conversation_messages,
+        );
         let result =
             tokio::task::spawn_blocking(move || dispatch_task_prompt(config, prompt)).await??;
 
@@ -356,10 +364,11 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
 fn task_prompt(
     task: &Task,
     memories: &[Memory],
+    notes: &[TaskNote],
     conversation_messages: &[ConversationMessage],
 ) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nRelevant approved memories:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nRelevant approved memories:\n{}\n\nTask notes:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -375,6 +384,7 @@ fn task_prompt(
         },
         active_skills(task).join(", "),
         format_memories(memories),
+        format_notes(notes),
         format_conversation(conversation_messages),
         task.description
     )
@@ -393,6 +403,18 @@ fn format_memories(memories: &[Memory]) -> String {
                 memory.scope, memory.confidence, memory.content
             )
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_notes(notes: &[TaskNote]) -> String {
+    if notes.is_empty() {
+        return "none".to_owned();
+    }
+
+    notes
+        .iter()
+        .map(|note| format!("- {}: {}", note.actor, note.content))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -849,7 +871,7 @@ mod tests {
             updated_at: now,
         };
 
-        let prompt = task_prompt(&task, &[], &[]);
+        let prompt = task_prompt(&task, &[], &[], &[]);
 
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
@@ -902,7 +924,7 @@ mod tests {
         };
 
         let memories = select_relevant_memories(&task, vec![unrelated, relevant], 5);
-        let prompt = task_prompt(&task, &memories, &[]);
+        let prompt = task_prompt(&task, &memories, &[], &[]);
 
         assert_eq!(memories.len(), 1);
         assert!(prompt.contains("Prefer cargo test --workspace"));
@@ -944,10 +966,48 @@ mod tests {
             created_at: now,
         }];
 
-        let prompt = task_prompt(&task, &[], &messages);
+        let prompt = task_prompt(&task, &[], &[], &messages);
 
         assert!(prompt.contains("Recent task conversation"));
         assert!(prompt.contains("user: The target repository"));
+    }
+
+    #[test]
+    fn injects_task_notes_into_prompt() {
+        let now = Utc::now();
+        let task = Task {
+            id: Uuid::now_v7(),
+            title: "Deploy release".to_owned(),
+            description: "Deploy after approvals.".to_owned(),
+            task_type: TaskType::OneOff,
+            status: TaskStatus::Queued,
+            priority: 0,
+            queue_position: 0,
+            created_by: "user".to_owned(),
+            conversation_id: None,
+            requested_skills: Vec::new(),
+            matched_skills: Vec::new(),
+            schedule: None,
+            attempt_count: 0,
+            last_run_at: None,
+            next_run_at: None,
+            blocked_reason: None,
+            result_summary: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let notes = vec![TaskNote {
+            id: Uuid::now_v7(),
+            task_id: task.id,
+            actor: "main_agent".to_owned(),
+            content: "Wait for staging approval.".to_owned(),
+            created_at: now,
+        }];
+
+        let prompt = task_prompt(&task, &[], &notes, &[]);
+
+        assert!(prompt.contains("Task notes"));
+        assert!(prompt.contains("main_agent: Wait for staging approval."));
     }
 
     #[test]

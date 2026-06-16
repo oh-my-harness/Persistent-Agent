@@ -15,7 +15,7 @@ use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, SkillId,
     Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskDependency, TaskId,
-    UpdateMemory, UpdateSkill, UpdateTask,
+    TaskNote, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,7 @@ pub fn router(state: AppState) -> Router {
             "/api/tasks/{id}/dependencies/{depends_on_id}",
             delete(remove_task_dependency),
         )
+        .route("/api/tasks/{id}/notes", get(task_notes).post(add_task_note))
         .route(
             "/api/tasks/{id}/messages",
             get(task_messages).post(send_task_message),
@@ -280,6 +281,7 @@ struct TaskHistoryResponse {
     attempt_events: Vec<TaskAttemptEvent>,
     artifacts: Vec<TaskArtifact>,
     dependencies: Vec<TaskDependency>,
+    notes: Vec<TaskNote>,
     actions: Vec<TaskAction>,
 }
 
@@ -293,6 +295,7 @@ async fn task_history(
         attempt_events: state.db.list_task_attempt_events(id).await?,
         artifacts: state.db.list_task_artifacts(id).await?,
         dependencies: state.db.list_task_dependencies(id).await?,
+        notes: state.db.list_task_notes(id).await?,
         actions: state.db.list_task_actions(id).await?,
     }))
 }
@@ -338,6 +341,30 @@ async fn remove_task_dependency(
         .await?;
     state.events.send(AppEvent::TaskChanged { task });
     Ok(Json(dependency))
+}
+
+async fn task_notes(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Vec<TaskNote>>, ApiError> {
+    state.db.get_task(id).await?;
+    Ok(Json(state.db.list_task_notes(id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskNoteRequest {
+    content: String,
+}
+
+async fn add_task_note(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(input): Json<TaskNoteRequest>,
+) -> Result<Json<TaskNote>, ApiError> {
+    let note = state.main_agent.add_task_note(id, &input.content).await?;
+    let task = state.db.get_task(id).await?;
+    state.events.send(AppEvent::TaskChanged { task });
+    Ok(Json(note))
 }
 
 async fn pause_task(

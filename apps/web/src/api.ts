@@ -8,6 +8,7 @@ import type {
   TaskDependency,
   TaskHistory,
   TaskMessageResponse,
+  TaskNote,
   TaskPoolSummary,
   TaskType,
 } from "./types";
@@ -111,6 +112,17 @@ export function addTaskDependency(id: string, dependsOnTaskId: string): Promise<
 export function removeTaskDependency(id: string, dependsOnTaskId: string): Promise<TaskDependency> {
   return request<TaskDependency>(`/api/tasks/${id}/dependencies/${dependsOnTaskId}`, {
     method: "DELETE",
+  });
+}
+
+export function listTaskNotes(id: string): Promise<TaskNote[]> {
+  return request<TaskNote[]>(`/api/tasks/${id}/notes`);
+}
+
+export function addTaskNote(id: string, content: string): Promise<TaskNote> {
+  return request<TaskNote>(`/api/tasks/${id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ content }),
   });
 }
 

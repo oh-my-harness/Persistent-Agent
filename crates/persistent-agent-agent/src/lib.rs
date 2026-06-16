@@ -1,6 +1,7 @@
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateTask, Task, TaskId, TaskStatus, TaskType, UpdateTask,
+    ConversationId, ConversationMessage, CreateTask, Task, TaskId, TaskNote, TaskStatus, TaskType,
+    UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,7 @@ const ZH_EVERY: &str = "\u{6bcf}";
 const ZH_INTERVAL: &str = "\u{95f4}\u{9694}";
 const ZH_DEPEND_ON: &str = "\u{4f9d}\u{8d56}";
 const ZH_REMOVE_DEPENDENCY: &str = "\u{53d6}\u{6d88}\u{4f9d}\u{8d56}";
+const ZH_NOTE: &str = "\u{5907}\u{6ce8}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -131,6 +133,10 @@ impl MainAgent {
             .remove_task_dependency(task_id, depends_on_task_id, "main_agent")
             .await?;
         self.db.get_task(task_id).await
+    }
+
+    pub async fn add_task_note(&self, task_id: TaskId, content: &str) -> anyhow::Result<TaskNote> {
+        self.db.add_task_note(task_id, content, "main_agent").await
     }
 
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
@@ -322,6 +328,16 @@ impl MainAgent {
                     (Err(reply), _) | (_, Err(reply)) => reply,
                 }
             }
+            MainAgentIntent::AddTaskNote { selector, content } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => {
+                        let note = self.add_task_note(task.id, &content).await?;
+                        changed_tasks.push(task.clone());
+                        format!("Added note to '{}': {}", task.title, note.content)
+                    }
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -337,7 +353,7 @@ impl MainAgent {
                 )
             }
             MainAgentIntent::Help => {
-                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: make task Deploy release depend on Build package.".to_owned()
+                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: add note to task Deploy release: wait for staging approval.".to_owned()
             }
         };
 
@@ -450,6 +466,10 @@ enum MainAgentIntent {
         selector: String,
         depends_on_selector: String,
     },
+    AddTaskNote {
+        selector: String,
+        content: String,
+    },
     Summarize,
     Help,
 }
@@ -472,6 +492,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_note_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -698,6 +722,56 @@ fn parse_dependency_intent(content: &str, normalized: &str) -> Option<MainAgentI
     None
 }
 
+fn parse_note_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "add note",
+            "note task",
+            "note to task",
+            "add note to task",
+            ZH_NOTE,
+        ],
+    ) {
+        return None;
+    }
+
+    split_note_selector_and_content(content)
+        .map(|(selector, content)| MainAgentIntent::AddTaskNote { selector, content })
+}
+
+fn split_note_selector_and_content(content: &str) -> Option<(String, String)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector_head = if head.contains(ZH_NOTE) {
+                head.split(ZH_NOTE).next().unwrap_or(head)
+            } else {
+                head
+            };
+            let selector = extract_task_selector(
+                selector_head,
+                &["note", "notes", "add", "to", "for", ZH_ADD, ZH_NOTE, ZH_TO],
+            );
+            let note = tail.trim();
+            if !selector.is_empty() && !note.is_empty() {
+                return Some((selector, note.to_owned()));
+            }
+        }
+    }
+
+    for marker in [" note ", " note: ", ZH_NOTE] {
+        if let Some((head, tail)) = content.split_once(marker) {
+            let selector = extract_task_selector(head, &[]);
+            let note = tail.trim().trim_matches([':', '\u{ff1a}']).trim();
+            if !selector.is_empty() && !note.is_empty() {
+                return Some((selector, note.to_owned()));
+            }
+        }
+    }
+
+    None
+}
+
 fn split_dependency_selectors(
     content: &str,
     normalized: &str,
@@ -757,6 +831,11 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "remove dependency",
         "delete dependency",
         "clear dependency",
+        "add note to task",
+        "add note",
+        "note to task",
+        "note task",
+        "note",
         "reprioritize",
         "set priority",
         "change priority",
@@ -775,6 +854,7 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         ZH_PAUSE,
         ZH_RESUME,
         ZH_CANCEL,
+        ZH_NOTE,
         ZH_ADJUST,
         ZH_MOVE,
         ZH_CHANGE_TO,
@@ -1049,6 +1129,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_task_note_intents() {
+        assert_eq!(
+            parse_intent("add note to task Deploy release: wait for staging approval"),
+            MainAgentIntent::AddTaskNote {
+                selector: "Deploy release".to_owned(),
+                content: "wait for staging approval".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{7ed9}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{6dfb}\u{52a0}\u{5907}\u{6ce8}\u{ff1a}\u{7b49}\u{5f85} staging \u{5ba1}\u{6279}"
+            ),
+            MainAgentIntent::AddTaskNote {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                content: "\u{7b49}\u{5f85} staging \u{5ba1}\u{6279}".to_owned(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
@@ -1176,6 +1276,37 @@ mod tests {
                 .content
                 .contains("Removed dependency")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_add_task_note_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "add note to task Deploy release: wait for staging approval".to_owned(),
+            })
+            .await?;
+        let notes = db.list_task_notes(task.id).await?;
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "wait for staging approval");
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Added note"));
 
         Ok(())
     }

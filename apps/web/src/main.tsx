@@ -945,6 +945,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const attempts = history.data?.attempts ?? [];
   const attemptEvents = history.data?.attempt_events ?? [];
   const artifacts = history.data?.artifacts ?? [];
+  const notes = history.data?.notes ?? [];
   const actions = history.data?.actions ?? [];
 
   return (
@@ -989,6 +990,19 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && artifacts.length === 0 && <p className="empty">No artifacts yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Notes</h4>
+        {notes.map((note) => (
+          <div className="history-item" key={note.id}>
+            <div>
+              <strong>{note.actor}</strong>
+              <time>{new Date(note.created_at).toLocaleString()}</time>
+            </div>
+            <p>{note.content}</p>
+          </div>
+        ))}
+        {!history.isLoading && notes.length === 0 && <p className="empty">No notes yet.</p>}
       </div>
       <div className="history-column">
         <h4>Actions</h4>
