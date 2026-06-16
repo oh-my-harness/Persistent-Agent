@@ -159,6 +159,7 @@ export interface TaskHistory {
   attempts: TaskAttempt[];
   attempt_events: TaskAttemptEvent[];
   artifacts: TaskArtifact[];
+  memory_candidates: Memory[];
   dependencies: TaskDependency[];
   resource_locks: TaskResourceLock[];
   notes: TaskNote[];

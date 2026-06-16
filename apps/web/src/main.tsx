@@ -1045,6 +1045,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const attempts = history.data?.attempts ?? [];
   const attemptEvents = history.data?.attempt_events ?? [];
   const artifacts = history.data?.artifacts ?? [];
+  const memoryCandidates = history.data?.memory_candidates ?? [];
   const resourceLocks = history.data?.resource_locks ?? [];
   const notes = history.data?.notes ?? [];
   const actions = history.data?.actions ?? [];
@@ -1104,6 +1105,19 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && artifacts.length === 0 && <p className="empty">No artifacts yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Memory Candidates</h4>
+        {memoryCandidates.map((memory) => (
+          <div className="history-item" key={memory.id}>
+            <div>
+              <span className={`status ${memory.status}`}>{memory.status}</span>
+              <span>{memory.confidence.toFixed(2)}</span>
+            </div>
+            <p>{memory.content}</p>
+          </div>
+        ))}
+        {!history.isLoading && memoryCandidates.length === 0 && <p className="empty">No memory candidates yet.</p>}
       </div>
       <div className="history-column">
         <h4>Resource Locks</h4>

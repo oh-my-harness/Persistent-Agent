@@ -35,6 +35,7 @@ The repository now contains the first executable skeleton:
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate review, edit/delete controls, and approved-memory injection into worker context.
+- Task detail history shows memory candidates proposed by that task.
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.
 - Worker-completed results can create auditable one-off follow-up tasks in the queue.

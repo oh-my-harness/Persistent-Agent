@@ -1266,6 +1266,28 @@ impl Db {
         rows.into_iter().map(row_to_memory).collect()
     }
 
+    pub async fn list_task_memories(&self, task_id: TaskId) -> anyhow::Result<Vec<Memory>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM memories
+            WHERE source_task_id = ?
+            ORDER BY
+              CASE status
+                WHEN 'pending' THEN 0
+                WHEN 'approved' THEN 1
+                ELSE 2
+              END,
+              confidence DESC,
+              created_at DESC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_memory).collect()
+    }
+
     pub async fn set_memory_status(
         &self,
         id: MemoryId,
@@ -1877,6 +1899,80 @@ mod tests {
         assert_eq!(approved.len(), 1);
         assert_eq!(approved[0].content, "Approved memory");
         assert_ne!(approved[0].id, pending.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_memories_are_listed_by_source_task() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Memory source".to_owned(),
+                    description: "Record candidates".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let other_task = db
+            .create_task(
+                CreateTask {
+                    title: "Other source".to_owned(),
+                    description: "Should not appear".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "task".to_owned(),
+                content: "Pending candidate".to_owned(),
+                source_task_id: Some(task.id),
+                status: MemoryStatus::Pending,
+                confidence: 0.5,
+            },
+            "test",
+        )
+        .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "task".to_owned(),
+                content: "Approved candidate".to_owned(),
+                source_task_id: Some(task.id),
+                status: MemoryStatus::Approved,
+                confidence: 0.9,
+            },
+            "test",
+        )
+        .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "task".to_owned(),
+                content: "Other candidate".to_owned(),
+                source_task_id: Some(other_task.id),
+                status: MemoryStatus::Pending,
+                confidence: 1.0,
+            },
+            "test",
+        )
+        .await?;
+
+        let memories = db.list_task_memories(task.id).await?;
+
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[0].content, "Pending candidate");
+        assert_eq!(memories[1].content, "Approved candidate");
 
         Ok(())
     }
