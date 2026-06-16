@@ -74,6 +74,29 @@ export interface TaskMessageResponse {
   task: Task;
 }
 
+export interface TaskAttempt {
+  id: string;
+  task_id: string;
+  status: TaskStatus;
+  summary?: string | null;
+  started_at: string;
+  finished_at?: string | null;
+}
+
+export interface TaskAction {
+  id: string;
+  task_id?: string | null;
+  actor: string;
+  action_type: string;
+  details: unknown;
+  created_at: string;
+}
+
+export interface TaskHistory {
+  attempts: TaskAttempt[];
+  actions: TaskAction[];
+}
+
 export type MemoryStatus = "pending" | "approved" | "rejected";
 
 export interface Memory {

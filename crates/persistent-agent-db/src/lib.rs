@@ -401,6 +401,21 @@ impl Db {
         })
     }
 
+    pub async fn list_task_attempts(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskAttempt>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_attempts
+            WHERE task_id = ?
+            ORDER BY started_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_attempt).collect()
+    }
+
     pub async fn record_action(
         &self,
         task_id: Option<TaskId>,
@@ -430,6 +445,21 @@ impl Db {
         .await?;
 
         Ok(action)
+    }
+
+    pub async fn list_task_actions(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskAction>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_actions
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_action).collect()
     }
 
     pub async fn get_or_create_main_conversation(&self) -> anyhow::Result<Conversation> {
@@ -774,6 +804,31 @@ fn row_to_conversation_message(
     })
 }
 
+fn row_to_task_attempt(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAttempt> {
+    let status: String = row.try_get("status")?;
+    Ok(TaskAttempt {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        status: status.parse()?,
+        summary: row.try_get("summary")?,
+        started_at: row.try_get::<DateTime<Utc>, _>("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
+fn row_to_task_action(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAction> {
+    let task_id: Option<String> = row.try_get("task_id")?;
+    let details: String = row.try_get("details")?;
+    Ok(TaskAction {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        task_id: task_id.map(parse_uuid).transpose()?,
+        actor: row.try_get("actor")?,
+        action_type: row.try_get("action_type")?,
+        details: serde_json::from_str(&details)?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
 fn row_to_task(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
     let requested_skills: String = row.try_get("requested_skills")?;
     let matched_skills: String = row.try_get("matched_skills")?;
@@ -924,6 +979,47 @@ mod tests {
             .await?;
 
         assert_eq!(task.matched_skills, vec!["github"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_history_lists_attempts_and_actions() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "History check".to_owned(),
+                    description: "Record history".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.create_attempt(task.id, TaskStatus::Running, Some("started"))
+            .await?;
+        db.set_task_status(task.id, TaskStatus::Paused, "test", None)
+            .await?;
+
+        let attempts = db.list_task_attempts(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].summary.as_deref(), Some("started"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "create_task")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "set_task_status")
+        );
 
         Ok(())
     }

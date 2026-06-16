@@ -5,6 +5,7 @@ import type {
   SchedulerTick,
   Skill,
   Task,
+  TaskHistory,
   TaskMessageResponse,
   TaskPoolSummary,
   TaskType,
@@ -90,6 +91,10 @@ export function sendTaskMessage(id: string, content: string): Promise<TaskMessag
     method: "POST",
     body: JSON.stringify({ content }),
   });
+}
+
+export function getTaskHistory(id: string): Promise<TaskHistory> {
+  return request<TaskHistory>(`/api/tasks/${id}/history`);
 }
 
 export function listMemories(): Promise<Memory[]> {

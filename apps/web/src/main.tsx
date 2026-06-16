@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, CirclePause, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
+import { Bot, CirclePause, History, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
 import {
   approveMemory,
   cancelTask,
   createSkill,
   createTask,
+  getTaskHistory,
   getTaskPoolSummary,
   listMainAgentMessages,
   listMemories,
@@ -416,9 +417,11 @@ function TaskComposer() {
 
 function TaskRow({ task }: { task: Task }) {
   const queryClient = useQueryClient();
+  const [showHistory, setShowHistory] = useState(false);
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ["tasks"] });
     await queryClient.invalidateQueries({ queryKey: ["summary"] });
+    await queryClient.invalidateQueries({ queryKey: ["task-history", task.id] });
   };
   const pause = useMutation({ mutationFn: pauseTask, onSuccess: refresh });
   const resume = useMutation({ mutationFn: resumeTask, onSuccess: refresh });
@@ -444,6 +447,7 @@ function TaskRow({ task }: { task: Task }) {
         </div>
       </div>
       <div className="task-actions">
+        <button title="Execution history" onClick={() => setShowHistory((value) => !value)}><History size={16} /></button>
         {task.status === "paused" ? (
           <button title="Resume task" onClick={() => resume.mutate(task.id)}><Play size={16} /></button>
         ) : (
@@ -452,7 +456,49 @@ function TaskRow({ task }: { task: Task }) {
         <button title="Cancel task" onClick={() => cancel.mutate(task.id)}><SquareX size={16} /></button>
       </div>
       {task.status === "waiting_for_user" && <TaskConversation task={task} />}
+      {showHistory && <TaskHistoryPanel taskId={task.id} />}
     </article>
+  );
+}
+
+function TaskHistoryPanel({ taskId }: { taskId: string }) {
+  const history = useQuery({
+    queryKey: ["task-history", taskId],
+    queryFn: () => getTaskHistory(taskId),
+  });
+  const attempts = history.data?.attempts ?? [];
+  const actions = history.data?.actions ?? [];
+
+  return (
+    <div className="task-history">
+      <div className="history-column">
+        <h4>Attempts</h4>
+        {attempts.map((attempt) => (
+          <div className="history-item" key={attempt.id}>
+            <div>
+              <span className={`status ${attempt.status.replaceAll("_", "-")}`}>{attempt.status.replaceAll("_", " ")}</span>
+              <time>{new Date(attempt.started_at).toLocaleString()}</time>
+            </div>
+            <p>{attempt.summary || "No summary"}</p>
+          </div>
+        ))}
+        {!history.isLoading && attempts.length === 0 && <p className="empty">No attempts yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Actions</h4>
+        {actions.map((action) => (
+          <div className="history-item" key={action.id}>
+            <div>
+              <strong>{action.action_type}</strong>
+              <time>{new Date(action.created_at).toLocaleString()}</time>
+            </div>
+            <p>{action.actor}</p>
+            <code>{JSON.stringify(action.details)}</code>
+          </div>
+        ))}
+        {!history.isLoading && actions.length === 0 && <p className="empty">No actions yet.</p>}
+      </div>
+    </div>
   );
 }
 

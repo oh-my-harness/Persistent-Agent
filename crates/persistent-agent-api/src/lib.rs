@@ -14,7 +14,7 @@ use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, Task,
-    TaskId, UpdateTask,
+    TaskAction, TaskAttempt, TaskId, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
             "/api/tasks/{id}/messages",
             get(task_messages).post(send_task_message),
         )
+        .route("/api/tasks/{id}/history", get(task_history))
         .route("/api/tasks/{id}/pause", post(pause_task))
         .route("/api/tasks/{id}/resume", post(resume_task))
         .route("/api/tasks/{id}/cancel", post(cancel_task))
@@ -256,6 +257,23 @@ async fn send_task_message(
         user_message,
         assistant_message,
         task,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct TaskHistoryResponse {
+    attempts: Vec<TaskAttempt>,
+    actions: Vec<TaskAction>,
+}
+
+async fn task_history(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TaskHistoryResponse>, ApiError> {
+    state.db.get_task(id).await?;
+    Ok(Json(TaskHistoryResponse {
+        attempts: state.db.list_task_attempts(id).await?,
+        actions: state.db.list_task_actions(id).await?,
     }))
 }
 
