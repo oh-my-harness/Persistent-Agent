@@ -557,6 +557,7 @@ textarea {
   padding-top: 12px;
 }
 
+.task-edit,
 .task-result {
   background: #f7f9fa;
   border: 1px solid #e1e7ea;
@@ -566,6 +567,14 @@ textarea {
   padding: 12px;
 }
 
+.task-edit-heading {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.task-edit-heading h4,
 .task-result h4 {
   color: #52636c;
   font-size: 13px;
@@ -573,7 +582,52 @@ textarea {
   text-transform: uppercase;
 }
 
+.task-edit-heading > div {
+  display: flex;
+  gap: 8px;
+}
+
+.task-edit button,
+.task-edit-heading button {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #cad4d9;
+  border-radius: 6px;
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.task-edit button:disabled {
+  opacity: 0.45;
+}
+
+.task-edit-fields {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.task-edit-fields textarea {
+  min-height: 88px;
+}
+
+.task-brief {
+  display: grid;
+  gap: 4px;
+}
+
+.task-brief strong {
+  color: #172026;
+}
+
 .task-result p {
+  color: #34444d;
+  margin: 0;
+}
+
+.task-brief p {
   color: #34444d;
   margin: 0;
 }

@@ -17,6 +17,7 @@ The repository now contains the first executable skeleton:
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
 - Main-agent conversation commands in Chinese and English for create, pause, resume, cancel, reprioritize, reorder, and summarize.
 - Web task pool controls for priority and queue-position changes.
+- Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.

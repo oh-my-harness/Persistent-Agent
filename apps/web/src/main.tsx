@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, Check, CirclePause, History, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
+import { Bot, Check, CirclePause, History, ListTodo, Pencil, Play, Plus, RotateCw, Send, SquareX, X, Zap } from "lucide-react";
 import {
   approveMemory,
   cancelTask,
@@ -24,6 +24,7 @@ import {
   sendMainAgentMessage,
   sendTaskMessage,
   updateMemory,
+  updateTask,
 } from "./api";
 import type { ConversationMessage, Memory, Task, TaskType } from "./types";
 import type { Skill } from "./types";
@@ -352,7 +353,7 @@ function MainAgentChat() {
           <MessageBubble key={message.id} message={message} />
         ))}
         {visibleMessages.length === 0 && (
-          <p className="empty">Try: 创建任务：检查 Persistent-Agent 的 README 是否需要更新</p>
+          <p className="empty">Try: create task: Check whether the Persistent-Agent README needs updates</p>
         )}
       </div>
       <form
@@ -586,6 +587,7 @@ function TaskRow({ task }: { task: Task }) {
 function TaskDetailPanel({ task }: { task: Task }) {
   return (
     <div className="task-detail">
+      <TaskEditForm task={task} />
       <section className="task-result">
         <h4>Latest result</h4>
         {task.result_summary ? <p>{task.result_summary}</p> : <p className="empty">No result summary yet.</p>}
@@ -599,6 +601,80 @@ function TaskDetailPanel({ task }: { task: Task }) {
       <TaskConversation task={task} />
       <TaskHistoryPanel taskId={task.id} />
     </div>
+  );
+}
+
+function TaskEditForm({ task }: { task: Task }) {
+  const queryClient = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(task.title);
+  const [description, setDescription] = useState(task.description);
+
+  useEffect(() => {
+    setTitle(task.title);
+    setDescription(task.description);
+  }, [task.title, task.description]);
+
+  const mutation = useMutation({
+    mutationFn: () => updateTask(task.id, { title: title.trim(), description }),
+    onSuccess: async () => {
+      setEditing(false);
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["summary"] });
+      await queryClient.invalidateQueries({ queryKey: ["task-history", task.id] });
+    },
+  });
+
+  return (
+    <section className="task-edit">
+      <div className="task-edit-heading">
+        <h4>Task brief</h4>
+        {editing ? (
+          <div>
+            <button
+              title="Save task brief"
+              onClick={() => {
+                if (title.trim()) mutation.mutate();
+              }}
+              disabled={mutation.isPending || !title.trim()}
+            >
+              <Check size={15} />
+            </button>
+            <button
+              title="Cancel editing"
+              onClick={() => {
+                setTitle(task.title);
+                setDescription(task.description);
+                setEditing(false);
+              }}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        ) : (
+          <button title="Edit task brief" onClick={() => setEditing(true)}>
+            <Pencil size={15} />
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="task-edit-fields">
+          <label>
+            Title
+            <input value={title} onChange={(event) => setTitle(event.target.value)} />
+          </label>
+          <label>
+            Description
+            <textarea value={description} onChange={(event) => setDescription(event.target.value)} />
+          </label>
+        </div>
+      ) : (
+        <div className="task-brief">
+          <strong>{task.title}</strong>
+          <p>{task.description || "No description"}</p>
+        </div>
+      )}
+    </section>
   );
 }
 

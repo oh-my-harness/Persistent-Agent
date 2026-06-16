@@ -55,6 +55,21 @@ export function createTask(input: CreateTaskInput): Promise<Task> {
   });
 }
 
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string;
+  priority?: number;
+  requested_skills?: string[];
+  schedule?: unknown;
+}
+
+export function updateTask(id: string, input: UpdateTaskInput): Promise<Task> {
+  return request<Task>(`/api/tasks/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
 export function pauseTask(id: string): Promise<Task> {
   return request<Task>(`/api/tasks/${id}/pause`, { method: "POST" });
 }
