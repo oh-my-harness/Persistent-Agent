@@ -20,6 +20,7 @@ The repository now contains the first executable skeleton:
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
+- Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek LLM worker with structured completed/blocked result parsing.
@@ -93,6 +94,7 @@ Recommended fields:
 - `last_run_at`: last execution timestamp.
 - `next_run_at`: next eligible execution timestamp.
 - `dependencies`: other tasks that must reach a satisfied state before this task can be claimed.
+- `resource_locks`: exclusive resources such as repositories, files, or services that should not be handled concurrently.
 - `notes`: durable context, decisions, or reminders attached by the user or main agent.
 - `blocked_reason`: reason the task needs user input.
 - `result_summary`: latest outcome summary.
@@ -141,7 +143,7 @@ The main agent owns a single execution loop:
 
 1. Wake on a timer or explicit user action.
 2. Find the first runnable task by queue order and priority.
-3. Skip tasks whose dependencies are not yet satisfied.
+3. Skip tasks whose dependencies are not yet satisfied or whose exclusive resources are already held by a running task.
 4. Resolve applicable skills.
 5. Start one worker agent for that task.
 6. Track logs, state, artifacts, and conversation messages.

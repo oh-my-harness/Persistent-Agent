@@ -120,6 +120,13 @@ export interface TaskDependency {
   created_at: string;
 }
 
+export interface TaskResourceLock {
+  task_id: string;
+  resource_key: string;
+  lock_mode: string;
+  created_at: string;
+}
+
 export interface TaskNote {
   id: string;
   task_id: string;
@@ -142,6 +149,7 @@ export interface TaskHistory {
   attempt_events: TaskAttemptEvent[];
   artifacts: TaskArtifact[];
   dependencies: TaskDependency[];
+  resource_locks: TaskResourceLock[];
   notes: TaskNote[];
   actions: TaskAction[];
 }

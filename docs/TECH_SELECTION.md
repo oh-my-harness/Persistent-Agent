@@ -77,6 +77,7 @@ MVP behavior:
 - serial worker capacity: `1`;
 - deterministic queue ordering by `priority`, `queue_position`, and creation time;
 - dependency-aware claiming, so a queued task is skipped until its prerequisites are satisfied;
+- resource-lock-aware claiming, so tasks can declare exclusive repositories, files, or services before future parallel workers are enabled;
 - task lease before execution;
 - heartbeat while running;
 - explicit state transitions;
@@ -85,9 +86,8 @@ MVP behavior:
 Future parallelism:
 
 - increase global worker capacity;
-- add per-skill and per-resource locks;
-- add task dependencies;
-- add repository/workspace exclusive locks;
+- add per-skill and capacity-based resource policies;
+- broaden repository/workspace locks beyond exclusive mode when needed;
 - add scheduler policies without changing task records.
 
 The scheduler should not be hidden inside the UI or a single process-local memory queue. The database is the coordination boundary.
@@ -101,6 +101,7 @@ REST:
 - task CRUD;
 - queue reorder;
 - task dependency management;
+- task resource lock management;
 - task note creation and listing;
 - pause, resume, cancel;
 - conversation message creation;

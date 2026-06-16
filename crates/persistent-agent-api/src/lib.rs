@@ -15,7 +15,7 @@ use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, SkillId,
     Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskDependency, TaskId,
-    TaskNote, UpdateMemory, UpdateSkill, UpdateTask,
+    TaskNote, TaskResourceLock, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerPolicy, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,12 @@ pub fn router(state: AppState) -> Router {
             delete(remove_task_dependency),
         )
         .route("/api/tasks/{id}/notes", get(task_notes).post(add_task_note))
+        .route(
+            "/api/tasks/{id}/resource-locks",
+            get(task_resource_locks)
+                .post(add_task_resource_lock)
+                .delete(remove_task_resource_lock),
+        )
         .route(
             "/api/tasks/{id}/messages",
             get(task_messages).post(send_task_message),
@@ -289,6 +295,7 @@ struct TaskHistoryResponse {
     attempt_events: Vec<TaskAttemptEvent>,
     artifacts: Vec<TaskArtifact>,
     dependencies: Vec<TaskDependency>,
+    resource_locks: Vec<TaskResourceLock>,
     notes: Vec<TaskNote>,
     actions: Vec<TaskAction>,
 }
@@ -303,6 +310,7 @@ async fn task_history(
         attempt_events: state.db.list_task_attempt_events(id).await?,
         artifacts: state.db.list_task_artifacts(id).await?,
         dependencies: state.db.list_task_dependencies(id).await?,
+        resource_locks: state.db.list_task_resource_locks(id).await?,
         notes: state.db.list_task_notes(id).await?,
         actions: state.db.list_task_actions(id).await?,
     }))
@@ -373,6 +381,47 @@ async fn add_task_note(
     let task = state.db.get_task(id).await?;
     state.events.send(AppEvent::TaskChanged { task });
     Ok(Json(note))
+}
+
+async fn task_resource_locks(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Vec<TaskResourceLock>>, ApiError> {
+    state.db.get_task(id).await?;
+    Ok(Json(state.db.list_task_resource_locks(id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskResourceLockRequest {
+    resource_key: String,
+}
+
+async fn add_task_resource_lock(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(input): Json<TaskResourceLockRequest>,
+) -> Result<Json<TaskResourceLock>, ApiError> {
+    let resource_lock = state
+        .db
+        .add_task_resource_lock(id, &input.resource_key, "main_agent")
+        .await?;
+    let task = state.db.get_task(id).await?;
+    state.events.send(AppEvent::TaskChanged { task });
+    Ok(Json(resource_lock))
+}
+
+async fn remove_task_resource_lock(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(input): Json<TaskResourceLockRequest>,
+) -> Result<Json<TaskResourceLock>, ApiError> {
+    let resource_lock = state
+        .db
+        .remove_task_resource_lock(id, &input.resource_key, "main_agent")
+        .await?;
+    let task = state.db.get_task(id).await?;
+    state.events.send(AppEvent::TaskChanged { task });
+    Ok(Json(resource_lock))
 }
 
 async fn pause_task(

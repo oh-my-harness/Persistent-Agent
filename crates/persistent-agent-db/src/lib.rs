@@ -2,8 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
     Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskArtifact, TaskAttempt,
-    TaskAttemptEvent, TaskAttemptId, TaskDependency, TaskId, TaskNote, TaskStatus, TaskType,
-    UpdateMemory, UpdateSkill, UpdateTask,
+    TaskAttemptEvent, TaskAttemptId, TaskDependency, TaskId, TaskNote, TaskResourceLock,
+    TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -309,10 +309,24 @@ impl Db {
                 WHERE task_dependencies.task_id = tasks.id
                   AND dependency_tasks.status NOT IN ('completed', 'waiting_for_schedule')
               )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM task_resource_locks candidate_locks
+                JOIN task_resource_locks running_locks
+                  ON running_locks.resource_key = candidate_locks.resource_key
+                 AND running_locks.lock_mode = 'exclusive'
+                JOIN tasks running_tasks ON running_tasks.id = running_locks.task_id
+                WHERE candidate_locks.task_id = tasks.id
+                  AND candidate_locks.lock_mode = 'exclusive'
+                  AND running_tasks.status = 'running'
+                  AND running_tasks.id <> tasks.id
+                  AND (running_tasks.lease_expires_at IS NULL OR running_tasks.lease_expires_at > ?)
+              )
             ORDER BY priority DESC, queue_position ASC, created_at ASC
             LIMIT 1
             "#,
         )
+        .bind(now)
         .bind(now)
         .bind(now)
         .fetch_optional(&mut *tx)
@@ -726,6 +740,103 @@ impl Db {
         .await?;
 
         rows.into_iter().map(row_to_task_dependency).collect()
+    }
+
+    pub async fn add_task_resource_lock(
+        &self,
+        task_id: TaskId,
+        resource_key: &str,
+        actor: &str,
+    ) -> anyhow::Result<TaskResourceLock> {
+        self.get_task(task_id).await?;
+        let resource_key = normalize_resource_key(resource_key)?;
+        let resource_lock = TaskResourceLock {
+            task_id,
+            resource_key,
+            lock_mode: "exclusive".to_owned(),
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO task_resource_locks (task_id, resource_key, lock_mode, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(resource_lock.task_id.to_string())
+        .bind(&resource_lock.resource_key)
+        .bind(&resource_lock.lock_mode)
+        .bind(resource_lock.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            Some(task_id),
+            actor,
+            "add_task_resource_lock",
+            json!({ "resource_key": resource_lock.resource_key, "lock_mode": resource_lock.lock_mode }),
+        )
+        .await?;
+
+        self.get_task_resource_lock(task_id, &resource_lock.resource_key)
+            .await
+    }
+
+    pub async fn remove_task_resource_lock(
+        &self,
+        task_id: TaskId,
+        resource_key: &str,
+        actor: &str,
+    ) -> anyhow::Result<TaskResourceLock> {
+        let resource_key = normalize_resource_key(resource_key)?;
+        let resource_lock = self.get_task_resource_lock(task_id, &resource_key).await?;
+
+        sqlx::query("DELETE FROM task_resource_locks WHERE task_id = ? AND resource_key = ?")
+            .bind(task_id.to_string())
+            .bind(&resource_key)
+            .execute(&self.pool)
+            .await?;
+
+        self.record_action(
+            Some(task_id),
+            actor,
+            "remove_task_resource_lock",
+            json!({ "resource_key": resource_key }),
+        )
+        .await?;
+
+        Ok(resource_lock)
+    }
+
+    pub async fn get_task_resource_lock(
+        &self,
+        task_id: TaskId,
+        resource_key: &str,
+    ) -> anyhow::Result<TaskResourceLock> {
+        let resource_key = normalize_resource_key(resource_key)?;
+        let row =
+            sqlx::query("SELECT * FROM task_resource_locks WHERE task_id = ? AND resource_key = ?")
+                .bind(task_id.to_string())
+                .bind(resource_key)
+                .fetch_one(&self.pool)
+                .await?;
+
+        row_to_task_resource_lock(row)
+    }
+
+    pub async fn list_task_resource_locks(
+        &self,
+        task_id: TaskId,
+    ) -> anyhow::Result<Vec<TaskResourceLock>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_resource_locks
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_resource_lock).collect()
     }
 
     pub async fn add_task_note(
@@ -1430,6 +1541,15 @@ fn row_to_task_dependency(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskDe
     })
 }
 
+fn row_to_task_resource_lock(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskResourceLock> {
+    Ok(TaskResourceLock {
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        resource_key: row.try_get("resource_key")?,
+        lock_mode: row.try_get("lock_mode")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
 fn row_to_task_note(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskNote> {
     Ok(TaskNote {
         id: parse_uuid(row.try_get::<String, _>("id")?)?,
@@ -1488,6 +1608,14 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
 
 fn parse_uuid(value: String) -> anyhow::Result<Uuid> {
     Ok(Uuid::parse_str(&value)?)
+}
+
+fn normalize_resource_key(resource_key: &str) -> anyhow::Result<String> {
+    let resource_key = resource_key.trim().to_owned();
+    if resource_key.is_empty() {
+        anyhow::bail!("resource key cannot be empty");
+    }
+    Ok(resource_key)
 }
 
 #[cfg(test)]
@@ -1947,7 +2075,7 @@ mod tests {
                     title: "Use prepared context".to_owned(),
                     description: "Should wait for dependency".to_owned(),
                     task_type: TaskType::OneOff,
-                    priority: 10,
+                    priority: 100,
                     requested_skills: Vec::new(),
                     schedule: None,
                     created_by: "test".to_owned(),
@@ -2015,6 +2143,98 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_resource_lock_blocks_conflicting_claims() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let first = db
+            .create_task(
+                CreateTask {
+                    title: "First repo job".to_owned(),
+                    description: "Use the shared repository".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 10,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let second = db
+            .create_task(
+                CreateTask {
+                    title: "Second repo job".to_owned(),
+                    description: "Should wait for the shared repository".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 10,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        db.add_task_resource_lock(first.id, "repo:persistent-agent", "test")
+            .await?;
+        db.add_task_resource_lock(second.id, " repo:persistent-agent ", "test")
+            .await?;
+
+        let claimed_first = db.claim_next_runnable("worker-a", 60).await?;
+        assert_eq!(claimed_first.map(|task| task.id), Some(first.id));
+
+        let blocked_by_lock = db.claim_next_runnable("worker-b", 60).await?;
+        assert!(blocked_by_lock.is_none());
+
+        db.complete_task(first.id, "done", "worker-a").await?;
+
+        let claimed_second = db.claim_next_runnable("worker-b", 60).await?;
+        assert_eq!(claimed_second.map(|task| task.id), Some(second.id));
+
+        let locks = db.list_task_resource_locks(second.id).await?;
+        let actions = db.list_task_actions(second.id).await?;
+
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].resource_key, "repo:persistent-agent");
+        assert!(actions.iter().any(|action| {
+            action.action_type == "add_task_resource_lock"
+                && action.details["resource_key"] == "repo:persistent-agent"
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_resource_locks_can_be_removed() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Lock cleanup".to_owned(),
+                    description: "Remove lock metadata".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        db.add_task_resource_lock(task.id, "repo:persistent-agent", "test")
+            .await?;
+        let removed = db
+            .remove_task_resource_lock(task.id, "repo:persistent-agent", "test")
+            .await?;
+        let locks = db.list_task_resource_locks(task.id).await?;
+
+        assert_eq!(removed.resource_key, "repo:persistent-agent");
+        assert!(locks.is_empty());
 
         Ok(())
     }

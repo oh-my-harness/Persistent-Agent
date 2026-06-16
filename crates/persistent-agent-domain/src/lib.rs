@@ -242,6 +242,14 @@ pub struct TaskDependency {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResourceLock {
+    pub task_id: TaskId,
+    pub resource_key: String,
+    pub lock_mode: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNote {
     pub id: TaskNoteId,
     pub task_id: TaskId,
