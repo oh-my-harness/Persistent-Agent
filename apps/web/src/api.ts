@@ -67,6 +67,20 @@ export function cancelTask(id: string): Promise<Task> {
   return request<Task>(`/api/tasks/${id}/cancel`, { method: "POST" });
 }
 
+export function reprioritizeTask(id: string, priority: number): Promise<Task> {
+  return request<Task>(`/api/tasks/${id}/reprioritize`, {
+    method: "POST",
+    body: JSON.stringify({ priority }),
+  });
+}
+
+export function reorderTask(id: string, queuePosition: number): Promise<Task> {
+  return request<Task>(`/api/tasks/${id}/reorder`, {
+    method: "POST",
+    body: JSON.stringify({ queue_position: queuePosition }),
+  });
+}
+
 export function runSchedulerTick(): Promise<SchedulerTick> {
   return request<SchedulerTick>("/api/scheduler/tick", { method: "POST" });
 }

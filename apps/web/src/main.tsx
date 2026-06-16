@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, CirclePause, History, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
+import { Bot, Check, CirclePause, History, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
 import {
   approveMemory,
   cancelTask,
@@ -16,6 +16,8 @@ import {
   listTasks,
   pauseTask,
   rejectMemory,
+  reorderTask,
+  reprioritizeTask,
   resumeTask,
   runSchedulerTick,
   sendMainAgentMessage,
@@ -445,14 +447,28 @@ function TaskComposer() {
 function TaskRow({ task }: { task: Task }) {
   const queryClient = useQueryClient();
   const [showHistory, setShowHistory] = useState(false);
+  const [priorityDraft, setPriorityDraft] = useState(task.priority);
+  const [queueDraft, setQueueDraft] = useState(task.queue_position);
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ["tasks"] });
     await queryClient.invalidateQueries({ queryKey: ["summary"] });
     await queryClient.invalidateQueries({ queryKey: ["task-history", task.id] });
   };
+  useEffect(() => {
+    setPriorityDraft(task.priority);
+    setQueueDraft(task.queue_position);
+  }, [task.priority, task.queue_position]);
   const pause = useMutation({ mutationFn: pauseTask, onSuccess: refresh });
   const resume = useMutation({ mutationFn: resumeTask, onSuccess: refresh });
   const cancel = useMutation({ mutationFn: cancelTask, onSuccess: refresh });
+  const reprioritize = useMutation({
+    mutationFn: () => reprioritizeTask(task.id, priorityDraft),
+    onSuccess: refresh,
+  });
+  const reorder = useMutation({
+    mutationFn: () => reorderTask(task.id, queueDraft),
+    onSuccess: refresh,
+  });
 
   const statusClass = useMemo(() => `status ${task.status.replaceAll("_", "-")}`, [task.status]);
 
@@ -468,10 +484,27 @@ function TaskRow({ task }: { task: Task }) {
         <div className="task-meta">
           <span>{task.task_type.replace("_", " ")}</span>
           <span>priority {task.priority}</span>
+          <span>queue {task.queue_position}</span>
           <span>attempts {task.attempt_count}</span>
           {task.requested_skills.length > 0 && <span>requested {task.requested_skills.join(", ")}</span>}
           {task.matched_skills.length > 0 && <span>matched {task.matched_skills.join(", ")}</span>}
           {task.next_run_at && <span>next {new Date(task.next_run_at).toLocaleString()}</span>}
+        </div>
+        <div className="queue-controls">
+          <label>
+            Priority
+            <input type="number" value={priorityDraft} onChange={(event) => setPriorityDraft(Number(event.target.value))} />
+          </label>
+          <button title="Apply priority" onClick={() => reprioritize.mutate()} disabled={reprioritize.isPending || priorityDraft === task.priority}>
+            <Check size={15} />
+          </button>
+          <label>
+            Queue
+            <input type="number" value={queueDraft} onChange={(event) => setQueueDraft(Number(event.target.value))} />
+          </label>
+          <button title="Apply queue position" onClick={() => reorder.mutate()} disabled={reorder.isPending || queueDraft === task.queue_position}>
+            <Check size={15} />
+          </button>
         </div>
       </div>
       <div className="task-actions">

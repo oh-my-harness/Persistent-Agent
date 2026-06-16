@@ -472,6 +472,42 @@ textarea {
   gap: 10px;
 }
 
+.queue-controls {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.queue-controls label {
+  color: #52636c;
+  font-size: 12px;
+  gap: 4px;
+  min-width: 74px;
+}
+
+.queue-controls input {
+  min-height: 32px;
+  padding: 6px 8px;
+  width: 74px;
+}
+
+.queue-controls button {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #cad4d9;
+  border-radius: 6px;
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.queue-controls button:disabled {
+  opacity: 0.45;
+}
+
 .task-actions {
   display: flex;
   gap: 8px;
