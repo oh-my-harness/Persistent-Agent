@@ -3,7 +3,7 @@ use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateTask, Task, TaskAction, TaskAttempt,
     TaskId, TaskStatus, TaskType, UpdateTask,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use uuid::Uuid;
 
@@ -270,6 +270,53 @@ impl Db {
         self.get_task(task.id).await.map(Some)
     }
 
+    pub async fn requeue_due_recurring_tasks(&self, actor: &str) -> anyhow::Result<Vec<Task>> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+            SELECT id FROM tasks
+            WHERE task_type = 'recurring'
+              AND status = 'waiting_for_schedule'
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+            ORDER BY next_run_at ASC, priority DESC, queue_position ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut requeued = Vec::new();
+        for row in rows {
+            let task_id = parse_uuid(row.try_get::<String, _>("id")?)?;
+            let queue_position = self.next_queue_position().await?;
+            sqlx::query(
+                r#"
+                UPDATE tasks
+                SET status = 'queued', queue_position = ?, next_run_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'waiting_for_schedule'
+                "#,
+            )
+            .bind(queue_position)
+            .bind(now)
+            .bind(task_id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+            self.record_action(
+                Some(task_id),
+                actor,
+                "requeue_recurring_task",
+                json!({ "queue_position": queue_position }),
+            )
+            .await?;
+
+            requeued.push(self.get_task(task_id).await?);
+        }
+
+        Ok(requeued)
+    }
+
     pub async fn complete_task(
         &self,
         id: TaskId,
@@ -282,16 +329,24 @@ impl Db {
             TaskType::OneOff => TaskStatus::Completed,
             TaskType::Recurring => TaskStatus::WaitingForSchedule,
         };
+        let next_run_at = match task.task_type {
+            TaskType::OneOff => None,
+            TaskType::Recurring => {
+                Some(now + Duration::seconds(recurring_interval_seconds(task.schedule.as_ref())))
+            }
+        };
 
         sqlx::query(
             r#"
             UPDATE tasks
-            SET status = ?, result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            SET status = ?, result_summary = ?, next_run_at = ?,
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(next_status.to_string())
         .bind(summary)
+        .bind(next_run_at)
         .bind(now)
         .bind(id.to_string())
         .execute(&self.pool)
@@ -482,6 +537,20 @@ impl Db {
     }
 }
 
+fn recurring_interval_seconds(schedule: Option<&Value>) -> i64 {
+    let seconds = schedule
+        .and_then(|value| {
+            value
+                .get("interval_seconds")
+                .or_else(|| value.get("every_seconds"))
+                .or_else(|| value.get("seconds"))
+                .and_then(Value::as_i64)
+        })
+        .unwrap_or(300);
+
+    seconds.max(0)
+}
+
 fn row_to_conversation(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Conversation> {
     let task_id: Option<String> = row.try_get("task_id")?;
     Ok(Conversation {
@@ -542,4 +611,59 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
 
 fn parse_uuid(value: String) -> anyhow::Result<Uuid> {
     Ok(Uuid::parse_str(&value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use persistent_agent_domain::TaskType;
+
+    #[tokio::test]
+    async fn recurring_task_waits_then_requeues_when_due() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Recurring check".to_owned(),
+                    description: "Run repeatedly".to_owned(),
+                    task_type: TaskType::Recurring,
+                    priority: 1,
+                    requested_skills: Vec::new(),
+                    schedule: Some(json!({ "interval_seconds": 0 })),
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let completed = db.complete_task(task.id, "first run", "test").await?;
+
+        assert_eq!(completed.status, TaskStatus::WaitingForSchedule);
+        assert!(completed.next_run_at.is_some());
+
+        let requeued = db.requeue_due_recurring_tasks("test").await?;
+
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].status, TaskStatus::Queued);
+        assert!(requeued[0].next_run_at.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_recurring_interval_seconds() {
+        assert_eq!(
+            recurring_interval_seconds(Some(&json!({ "interval_seconds": 12 }))),
+            12
+        );
+        assert_eq!(
+            recurring_interval_seconds(Some(&json!({ "every_seconds": 3 }))),
+            3
+        );
+        assert_eq!(
+            recurring_interval_seconds(Some(&json!({ "seconds": -5 }))),
+            0
+        );
+        assert_eq!(recurring_interval_seconds(None), 300);
+    }
 }

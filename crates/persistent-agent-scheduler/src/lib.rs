@@ -32,12 +32,14 @@ where
     }
 
     pub async fn tick(&self) -> anyhow::Result<SchedulerTick> {
+        let requeued_tasks = self.db.requeue_due_recurring_tasks("scheduler").await?;
         let Some(task) = self
             .db
             .claim_next_runnable(&self.lease_owner, self.lease_seconds)
             .await?
         else {
             return Ok(SchedulerTick {
+                requeued_tasks,
                 claimed_task: None,
                 outcome: SchedulerOutcome::Idle,
             });
@@ -56,6 +58,7 @@ where
                     .await?;
                 self.db.complete_task(task.id, &summary, "worker").await?;
                 Ok(SchedulerTick {
+                    requeued_tasks,
                     claimed_task: Some(task),
                     outcome: SchedulerOutcome::Completed { summary },
                 })
@@ -68,6 +71,7 @@ where
                     .set_task_status(task.id, TaskStatus::WaitingForUser, "worker", Some(&reason))
                     .await?;
                 Ok(SchedulerTick {
+                    requeued_tasks,
                     claimed_task: Some(task),
                     outcome: SchedulerOutcome::Blocked { reason },
                 })
@@ -245,6 +249,7 @@ pub enum WorkerResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerTick {
+    pub requeued_tasks: Vec<Task>,
     pub claimed_task: Option<Task>,
     pub outcome: SchedulerOutcome,
 }

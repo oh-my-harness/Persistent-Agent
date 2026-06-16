@@ -1262,6 +1262,7 @@ dependencies = [
  "persistent-agent-domain",
  "serde_json",
  "sqlx",
+ "tokio",
  "uuid",
 ]
 

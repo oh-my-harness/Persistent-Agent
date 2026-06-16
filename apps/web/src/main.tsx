@@ -184,6 +184,7 @@ function TaskComposer() {
   const [description, setDescription] = useState("");
   const [taskType, setTaskType] = useState<TaskType>("one_off");
   const [priority, setPriority] = useState(0);
+  const [intervalSeconds, setIntervalSeconds] = useState(300);
 
   const mutation = useMutation({
     mutationFn: createTask,
@@ -191,6 +192,7 @@ function TaskComposer() {
       setTitle("");
       setDescription("");
       setPriority(0);
+      setIntervalSeconds(300);
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["summary"] });
     },
@@ -212,6 +214,7 @@ function TaskComposer() {
             task_type: taskType,
             priority,
             requested_skills: [],
+            schedule: taskType === "recurring" ? { interval_seconds: intervalSeconds } : undefined,
             created_by: "user",
           });
         }}
@@ -241,6 +244,17 @@ function TaskComposer() {
             <input type="number" value={priority} onChange={(event) => setPriority(Number(event.target.value))} />
           </label>
         </div>
+        {taskType === "recurring" && (
+          <label>
+            Interval seconds
+            <input
+              type="number"
+              min="0"
+              value={intervalSeconds}
+              onChange={(event) => setIntervalSeconds(Number(event.target.value))}
+            />
+          </label>
+        )}
         <button className="primary" type="submit" disabled={mutation.isPending}>
           <Plus size={16} /> Create task
         </button>
@@ -273,6 +287,7 @@ function TaskRow({ task }: { task: Task }) {
           <span>{task.task_type.replace("_", " ")}</span>
           <span>priority {task.priority}</span>
           <span>attempts {task.attempt_count}</span>
+          {task.next_run_at && <span>next {new Date(task.next_run_at).toLocaleString()}</span>}
         </div>
       </div>
       <div className="task-actions">

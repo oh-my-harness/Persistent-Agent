@@ -11,4 +11,5 @@ chrono.workspace = true
 persistent-agent-domain = { path = "../persistent-agent-domain" }
 serde_json.workspace = true
 sqlx.workspace = true
+tokio.workspace = true
 uuid.workspace = true
