@@ -226,6 +226,67 @@ impl Db {
         self.get_task(id).await
     }
 
+    pub async fn convert_task_type(
+        &self,
+        id: TaskId,
+        task_type: TaskType,
+        schedule: Option<Value>,
+        actor: &str,
+    ) -> anyhow::Result<Task> {
+        let current = self.get_task(id).await?;
+        let now = Utc::now();
+        let schedule = match task_type {
+            TaskType::OneOff => None,
+            TaskType::Recurring => {
+                Some(schedule.unwrap_or_else(|| json!({ "interval_seconds": 300 })))
+            }
+        };
+        let next_run_at = match task_type {
+            TaskType::OneOff => None,
+            TaskType::Recurring => {
+                if matches!(
+                    current.status,
+                    TaskStatus::Completed | TaskStatus::WaitingForSchedule
+                ) {
+                    Some(now + Duration::seconds(recurring_interval_seconds(schedule.as_ref())))
+                } else {
+                    current.next_run_at
+                }
+            }
+        };
+        let status = match (task_type, current.status) {
+            (TaskType::OneOff, TaskStatus::WaitingForSchedule) => TaskStatus::Completed,
+            (TaskType::Recurring, TaskStatus::Completed) => TaskStatus::WaitingForSchedule,
+            (_, status) => status,
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET task_type = ?, status = ?, schedule = ?, next_run_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(task_type.to_string())
+        .bind(status.to_string())
+        .bind(schedule.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(next_run_at)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            Some(id),
+            actor,
+            "convert_task_type",
+            json!({ "task_type": task_type, "schedule": schedule }),
+        )
+        .await?;
+
+        self.get_task(id).await
+    }
+
     pub async fn claim_next_runnable(
         &self,
         lease_owner: &str,
@@ -1514,6 +1575,51 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "fail_task")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_type_can_be_converted_with_audit_action() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Convert check".to_owned(),
+                    description: "Change type later".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let recurring = db
+            .convert_task_type(
+                task.id,
+                TaskType::Recurring,
+                Some(json!({ "interval_seconds": 12 })),
+                "test",
+            )
+            .await?;
+        let one_off = db
+            .convert_task_type(task.id, TaskType::OneOff, None, "test")
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(recurring.task_type, TaskType::Recurring);
+        assert_eq!(recurring.schedule, Some(json!({ "interval_seconds": 12 })));
+        assert_eq!(one_off.task_type, TaskType::OneOff);
+        assert!(one_off.schedule.is_none());
+        assert!(one_off.next_run_at.is_none());
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "convert_task_type")
         );
 
         Ok(())

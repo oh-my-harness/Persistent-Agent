@@ -4,6 +4,38 @@ use persistent_agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+const ZH_SUMMARY: &str = "\u{603b}\u{7ed3}";
+const ZH_OVERVIEW: &str = "\u{6982}\u{89c8}";
+const ZH_TASK_POOL: &str = "\u{4efb}\u{52a1}\u{6c60}";
+const ZH_CREATE: &str = "\u{521b}\u{5efa}";
+const ZH_NEW: &str = "\u{65b0}\u{5efa}";
+const ZH_ADD: &str = "\u{6dfb}\u{52a0}";
+const ZH_ADD_ONE: &str = "\u{52a0}\u{4e00}\u{4e2a}";
+const ZH_RECURRING: &str = "\u{5faa}\u{73af}";
+const ZH_SCHEDULED: &str = "\u{5b9a}\u{671f}";
+const ZH_ONE_OFF: &str = "\u{4e00}\u{6b21}\u{6027}";
+const ZH_PRIORITY: &str = "\u{4f18}\u{5148}\u{7ea7}";
+const ZH_PAUSE_TASK: &str = "\u{6682}\u{505c}\u{4efb}\u{52a1}";
+const ZH_RESUME_TASK: &str = "\u{6062}\u{590d}\u{4efb}\u{52a1}";
+const ZH_CANCEL_TASK: &str = "\u{53d6}\u{6d88}\u{4efb}\u{52a1}";
+const ZH_QUEUE: &str = "\u{961f}\u{5217}";
+const ZH_SORT: &str = "\u{6392}\u{5e8f}";
+const ZH_MOVE: &str = "\u{79fb}\u{52a8}";
+const ZH_POSITION: &str = "\u{4f4d}\u{7f6e}";
+const ZH_TASK: &str = "\u{4efb}\u{52a1}";
+const ZH_PAUSE: &str = "\u{6682}\u{505c}";
+const ZH_RESUME: &str = "\u{6062}\u{590d}";
+const ZH_CANCEL: &str = "\u{53d6}\u{6d88}";
+const ZH_ADJUST: &str = "\u{8c03}\u{6574}";
+const ZH_CONVERT_TASK: &str = "\u{8f6c}\u{6362}\u{4efb}\u{52a1}";
+const ZH_CHANGE_TO: &str = "\u{6539}\u{6210}";
+const ZH_CHANGE_AS: &str = "\u{6539}\u{4e3a}";
+const ZH_SET_AS: &str = "\u{8bbe}\u{4e3a}";
+const ZH_TO: &str = "\u{5230}";
+const ZH_AS: &str = "\u{4e3a}";
+const ZH_EVERY: &str = "\u{6bcf}";
+const ZH_INTERVAL: &str = "\u{95f4}\u{9694}";
+
 #[derive(Clone)]
 pub struct MainAgent {
     db: Db,
@@ -40,6 +72,23 @@ impl MainAgent {
 
     pub async fn reorder_task(&self, id: TaskId, queue_position: i64) -> anyhow::Result<Task> {
         self.db.reorder_task(id, queue_position, "main_agent").await
+    }
+
+    pub async fn convert_task_type(
+        &self,
+        id: TaskId,
+        task_type: TaskType,
+        interval_seconds: Option<i64>,
+    ) -> anyhow::Result<Task> {
+        let schedule = match task_type {
+            TaskType::OneOff => None,
+            TaskType::Recurring => {
+                Some(serde_json::json!({ "interval_seconds": interval_seconds.unwrap_or(300) }))
+            }
+        };
+        self.db
+            .convert_task_type(id, task_type, schedule, "main_agent")
+            .await
     }
 
     pub async fn pause_task(&self, id: TaskId) -> anyhow::Result<Task> {
@@ -112,7 +161,14 @@ impl MainAgent {
                 description,
                 task_type,
                 priority,
+                interval_seconds,
             } => {
+                let schedule = match task_type {
+                    TaskType::OneOff => None,
+                    TaskType::Recurring => Some(
+                        serde_json::json!({ "interval_seconds": interval_seconds.unwrap_or(300) }),
+                    ),
+                };
                 let task = self
                     .create_task(CreateTask {
                         title,
@@ -120,12 +176,12 @@ impl MainAgent {
                         task_type,
                         priority,
                         requested_skills: Vec::new(),
-                        schedule: None,
+                        schedule,
                         created_by: "user".to_owned(),
                     })
                     .await?;
                 let reply = format!(
-                    "已创建任务：{}。当前状态是 {}，优先级 {}。",
+                    "Created task '{}'. Status: {}, priority: {}.",
                     task.title, task.status, task.priority
                 );
                 changed_tasks.push(task);
@@ -134,7 +190,7 @@ impl MainAgent {
             MainAgentIntent::PauseTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.pause_task(task.id).await?;
-                    let reply = format!("已暂停任务：{}。", task.title);
+                    let reply = format!("Paused task '{}'.", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -143,7 +199,7 @@ impl MainAgent {
             MainAgentIntent::ResumeTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.resume_task(task.id).await?;
-                    let reply = format!("已恢复任务：{}。", task.title);
+                    let reply = format!("Resumed task '{}'.", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -152,7 +208,7 @@ impl MainAgent {
             MainAgentIntent::CancelTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.cancel_task(task.id).await?;
-                    let reply = format!("已取消任务：{}。", task.title);
+                    let reply = format!("Cancelled task '{}'.", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -163,7 +219,7 @@ impl MainAgent {
                     Ok(task) => {
                         let task = self.reprioritize_task(task.id, priority).await?;
                         let reply =
-                            format!("已将任务 {} 的优先级调整为 {}。", task.title, task.priority);
+                            format!("Set task '{}' priority to {}.", task.title, task.priority);
                         changed_tasks.push(task);
                         reply
                     }
@@ -177,9 +233,24 @@ impl MainAgent {
                 Ok(task) => {
                     let task = self.reorder_task(task.id, queue_position).await?;
                     let reply = format!(
-                        "已将任务 {} 移动到队列位置 {}。",
+                        "Moved task '{}' to queue position {}.",
                         task.title, task.queue_position
                     );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::ConvertTaskType {
+                selector,
+                task_type,
+                interval_seconds,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self
+                        .convert_task_type(task.id, task_type, interval_seconds)
+                        .await?;
+                    let reply = format!("Converted task '{}' to {}.", task.title, task.task_type);
                     changed_tasks.push(task);
                     reply
                 }
@@ -188,17 +259,19 @@ impl MainAgent {
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
-                    "当前共有 {} 个任务：{} 个排队中，{} 个运行中，{} 个等待用户，{} 个已完成，{} 个已暂停。",
+                    "Task pool: {} total, {} queued, {} running, {} waiting for user, {} waiting for schedule, {} completed, {} failed, {} paused.",
                     summary.total,
                     summary.queued,
                     summary.running,
                     summary.waiting_for_user,
+                    summary.waiting_for_schedule,
                     summary.completed,
+                    summary.failed,
                     summary.paused
                 )
             }
             MainAgentIntent::Help => {
-                "我可以通过对话帮你创建任务、暂停/恢复/取消任务、调整优先级、移动队列位置，或总结任务池。比如：“创建循环任务：每天检查 GitHub issue 优先级 3”。".to_owned()
+                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, convert tasks between one-off and recurring, or summarize the task pool. Example: convert task Check issues to recurring every 300 seconds.".to_owned()
             }
         };
 
@@ -219,7 +292,7 @@ impl MainAgent {
         let needle = selector.trim().to_lowercase();
         if needle.is_empty() {
             return Ok(Err(
-                "请告诉我要调整哪个任务，可以使用标题片段或任务 id。".to_owned()
+                "Please tell me which task to change by title fragment or task id.".to_owned(),
             ));
         }
 
@@ -236,9 +309,9 @@ impl MainAgent {
 
         match matches.as_slice() {
             [task] => Ok(Ok(task.clone())),
-            [] => Ok(Err(format!("没有找到匹配“{selector}”的任务。"))),
+            [] => Ok(Err(format!("No task matched '{selector}'."))),
             _ => Ok(Err(format!(
-                "找到了 {} 个匹配“{selector}”的任务，请使用更具体的标题或 id。",
+                "Found {} tasks matching '{selector}'. Please use a more specific title or id.",
                 matches.len()
             ))),
         }
@@ -279,6 +352,7 @@ enum MainAgentIntent {
         description: String,
         task_type: TaskType,
         priority: i64,
+        interval_seconds: Option<i64>,
     },
     PauseTask {
         selector: String,
@@ -297,6 +371,11 @@ enum MainAgentIntent {
         selector: String,
         queue_position: i64,
     },
+    ConvertTaskType {
+        selector: String,
+        task_type: TaskType,
+        interval_seconds: Option<i64>,
+    },
     Summarize,
     Help,
 }
@@ -307,7 +386,13 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if contains_any(
         &normalized,
-        &["总结", "概览", "任务池", "summary", "summarize"],
+        &[
+            ZH_SUMMARY,
+            ZH_OVERVIEW,
+            ZH_TASK_POOL,
+            "summary",
+            "summarize",
+        ],
     ) {
         return MainAgentIntent::Summarize;
     }
@@ -316,11 +401,19 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         if !is_create_request(&normalized)
             && contains_any(
                 &normalized,
-                &["reprioritize", "set priority", "change priority", "优先级"],
+                &[
+                    "reprioritize",
+                    "set priority",
+                    "change priority",
+                    ZH_PRIORITY,
+                ],
             )
         {
             return MainAgentIntent::ReprioritizeTask {
-                selector: extract_task_selector(trimmed, &["priority", "to", "优先级", "为", "到"]),
+                selector: extract_task_selector(
+                    trimmed,
+                    &["priority", "to", ZH_PRIORITY, ZH_AS, ZH_TO],
+                ),
                 priority,
             };
         }
@@ -334,9 +427,9 @@ fn parse_intent(content: &str) -> MainAgentIntent {
                     "reorder",
                     "queue position",
                     "move task",
-                    "队列",
-                    "排序",
-                    "移动",
+                    ZH_QUEUE,
+                    ZH_SORT,
+                    ZH_MOVE,
                 ],
             )
         {
@@ -344,7 +437,14 @@ fn parse_intent(content: &str) -> MainAgentIntent {
                 selector: extract_task_selector(
                     trimmed,
                     &[
-                        "queue", "position", "to", "队列", "排序", "位置", "为", "到",
+                        "queue",
+                        "position",
+                        "to",
+                        ZH_QUEUE,
+                        ZH_SORT,
+                        ZH_POSITION,
+                        ZH_AS,
+                        ZH_TO,
                     ],
                 ),
                 queue_position,
@@ -352,22 +452,63 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         }
     }
 
-    if contains_any(&normalized, &["pause task", "暂停任务"]) || normalized.starts_with("pause ")
+    if is_convert_request(&normalized) {
+        if contains_any(
+            &normalized,
+            &["recurring", "repeat", ZH_RECURRING, ZH_SCHEDULED],
+        ) {
+            return MainAgentIntent::ConvertTaskType {
+                selector: extract_task_selector(
+                    trimmed,
+                    &[
+                        "to",
+                        "recurring",
+                        "repeat",
+                        "every",
+                        "interval",
+                        "seconds",
+                        "second",
+                        ZH_RECURRING,
+                        ZH_SCHEDULED,
+                        ZH_EVERY,
+                    ],
+                ),
+                task_type: TaskType::Recurring,
+                interval_seconds: extract_interval_seconds(&normalized),
+            };
+        }
+
+        if contains_any(&normalized, &["one-off", "one_off", "one off", ZH_ONE_OFF]) {
+            return MainAgentIntent::ConvertTaskType {
+                selector: extract_task_selector(
+                    trimmed,
+                    &["to", "one-off", "one_off", "one off", ZH_ONE_OFF],
+                ),
+                task_type: TaskType::OneOff,
+                interval_seconds: None,
+            };
+        }
+    }
+
+    if contains_any(&normalized, &["pause task", ZH_PAUSE_TASK]) || normalized.starts_with("pause ")
     {
         return MainAgentIntent::PauseTask {
             selector: extract_task_selector(trimmed, &[]),
         };
     }
 
-    if contains_any(&normalized, &["resume task", "unpause task", "恢复任务"])
-        || normalized.starts_with("resume ")
+    if contains_any(
+        &normalized,
+        &["resume task", "unpause task", ZH_RESUME_TASK],
+    ) || normalized.starts_with("resume ")
     {
         return MainAgentIntent::ResumeTask {
             selector: extract_task_selector(trimmed, &[]),
         };
     }
 
-    if contains_any(&normalized, &["cancel task", "取消任务"]) || normalized.starts_with("cancel ")
+    if contains_any(&normalized, &["cancel task", ZH_CANCEL_TASK])
+        || normalized.starts_with("cancel ")
     {
         return MainAgentIntent::CancelTask {
             selector: extract_task_selector(trimmed, &[]),
@@ -375,12 +516,18 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if is_create_request(&normalized) {
-        let task_type = if contains_any(&normalized, &["循环", "定期", "recurring", "repeat"]) {
+        let task_type = if contains_any(
+            &normalized,
+            &[ZH_RECURRING, ZH_SCHEDULED, "recurring", "repeat"],
+        ) {
             TaskType::Recurring
         } else {
             TaskType::OneOff
         };
         let priority = extract_priority(&normalized).unwrap_or(0);
+        let interval_seconds = (task_type == TaskType::Recurring)
+            .then(|| extract_interval_seconds(&normalized))
+            .flatten();
         let title = extract_title(trimmed);
 
         return MainAgentIntent::CreateTask {
@@ -388,6 +535,7 @@ fn parse_intent(content: &str) -> MainAgentIntent {
             description: trimmed.to_owned(),
             task_type,
             priority,
+            interval_seconds,
         };
     }
 
@@ -401,12 +549,28 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 fn is_create_request(normalized: &str) -> bool {
     contains_any(
         normalized,
-        &["创建", "新建", "添加", "加一个", "create", "add task"],
+        &[ZH_CREATE, ZH_NEW, ZH_ADD, ZH_ADD_ONE, "create", "add task"],
+    )
+}
+
+fn is_convert_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "convert task",
+            "change task type",
+            "make task",
+            "task type",
+            ZH_CONVERT_TASK,
+            ZH_CHANGE_TO,
+            ZH_CHANGE_AS,
+            ZH_SET_AS,
+        ],
     )
 }
 
 fn extract_title(content: &str) -> String {
-    for separator in ["：", ":", "，", ",", "\n"] {
+    for separator in ["\u{ff1a}", ":", "\u{ff0c}", ",", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
             let title = tail.trim();
             if !title.is_empty() {
@@ -416,11 +580,11 @@ fn extract_title(content: &str) -> String {
     }
 
     let title = content
-        .replace("创建循环任务", "")
-        .replace("创建一次性任务", "")
-        .replace("创建任务", "")
-        .replace("新建任务", "")
-        .replace("添加任务", "")
+        .replace(&format!("{ZH_CREATE}{ZH_RECURRING}{ZH_TASK}"), "")
+        .replace(&format!("{ZH_CREATE}{ZH_ONE_OFF}{ZH_TASK}"), "")
+        .replace(&format!("{ZH_CREATE}{ZH_TASK}"), "")
+        .replace(&format!("{ZH_NEW}{ZH_TASK}"), "")
+        .replace(&format!("{ZH_ADD}{ZH_TASK}"), "")
         .replace("create task", "")
         .replace("add task", "")
         .trim()
@@ -436,6 +600,9 @@ fn extract_title(content: &str) -> String {
 fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
     let normalized = content.to_lowercase();
     let action_words = [
+        "convert task",
+        "change task type",
+        "make task",
         "reprioritize",
         "set priority",
         "change priority",
@@ -449,12 +616,16 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "cancel task",
         "cancel",
         "task",
-        "任务",
-        "暂停",
-        "恢复",
-        "取消",
-        "调整",
-        "移动",
+        ZH_CONVERT_TASK,
+        ZH_TASK,
+        ZH_PAUSE,
+        ZH_RESUME,
+        ZH_CANCEL,
+        ZH_ADJUST,
+        ZH_MOVE,
+        ZH_CHANGE_TO,
+        ZH_CHANGE_AS,
+        ZH_SET_AS,
     ];
 
     let mut start = 0;
@@ -476,7 +647,7 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
 
     selector
         .trim()
-        .trim_matches([':', '：', ',', '，', '.', '。', '"', '\''])
+        .trim_matches([':', '\u{ff1a}', ',', '\u{ff0c}', '.', '\u{3002}', '"', '\''])
         .trim()
         .to_owned()
 }
@@ -492,7 +663,7 @@ fn clamp_title(title: &str) -> String {
 }
 
 fn extract_priority(normalized: &str) -> Option<i64> {
-    extract_number_after_any(normalized, &["priority", "优先级"])
+    extract_number_after_any(normalized, &["priority", ZH_PRIORITY])
 }
 
 fn extract_queue_position(normalized: &str) -> Option<i64> {
@@ -502,11 +673,15 @@ fn extract_queue_position(normalized: &str) -> Option<i64> {
             "queue position",
             "queue",
             "position",
-            "队列",
-            "排序",
-            "位置",
+            ZH_QUEUE,
+            ZH_SORT,
+            ZH_POSITION,
         ],
     )
+}
+
+fn extract_interval_seconds(normalized: &str) -> Option<i64> {
+    extract_number_after_last_any(normalized, &["every", "interval", ZH_INTERVAL, "\u{6bcf} "])
 }
 
 fn extract_number_after_any(normalized: &str, markers: &[&str]) -> Option<i64> {
@@ -526,6 +701,22 @@ fn extract_number_after_any(normalized: &str, markers: &[&str]) -> Option<i64> {
     None
 }
 
+fn extract_number_after_last_any(normalized: &str, markers: &[&str]) -> Option<i64> {
+    markers
+        .iter()
+        .filter_map(|marker| normalized.rfind(marker).map(|index| (index, *marker)))
+        .max_by_key(|(index, _)| *index)
+        .and_then(|(index, marker)| {
+            let after = &normalized[index + marker.len()..];
+            let digits: String = after
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit() && *ch != '-')
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+                .collect();
+            digits.parse().ok()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,29 +733,34 @@ mod tests {
                 description: "create task: Check GitHub issues priority 7".to_owned(),
                 task_type: TaskType::OneOff,
                 priority: 7,
+                interval_seconds: None,
             }
         );
     }
 
     #[test]
     fn parses_recurring_chinese_create_task() {
-        let content = "创建循环任务：每天检查仓库 issue 优先级 3";
+        let content = "\u{521b}\u{5efa}\u{5faa}\u{73af}\u{4efb}\u{52a1}\u{ff1a}\u{6bcf}\u{5929}\u{68c0}\u{67e5}\u{4ed3}\u{5e93} issue \u{4f18}\u{5148}\u{7ea7} 3 \u{6bcf} 60 \u{79d2}";
         let intent = parse_intent(content);
 
         assert_eq!(
             intent,
             MainAgentIntent::CreateTask {
-                title: "每天检查仓库 issue 优先级 3".to_owned(),
+                title: "\u{6bcf}\u{5929}\u{68c0}\u{67e5}\u{4ed3}\u{5e93} issue \u{4f18}\u{5148}\u{7ea7} 3 \u{6bcf} 60 \u{79d2}".to_owned(),
                 description: content.to_owned(),
                 task_type: TaskType::Recurring,
                 priority: 3,
+                interval_seconds: Some(60),
             }
         );
     }
 
     #[test]
     fn parses_task_pool_summary() {
-        assert_eq!(parse_intent("总结任务池"), MainAgentIntent::Summarize);
+        assert_eq!(
+            parse_intent("\u{603b}\u{7ed3}\u{4efb}\u{52a1}\u{6c60}"),
+            MainAgentIntent::Summarize
+        );
     }
 
     #[test]
@@ -606,35 +802,59 @@ mod tests {
     #[test]
     fn parses_chinese_task_management_intents() {
         assert_eq!(
-            parse_intent("暂停任务 检查 GitHub issues"),
+            parse_intent("\u{6682}\u{505c}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues"),
             MainAgentIntent::PauseTask {
-                selector: "检查 GitHub issues".to_owned()
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned()
             }
         );
         assert_eq!(
-            parse_intent("恢复任务 检查 GitHub issues"),
+            parse_intent("\u{6062}\u{590d}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues"),
             MainAgentIntent::ResumeTask {
-                selector: "检查 GitHub issues".to_owned()
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned()
             }
         );
         assert_eq!(
-            parse_intent("取消任务 检查 GitHub issues"),
+            parse_intent("\u{53d6}\u{6d88}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues"),
             MainAgentIntent::CancelTask {
-                selector: "检查 GitHub issues".to_owned()
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned()
             }
         );
         assert_eq!(
-            parse_intent("调整任务 检查 GitHub issues 优先级为 8"),
+            parse_intent(
+                "\u{8c03}\u{6574}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues \u{4f18}\u{5148}\u{7ea7}\u{4e3a} 8"
+            ),
             MainAgentIntent::ReprioritizeTask {
-                selector: "检查 GitHub issues".to_owned(),
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned(),
                 priority: 8,
             }
         );
         assert_eq!(
-            parse_intent("移动任务 检查 GitHub issues 到队列位置 4"),
+            parse_intent(
+                "\u{79fb}\u{52a8}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues \u{5230}\u{961f}\u{5217}\u{4f4d}\u{7f6e} 4"
+            ),
             MainAgentIntent::ReorderTask {
-                selector: "检查 GitHub issues".to_owned(),
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned(),
                 queue_position: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_convert_task_type_intents() {
+        assert_eq!(
+            parse_intent("convert task Check GitHub issues to recurring every 60 seconds"),
+            MainAgentIntent::ConvertTaskType {
+                selector: "Check GitHub issues".to_owned(),
+                task_type: TaskType::Recurring,
+                interval_seconds: Some(60),
+            }
+        );
+        assert_eq!(
+            parse_intent("convert task Check GitHub issues to one-off"),
+            MainAgentIntent::ConvertTaskType {
+                selector: "Check GitHub issues".to_owned(),
+                task_type: TaskType::OneOff,
+                interval_seconds: None,
             }
         );
     }
@@ -664,7 +884,45 @@ mod tests {
 
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
-        assert!(response.assistant_message.content.contains("已暂停任务"));
+        assert!(response.assistant_message.content.contains("Paused task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_convert_task_type_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Check GitHub issues".to_owned(),
+                description: "Look for open issues".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "convert task Check GitHub issues to recurring every 45 seconds"
+                    .to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.task_type, TaskType::Recurring);
+        assert_eq!(
+            updated
+                .schedule
+                .as_ref()
+                .and_then(|value| value.get("interval_seconds"))
+                .and_then(serde_json::Value::as_i64),
+            Some(45)
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
 
         Ok(())
     }

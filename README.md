@@ -16,6 +16,7 @@ The repository now contains the first executable skeleton:
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
 - Main-agent conversation commands in Chinese and English for create, pause, resume, cancel, reprioritize, reorder, and summarize.
+- Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
