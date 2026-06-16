@@ -6,7 +6,9 @@ use llm_adapter::{
     core::{CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole},
 };
 use persistent_agent_db::Db;
-use persistent_agent_domain::{CreateMemory, Memory, MemoryStatus, Task, TaskStatus};
+use persistent_agent_domain::{
+    ConversationMessage, CreateMemory, Memory, MemoryStatus, Task, TaskStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -60,6 +62,7 @@ where
 
         let context = WorkerContext {
             memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
+            conversation_messages: self.db.list_task_conversation_messages(task.id, 20).await?,
         };
         let result = self.worker.execute(task.clone(), context).await?;
         match result {
@@ -121,6 +124,7 @@ pub trait TaskWorker: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerContext {
     pub memories: Vec<Memory>,
+    pub conversation_messages: Vec<ConversationMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,12 +132,25 @@ pub struct StubWorker;
 
 #[async_trait]
 impl TaskWorker for StubWorker {
-    async fn execute(&self, task: Task, _context: WorkerContext) -> anyhow::Result<WorkerResult> {
+    async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let marker_text = format!("{} {}", task.title, task.description).to_lowercase();
         if marker_text.contains("blocked")
             || marker_text.contains("needs_user")
             || marker_text.contains("need_user")
         {
+            if context
+                .conversation_messages
+                .iter()
+                .any(|message| message.role == "user")
+            {
+                return Ok(WorkerResult::Completed {
+                    summary: format!(
+                        "Stub worker resumed task '{}' using the latest user conversation context.",
+                        task.title
+                    ),
+                });
+            }
+
             return Ok(WorkerResult::Blocked {
                 reason: format!(
                     "I need more user input before continuing task '{}'. Please add the missing context in this task conversation.",
@@ -201,7 +218,7 @@ impl LlmWorkerConfig {
 impl TaskWorker for LlmWorker {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let config = self.config.clone();
-        let prompt = task_prompt(&task, &context.memories);
+        let prompt = task_prompt(&task, &context.memories, &context.conversation_messages);
         let summary =
             tokio::task::spawn_blocking(move || dispatch_task_prompt(config, prompt)).await??;
 
@@ -252,9 +269,13 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
     Ok(extract_response_text(&response))
 }
 
-fn task_prompt(task: &Task, memories: &[Memory]) -> String {
+fn task_prompt(
+    task: &Task,
+    memories: &[Memory],
+    conversation_messages: &[ConversationMessage],
+) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nRelevant approved memories:\n{}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nRelevant approved memories:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -270,6 +291,7 @@ fn task_prompt(task: &Task, memories: &[Memory]) -> String {
         },
         active_skills(task).join(", "),
         format_memories(memories),
+        format_conversation(conversation_messages),
         task.description
     )
 }
@@ -287,6 +309,18 @@ fn format_memories(memories: &[Memory]) -> String {
                 memory.scope, memory.confidence, memory.content
             )
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_conversation(messages: &[ConversationMessage]) -> String {
+    if messages.is_empty() {
+        return "none".to_owned();
+    }
+
+    messages
+        .iter()
+        .map(|message| format!("- {}: {}", message.role, message.content))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -499,7 +533,7 @@ mod tests {
             updated_at: now,
         };
 
-        let prompt = task_prompt(&task, &[]);
+        let prompt = task_prompt(&task, &[], &[]);
 
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
@@ -552,11 +586,52 @@ mod tests {
         };
 
         let memories = select_relevant_memories(&task, vec![unrelated, relevant], 5);
-        let prompt = task_prompt(&task, &memories);
+        let prompt = task_prompt(&task, &memories, &[]);
 
         assert_eq!(memories.len(), 1);
         assert!(prompt.contains("Prefer cargo test --workspace"));
         assert!(!prompt.contains("design screenshots"));
+    }
+
+    #[test]
+    fn injects_recent_task_conversation_into_prompt() {
+        let now = Utc::now();
+        let conversation_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let task = Task {
+            id: task_id,
+            title: "Use user context".to_owned(),
+            description: "Continue after clarification.".to_owned(),
+            task_type: TaskType::OneOff,
+            status: TaskStatus::Queued,
+            priority: 0,
+            queue_position: 0,
+            created_by: "user".to_owned(),
+            conversation_id: Some(conversation_id),
+            requested_skills: Vec::new(),
+            matched_skills: Vec::new(),
+            schedule: None,
+            attempt_count: 0,
+            last_run_at: None,
+            next_run_at: None,
+            blocked_reason: None,
+            result_summary: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let messages = vec![ConversationMessage {
+            id: Uuid::now_v7(),
+            conversation_id,
+            task_id: Some(task_id),
+            role: "user".to_owned(),
+            content: "The target repository is oh-my-harness/Persistent-Agent.".to_owned(),
+            created_at: now,
+        }];
+
+        let prompt = task_prompt(&task, &[], &messages);
+
+        assert!(prompt.contains("Recent task conversation"));
+        assert!(prompt.contains("user: The target repository"));
     }
 
     #[test]
@@ -618,6 +693,64 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert!(messages[0].content.contains("more user input"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_task_can_resume_with_user_conversation_context() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Blocked resume smoke".to_owned(),
+                    description: "BLOCKED until the user provides a target repository.".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), StubWorker);
+
+        let first_tick = scheduler.tick().await?;
+        assert!(matches!(
+            first_tick.outcome,
+            SchedulerOutcome::Blocked { .. }
+        ));
+
+        let blocked = db.get_task(task.id).await?;
+        let conversation_id = blocked
+            .conversation_id
+            .expect("created tasks should have a conversation");
+        db.add_conversation_message(
+            conversation_id,
+            Some(task.id),
+            "user",
+            "Use repository oh-my-harness/Persistent-Agent.",
+        )
+        .await?;
+        db.set_task_status(task.id, TaskStatus::Queued, "test", None)
+            .await?;
+
+        let second_tick = scheduler.tick().await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert!(matches!(
+            second_tick.outcome,
+            SchedulerOutcome::Completed { .. }
+        ));
+        assert_eq!(updated.status, TaskStatus::Completed);
+        assert!(
+            updated
+                .result_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("latest user conversation context")
+        );
 
         Ok(())
     }

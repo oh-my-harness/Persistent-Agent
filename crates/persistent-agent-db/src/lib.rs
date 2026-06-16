@@ -176,13 +176,20 @@ impl Db {
         reason: Option<&str>,
     ) -> anyhow::Result<Task> {
         let now = Utc::now();
-        sqlx::query("UPDATE tasks SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?")
-            .bind(status.to_string())
-            .bind(reason)
-            .bind(now)
-            .bind(id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET status = ?, blocked_reason = ?, lease_owner = NULL, lease_expires_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(reason)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
 
         self.record_action(
             Some(id),
