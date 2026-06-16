@@ -29,6 +29,9 @@ const ZH_PAUSE: &str = "\u{6682}\u{505c}";
 const ZH_RESUME: &str = "\u{6062}\u{590d}";
 const ZH_CANCEL: &str = "\u{53d6}\u{6d88}";
 const ZH_ADJUST: &str = "\u{8c03}\u{6574}";
+const ZH_EXPLAIN: &str = "\u{89e3}\u{91ca}";
+const ZH_WHY: &str = "\u{4e3a}\u{4ec0}\u{4e48}";
+const ZH_STATE: &str = "\u{72b6}\u{6001}";
 const ZH_CONVERT_TASK: &str = "\u{8f6c}\u{6362}\u{4efb}\u{52a1}";
 const ZH_CHANGE_TO: &str = "\u{6539}\u{6210}";
 const ZH_CHANGE_AS: &str = "\u{6539}\u{4e3a}";
@@ -175,6 +178,41 @@ impl MainAgent {
             )
             .await?;
         Ok(tasks)
+    }
+
+    pub async fn explain_task_pool_state(&self) -> anyhow::Result<String> {
+        let tasks = self.db.list_tasks().await?;
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "explain_task_pool_state",
+                serde_json::json!({ "count": tasks.len() }),
+            )
+            .await?;
+
+        Ok(format_task_pool_explanation(&tasks))
+    }
+
+    pub async fn explain_task_state(&self, id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(id).await?;
+        let dependencies = self.db.list_task_dependencies(id).await?;
+        let mut dependency_states = Vec::new();
+        for dependency in dependencies {
+            let dependency_task = self.db.get_task(dependency.depends_on_task_id).await?;
+            dependency_states.push(dependency_task);
+        }
+
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "explain_task_state",
+                serde_json::json!({ "status": task.status }),
+            )
+            .await?;
+
+        Ok(format_task_explanation(&task, &dependency_states))
     }
 
     pub async fn main_conversation_messages(
@@ -370,8 +408,13 @@ impl MainAgent {
                 let tasks = self.list_task_pool().await?;
                 format_task_list(&tasks)
             }
+            MainAgentIntent::ExplainTaskPool => self.explain_task_pool_state().await?,
+            MainAgentIntent::ExplainTask { selector } => match self.find_task(&selector).await? {
+                Ok(task) => self.explain_task_state(task.id).await?,
+                Err(reply) => reply,
+            },
             MainAgentIntent::Help => {
-                "I can create tasks, list tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: list tasks.".to_owned()
+                "I can create tasks, list tasks, explain task state, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: why is task Deploy release not running?".to_owned()
             }
         };
 
@@ -489,6 +532,10 @@ enum MainAgentIntent {
         content: String,
     },
     ListTasks,
+    ExplainTaskPool,
+    ExplainTask {
+        selector: String,
+    },
     Summarize,
     Help,
 }
@@ -496,6 +543,10 @@ enum MainAgentIntent {
 fn parse_intent(content: &str) -> MainAgentIntent {
     let trimmed = content.trim();
     let normalized = trimmed.to_lowercase();
+
+    if let Some(intent) = parse_explain_intent(trimmed, &normalized) {
+        return intent;
+    }
 
     if contains_any(
         &normalized,
@@ -728,6 +779,230 @@ fn format_task_list(tasks: &[Task]) -> String {
     }
     if tasks.len() > 10 {
         lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn parse_explain_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "explain",
+            "why",
+            "why is",
+            "why isn't",
+            "status",
+            "state",
+            ZH_EXPLAIN,
+            ZH_WHY,
+            ZH_STATE,
+        ],
+    ) {
+        return None;
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "task pool",
+            "queue",
+            "current execution",
+            "execution state",
+            ZH_TASK_POOL,
+            ZH_QUEUE,
+        ],
+    ) {
+        return Some(MainAgentIntent::ExplainTaskPool);
+    }
+
+    extract_explain_task_selector(content, normalized)
+        .map(|selector| MainAgentIntent::ExplainTask { selector })
+}
+
+fn extract_explain_task_selector(content: &str, normalized: &str) -> Option<String> {
+    for prefix in [
+        "why is task",
+        "why isn't task",
+        "why is the task",
+        "explain task",
+        "task status",
+        "status of task",
+        "state of task",
+    ] {
+        if let Some(index) = normalized.find(prefix) {
+            let selector = content[index + prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\'']);
+            return clean_explain_selector(selector);
+        }
+    }
+
+    if contains_any(normalized, &[ZH_TASK, ZH_EXPLAIN, ZH_WHY, ZH_STATE]) {
+        let selector = extract_task_selector(
+            content,
+            &[
+                "not running",
+                "running",
+                "status",
+                "state",
+                "why",
+                "explain",
+                ZH_EXPLAIN,
+                ZH_WHY,
+                ZH_STATE,
+            ],
+        );
+        if !selector.is_empty() && selector != content {
+            return Some(selector);
+        }
+    }
+
+    None
+}
+
+fn clean_explain_selector(selector: &str) -> Option<String> {
+    let mut value = selector.to_owned();
+    for suffix in [
+        "not running",
+        "running",
+        "blocked",
+        "waiting",
+        "?",
+        "\u{ff1f}",
+    ] {
+        if let Some(index) = value.to_lowercase().find(suffix) {
+            value.truncate(index);
+        }
+    }
+    let value = value
+        .trim()
+        .trim_matches([':', '\u{ff1a}', ',', '\u{ff0c}', '.', '\u{3002}', '"', '\''])
+        .trim()
+        .to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn format_task_pool_explanation(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "No work is running because the task pool is empty.".to_owned();
+    }
+
+    let running = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .count();
+    let queued = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Queued)
+        .count();
+    let waiting_for_user = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::WaitingForUser)
+        .count();
+    let waiting_for_schedule = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::WaitingForSchedule)
+        .count();
+
+    let mut lines = vec![format!(
+        "Execution state: {running} running, {queued} queued, {waiting_for_user} waiting for user, {waiting_for_schedule} waiting for schedule."
+    )];
+
+    if let Some(task) = tasks.iter().find(|task| task.status == TaskStatus::Running) {
+        lines.push(format!("Currently running: '{}'.", task.title));
+    } else if let Some(task) = tasks.iter().find(|task| task.status == TaskStatus::Queued) {
+        lines.push(format!(
+            "No task is running right now. The next queued candidate appears to be '{}' by priority and queue order.",
+            task.title
+        ));
+    } else if waiting_for_user > 0 {
+        lines.push(
+            "No queued task is runnable because at least one task is waiting for user input."
+                .to_owned(),
+        );
+    } else if waiting_for_schedule > 0 {
+        lines.push(
+            "No queued task is runnable because recurring work is waiting for its next schedule."
+                .to_owned(),
+        );
+    } else {
+        lines.push("No task is currently runnable.".to_owned());
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_explanation(task: &Task, dependencies: &[Task]) -> String {
+    let mut lines = vec![format!(
+        "Task '{}' is currently {}.",
+        task.title, task.status
+    )];
+
+    match task.status {
+        TaskStatus::Queued => {
+            let unsatisfied = dependencies
+                .iter()
+                .filter(|dependency| {
+                    !matches!(
+                        dependency.status,
+                        TaskStatus::Completed | TaskStatus::WaitingForSchedule
+                    )
+                })
+                .collect::<Vec<_>>();
+            if unsatisfied.is_empty() {
+                lines.push("It is queued and eligible for the scheduler once it reaches the front of priority and queue order.".to_owned());
+            } else {
+                lines.push(format!(
+                    "It is queued but blocked by {} unfinished dependenc{}:",
+                    unsatisfied.len(),
+                    if unsatisfied.len() == 1 { "y" } else { "ies" }
+                ));
+                for dependency in unsatisfied {
+                    lines.push(format!("- '{}' is {}", dependency.title, dependency.status));
+                }
+            }
+        }
+        TaskStatus::Running => {
+            lines.push("A worker has claimed it and is executing it now.".to_owned())
+        }
+        TaskStatus::WaitingForUser => {
+            lines.push(
+                task.blocked_reason
+                    .as_ref()
+                    .map(|reason| format!("It needs user input: {reason}"))
+                    .unwrap_or_else(|| "It needs user input before it can continue.".to_owned()),
+            );
+        }
+        TaskStatus::WaitingForSchedule => {
+            lines.push(
+                task.next_run_at
+                    .map(|time| format!("It is a recurring task waiting until {time}."))
+                    .unwrap_or_else(|| {
+                        "It is a recurring task waiting for its next schedule.".to_owned()
+                    }),
+            );
+        }
+        TaskStatus::Completed => lines.push("It has completed successfully.".to_owned()),
+        TaskStatus::Failed => lines.push(
+            task.result_summary
+                .as_ref()
+                .map(|summary| format!("It failed with summary: {summary}"))
+                .unwrap_or_else(|| "It failed without a detailed summary.".to_owned()),
+        ),
+        TaskStatus::Cancelled => {
+            lines.push("It was cancelled and will not be scheduled.".to_owned())
+        }
+        TaskStatus::Paused => {
+            lines.push("It is paused and will not be scheduled until resumed.".to_owned())
+        }
+        TaskStatus::Draft => {
+            lines.push("It is a draft and is not ready for scheduling.".to_owned())
+        }
+    }
+
+    if !dependencies.is_empty() {
+        lines.push(format!("Dependencies: {}.", dependencies.len()));
     }
 
     lines.join("\n")
@@ -1065,6 +1340,24 @@ mod tests {
         assert_eq!(
             parse_intent("\u{5217}\u{51fa}\u{4efb}\u{52a1}"),
             MainAgentIntent::ListTasks
+        );
+    }
+
+    #[test]
+    fn parses_explain_intents() {
+        assert_eq!(
+            parse_intent("explain task pool state"),
+            MainAgentIntent::ExplainTaskPool
+        );
+        assert_eq!(
+            parse_intent("\u{89e3}\u{91ca}\u{4efb}\u{52a1}\u{6c60}\u{72b6}\u{6001}"),
+            MainAgentIntent::ExplainTaskPool
+        );
+        assert_eq!(
+            parse_intent("why is task Deploy release not running?"),
+            MainAgentIntent::ExplainTask {
+                selector: "Deploy release".to_owned()
+            }
         );
     }
 
@@ -1422,6 +1715,98 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "list_tasks")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_explain_task_pool_state() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        agent
+            .create_task(CreateTask {
+                title: "Queued work".to_owned(),
+                description: "Ready to run".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 2,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "explain task pool state".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Execution state")
+        );
+        assert!(response.assistant_message.content.contains("Queued work"));
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "explain_task_pool_state")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_explain_why_task_is_not_running() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let dependency = agent
+            .create_task(CreateTask {
+                title: "Build package".to_owned(),
+                description: "Build first".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let dependent = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy after build".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 10,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .add_task_dependency(dependent.id, dependency.id)
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "why is task Deploy release not running?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(dependent.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("unfinished depend")
+        );
+        assert!(response.assistant_message.content.contains("Build package"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "explain_task_state")
         );
 
         Ok(())
