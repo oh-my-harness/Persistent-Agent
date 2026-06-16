@@ -4,10 +4,14 @@ Persistent Agent is a task-pool driven agent system that can continuously pick u
 
 The first milestone focuses on reliable serial execution. The architecture should keep a clean path toward future parallel execution.
 
+## Documents
+
+- [Technical Selection](docs/TECH_SELECTION.md)
+
 ## Product Goals
 
-1. Let users create, prioritize, inspect, and discuss tasks in a task pool.
-2. Let a main agent periodically scan the task pool, pick the next runnable task, and coordinate execution.
+1. Let users create, prioritize, inspect, and discuss tasks through both conversation and structured UI controls.
+2. Let a main agent manage the task pool conversationally, periodically scan for runnable work, and coordinate execution.
 3. Let worker agents execute concrete tasks and report results, blockers, and memory candidates.
 4. Let blocked tasks request user input through a conversation thread, then resume when enough context is available.
 5. Support one-off tasks and recurring tasks.
@@ -42,6 +46,18 @@ Recommended fields:
 - `blocked_reason`: reason the task needs user input.
 - `result_summary`: latest outcome summary.
 - `memory_candidates`: summaries proposed by worker agents.
+
+### Task Creation Channels
+
+Tasks can enter the system through three channels:
+
+1. Conversational creation through the main agent.
+2. Structured creation through Web UI forms and queue controls.
+3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
+
+The conversational path should be a first-class product surface. Users can ask the main agent to create tasks, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, or summarize the queue.
+
+Structured UI controls remain important for exact edits, batch operations, and reviewable state changes.
 
 ### Task Types
 
@@ -106,8 +122,12 @@ Future scheduler policies can include:
 
 ### Main Agent
 
-The main agent is the coordinator. It should:
+The main agent is the conversational task manager, scheduler, and worker coordinator. It should:
 
+- discuss goals with the user and turn them into task changes,
+- create, update, pause, resume, cancel, reorder, and reprioritize tasks through explicit task-management tools,
+- summarize the task pool and explain current execution state,
+- perform lightweight local inspection when useful for task planning,
 - scan the task pool,
 - select runnable tasks,
 - resolve skills,
@@ -116,6 +136,10 @@ The main agent is the coordinator. It should:
 - handle task state transitions,
 - ask the user for help when needed,
 - decide whether worker memory candidates should be stored.
+
+The main agent should not mutate task state through hidden database writes. It should use auditable tools with clear arguments and recorded outcomes.
+
+For substantial task execution, code changes, long-running operations, or risky local actions, the main agent should delegate to a worker agent. For lightweight planning and inspection, it may use local tools directly.
 
 ### Worker Agent
 
@@ -187,13 +211,15 @@ Core views:
 
 - task pool: create tasks, reorder queue, filter status, inspect priority;
 - task detail: description, metadata, run history, artifacts, memory candidates;
-- conversation: user-agent discussion for blocked or active tasks;
+- main conversation: talk to the main agent to create, update, reorder, explain, or discuss tasks;
+- task conversation: user-agent discussion for blocked or active tasks;
 - execution monitor: current running task, logs, state transitions;
 - skills: manage user-defined skills and see activation rules;
 - memory: inspect and edit approved long-term memories.
 
 MVP UI actions:
 
+- create or change tasks by chatting with the main agent,
 - create one-off task,
 - create recurring task,
 - edit task priority/order,
@@ -207,15 +233,17 @@ MVP UI actions:
 Build the first version in this order:
 
 1. Data model and task lifecycle.
-2. Serial scheduler loop.
-3. Main-agent to worker-agent execution contract.
-4. Basic one-off task execution.
-5. Blocked task conversation flow.
-6. Recurring task requeue behavior.
-7. Skill metadata and explicit skill selection.
-8. Basic automatic skill matching.
-9. Long-term memory candidate review.
-10. Web UI for task pool, task detail, conversation, and execution status.
+2. Task-management tools for the main agent.
+3. Main-agent conversation flow for creating and changing tasks.
+4. Serial scheduler loop.
+5. Main-agent to worker-agent execution contract.
+6. Basic one-off task execution.
+7. Blocked task conversation flow.
+8. Recurring task requeue behavior.
+9. Skill metadata and explicit skill selection.
+10. Basic automatic skill matching.
+11. Long-term memory candidate review.
+12. Web UI for task pool, task detail, main conversation, task conversation, and execution status.
 
 ## Design Principles
 
@@ -226,4 +254,4 @@ Build the first version in this order:
 - Store summaries and decisions, not unbounded raw context.
 - Prefer small, inspectable agent contracts over hidden orchestration.
 - Design locks and capacity now, even if MVP uses only one worker.
-
+- Let the main agent manage task state through explicit tools, not implicit database mutation.
