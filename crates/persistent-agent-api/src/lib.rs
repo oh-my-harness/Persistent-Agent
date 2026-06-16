@@ -13,7 +13,7 @@ use axum::{
 use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{ConversationMessage, CreateTask, Task, TaskId, UpdateTask};
-use persistent_agent_scheduler::{Scheduler, SchedulerTick, StubWorker};
+use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::time::interval;
@@ -25,14 +25,14 @@ use uuid::Uuid;
 pub struct AppState {
     pub db: Db,
     pub main_agent: MainAgent,
-    pub scheduler: Scheduler<StubWorker>,
+    pub scheduler: Scheduler<WorkerBackend>,
     pub events: EventBus,
 }
 
 impl AppState {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, worker: WorkerBackend) -> Self {
         let main_agent = MainAgent::new(db.clone());
-        let scheduler = Scheduler::new(db.clone(), StubWorker);
+        let scheduler = Scheduler::new(db.clone(), worker);
         Self {
             db,
             main_agent,

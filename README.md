@@ -25,6 +25,8 @@ Run the backend:
 cargo run -p persistent-agent-server
 ```
 
+Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
+
 Run the Web UI:
 
 ```powershell

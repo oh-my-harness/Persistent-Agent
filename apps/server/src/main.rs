@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use persistent_agent_api::{AppState, router, spawn_heartbeat};
 use persistent_agent_db::Db;
+use persistent_agent_scheduler::{LlmWorker, LlmWorkerConfig, StubWorker, WorkerBackend};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -15,7 +16,8 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
 
     let db = Db::connect(&database_url).await?;
-    let state = AppState::new(db);
+    let worker = build_worker();
+    let state = AppState::new(db, worker);
 
     tokio::spawn(spawn_heartbeat(state.events.clone()));
 
@@ -29,6 +31,21 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn build_worker() -> WorkerBackend {
+    match std::env::var("DEEPSEEK_API_KEY") {
+        Ok(api_key) if !api_key.trim().is_empty() => {
+            let model =
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
+            tracing::info!(%model, "using DeepSeek LLM worker");
+            WorkerBackend::Llm(LlmWorker::new(LlmWorkerConfig::deepseek(api_key, model)))
+        }
+        _ => {
+            tracing::info!("DEEPSEEK_API_KEY not set; using stub worker");
+            WorkerBackend::Stub(StubWorker)
+        }
+    }
 }
 
 async fn shutdown_signal() {
