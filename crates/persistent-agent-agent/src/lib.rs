@@ -35,6 +35,8 @@ const ZH_TO: &str = "\u{5230}";
 const ZH_AS: &str = "\u{4e3a}";
 const ZH_EVERY: &str = "\u{6bcf}";
 const ZH_INTERVAL: &str = "\u{95f4}\u{9694}";
+const ZH_DEPEND_ON: &str = "\u{4f9d}\u{8d56}";
+const ZH_REMOVE_DEPENDENCY: &str = "\u{53d6}\u{6d88}\u{4f9d}\u{8d56}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -107,6 +109,28 @@ impl MainAgent {
         self.db
             .set_task_status(id, TaskStatus::Cancelled, "main_agent", None)
             .await
+    }
+
+    pub async fn add_task_dependency(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+    ) -> anyhow::Result<Task> {
+        self.db
+            .add_task_dependency(task_id, depends_on_task_id, "main_agent")
+            .await?;
+        self.db.get_task(task_id).await
+    }
+
+    pub async fn remove_task_dependency(
+        &self,
+        task_id: TaskId,
+        depends_on_task_id: TaskId,
+    ) -> anyhow::Result<Task> {
+        self.db
+            .remove_task_dependency(task_id, depends_on_task_id, "main_agent")
+            .await?;
+        self.db.get_task(task_id).await
     }
 
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
@@ -256,6 +280,48 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::AddTaskDependency {
+                selector,
+                depends_on_selector,
+            } => {
+                let task = self.find_task(&selector).await?;
+                let depends_on_task = self.find_task(&depends_on_selector).await?;
+                match (task, depends_on_task) {
+                    (Ok(task), Ok(depends_on_task)) => {
+                        let task = self
+                            .add_task_dependency(task.id, depends_on_task.id)
+                            .await?;
+                        let reply = format!(
+                            "Added dependency: '{}' now waits for '{}'.",
+                            task.title, depends_on_task.title
+                        );
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    (Err(reply), _) | (_, Err(reply)) => reply,
+                }
+            }
+            MainAgentIntent::RemoveTaskDependency {
+                selector,
+                depends_on_selector,
+            } => {
+                let task = self.find_task(&selector).await?;
+                let depends_on_task = self.find_task(&depends_on_selector).await?;
+                match (task, depends_on_task) {
+                    (Ok(task), Ok(depends_on_task)) => {
+                        let task = self
+                            .remove_task_dependency(task.id, depends_on_task.id)
+                            .await?;
+                        let reply = format!(
+                            "Removed dependency: '{}' no longer waits for '{}'.",
+                            task.title, depends_on_task.title
+                        );
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    (Err(reply), _) | (_, Err(reply)) => reply,
+                }
+            }
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -271,7 +337,7 @@ impl MainAgent {
                 )
             }
             MainAgentIntent::Help => {
-                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, convert tasks between one-off and recurring, or summarize the task pool. Example: convert task Check issues to recurring every 300 seconds.".to_owned()
+                "I can create tasks, pause/resume/cancel tasks, set priority, reorder the queue, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: make task Deploy release depend on Build package.".to_owned()
             }
         };
 
@@ -376,6 +442,14 @@ enum MainAgentIntent {
         task_type: TaskType,
         interval_seconds: Option<i64>,
     },
+    AddTaskDependency {
+        selector: String,
+        depends_on_selector: String,
+    },
+    RemoveTaskDependency {
+        selector: String,
+        depends_on_selector: String,
+    },
     Summarize,
     Help,
 }
@@ -395,6 +469,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         ],
     ) {
         return MainAgentIntent::Summarize;
+    }
+
+    if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if let Some(priority) = extract_priority(&normalized) {
@@ -569,6 +647,77 @@ fn is_convert_request(normalized: &str) -> bool {
     )
 }
 
+fn parse_dependency_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if contains_any(
+        normalized,
+        &[
+            "remove dependency",
+            "delete dependency",
+            "clear dependency",
+            ZH_REMOVE_DEPENDENCY,
+        ],
+    ) || (normalized.contains(ZH_CANCEL) && normalized.contains(ZH_DEPEND_ON))
+    {
+        return split_dependency_selectors(
+            content,
+            normalized,
+            &["depends on", "depend on", " on ", ZH_DEPEND_ON],
+        )
+        .map(
+            |(selector, depends_on_selector)| MainAgentIntent::RemoveTaskDependency {
+                selector,
+                depends_on_selector,
+            },
+        );
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "depends on",
+            "depend on",
+            "add dependency",
+            "set dependency",
+            ZH_DEPEND_ON,
+        ],
+    ) && !is_create_request(normalized)
+    {
+        return split_dependency_selectors(
+            content,
+            normalized,
+            &["depends on", "depend on", " on ", ZH_DEPEND_ON],
+        )
+        .map(
+            |(selector, depends_on_selector)| MainAgentIntent::AddTaskDependency {
+                selector,
+                depends_on_selector,
+            },
+        );
+    }
+
+    None
+}
+
+fn split_dependency_selectors(
+    content: &str,
+    normalized: &str,
+    markers: &[&str],
+) -> Option<(String, String)> {
+    markers
+        .iter()
+        .filter_map(|marker| normalized.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)
+        .and_then(|(index, marker)| {
+            let left = content[..index].trim();
+            let right = content[index + marker.len()..].trim();
+            let selector = extract_task_selector(left, &[]);
+            let depends_on_selector = extract_task_selector(right, &[]);
+
+            (!selector.is_empty() && !depends_on_selector.is_empty())
+                .then_some((selector, depends_on_selector))
+        })
+}
+
 fn extract_title(content: &str) -> String {
     for separator in ["\u{ff1a}", ":", "\u{ff0c}", ",", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
@@ -603,6 +752,11 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "convert task",
         "change task type",
         "make task",
+        "add dependency",
+        "set dependency",
+        "remove dependency",
+        "delete dependency",
+        "clear dependency",
         "reprioritize",
         "set priority",
         "change priority",
@@ -859,6 +1013,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_task_dependency_intents() {
+        assert_eq!(
+            parse_intent("make task Deploy release depend on Build package"),
+            MainAgentIntent::AddTaskDependency {
+                selector: "Deploy release".to_owned(),
+                depends_on_selector: "Build package".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("remove dependency task Deploy release on Build package"),
+            MainAgentIntent::RemoveTaskDependency {
+                selector: "Deploy release".to_owned(),
+                depends_on_selector: "Build package".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{8bbe}\u{7f6e}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{4f9d}\u{8d56} \u{6784}\u{5efa}\u{5305}"
+            ),
+            MainAgentIntent::AddTaskDependency {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                depends_on_selector: "\u{6784}\u{5efa}\u{5305}".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{53d6}\u{6d88}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{4f9d}\u{8d56} \u{6784}\u{5efa}\u{5305}"
+            ),
+            MainAgentIntent::RemoveTaskDependency {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                depends_on_selector: "\u{6784}\u{5efa}\u{5305}".to_owned(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
@@ -923,6 +1113,69 @@ mod tests {
             Some(45)
         );
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_manage_task_dependencies_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let dependency = agent
+            .create_task(CreateTask {
+                title: "Build package".to_owned(),
+                description: "Build the release package".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let dependent = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 10,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "make task Deploy release depend on Build package".to_owned(),
+            })
+            .await?;
+        let dependencies = db.list_task_dependencies(dependent.id).await?;
+
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_task_id, dependency.id);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Added dependency")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "remove dependency task Deploy release on Build package".to_owned(),
+            })
+            .await?;
+        let dependencies = db.list_task_dependencies(dependent.id).await?;
+
+        assert!(dependencies.is_empty());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Removed dependency")
+        );
 
         Ok(())
     }

@@ -315,11 +315,14 @@ async fn add_task_dependency(
     Path(id): Path<TaskId>,
     Json(input): Json<TaskDependencyRequest>,
 ) -> Result<Json<TaskDependency>, ApiError> {
+    let task = state
+        .main_agent
+        .add_task_dependency(id, input.depends_on_task_id)
+        .await?;
     let dependency = state
         .db
-        .add_task_dependency(id, input.depends_on_task_id, "main_agent")
+        .get_task_dependency(id, input.depends_on_task_id)
         .await?;
-    let task = state.db.get_task(id).await?;
     state.events.send(AppEvent::TaskChanged { task });
     Ok(Json(dependency))
 }
@@ -328,11 +331,11 @@ async fn remove_task_dependency(
     State(state): State<AppState>,
     Path((id, depends_on_id)): Path<(TaskId, TaskId)>,
 ) -> Result<Json<TaskDependency>, ApiError> {
-    let dependency = state
-        .db
-        .remove_task_dependency(id, depends_on_id, "main_agent")
+    let dependency = state.db.get_task_dependency(id, depends_on_id).await?;
+    let task = state
+        .main_agent
+        .remove_task_dependency(id, depends_on_id)
         .await?;
-    let task = state.db.get_task(id).await?;
     state.events.send(AppEvent::TaskChanged { task });
     Ok(Json(dependency))
 }
