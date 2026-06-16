@@ -66,8 +66,12 @@ fn scheduler_policy() -> SchedulerPolicy {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
+    let max_attempts = std::env::var("SCHEDULER_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
 
-    SchedulerPolicy::new(worker_capacity, 300)
+    SchedulerPolicy::new(worker_capacity, 300).with_max_attempts(max_attempts)
 }
 
 async fn shutdown_signal() {

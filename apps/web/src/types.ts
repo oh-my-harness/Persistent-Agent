@@ -55,6 +55,7 @@ export interface SchedulerTick {
     | { type: "completed"; summary: string; follow_up_tasks: Task[] }
     | { type: "blocked"; reason: string }
     | { type: "failed"; error: string }
+    | { type: "retry_scheduled"; error: string; next_attempt: number; max_attempts: number }
     | { type: "superseded"; status: TaskStatus; reason: string };
 }
 

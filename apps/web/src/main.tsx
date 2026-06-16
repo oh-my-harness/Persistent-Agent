@@ -653,6 +653,14 @@ function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): Timelin
         tone: "danger",
         timestamp,
       };
+    case "retry_scheduled":
+      return {
+        id: `${timestamp}-scheduler-retry-${tick.claimed_task?.id ?? "none"}`,
+        title: "Scheduler scheduled a retry",
+        detail: `${taskTitle}: ${tick.outcome.error}. Attempt ${tick.outcome.next_attempt} of ${tick.outcome.max_attempts} will run later.${suffix}`,
+        tone: "warning",
+        timestamp,
+      };
     case "superseded":
       return {
         id: `${timestamp}-scheduler-superseded-${tick.claimed_task?.id ?? "none"}`,

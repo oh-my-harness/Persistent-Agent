@@ -29,6 +29,7 @@ pub struct Scheduler<W> {
 pub struct SchedulerPolicy {
     pub worker_capacity: usize,
     pub lease_seconds: i64,
+    pub max_attempts: i64,
 }
 
 impl SchedulerPolicy {
@@ -36,6 +37,7 @@ impl SchedulerPolicy {
         Self {
             worker_capacity: 1,
             lease_seconds: 300,
+            max_attempts: 1,
         }
     }
 
@@ -43,7 +45,13 @@ impl SchedulerPolicy {
         Self {
             worker_capacity: worker_capacity.max(1),
             lease_seconds: lease_seconds.max(1),
+            max_attempts: 1,
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: i64) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
     }
 }
 
@@ -163,6 +171,36 @@ where
                 self.db
                     .create_attempt(task.id, TaskStatus::Failed, Some(&error))
                     .await?;
+                if task.attempt_count < self.policy.max_attempts {
+                    let next_attempt = task.attempt_count + 1;
+                    self.db
+                        .requeue_task_after_failure(task.id, &error, "worker")
+                        .await?;
+                    self.db
+                        .record_attempt_event(
+                            attempt.id,
+                            task.id,
+                            "worker_retry_scheduled",
+                            "Worker failed; task was requeued for another attempt.",
+                            json!({
+                                "error": error,
+                                "next_attempt": next_attempt,
+                                "max_attempts": self.policy.max_attempts,
+                            }),
+                        )
+                        .await?;
+
+                    return Ok(SchedulerTick {
+                        recovered_tasks,
+                        requeued_tasks,
+                        claimed_task: Some(task),
+                        outcome: SchedulerOutcome::RetryScheduled {
+                            error,
+                            next_attempt,
+                            max_attempts: self.policy.max_attempts,
+                        },
+                    });
+                }
                 self.db.fail_task(task.id, &error, "worker").await?;
 
                 return Ok(SchedulerTick {
@@ -1071,6 +1109,11 @@ pub enum SchedulerOutcome {
     Failed {
         error: String,
     },
+    RetryScheduled {
+        error: String,
+        next_attempt: i64,
+        max_attempts: i64,
+    },
     Superseded {
         status: TaskStatus,
         reason: String,
@@ -1095,11 +1138,13 @@ mod tests {
     #[test]
     fn scheduler_policy_clamps_capacity_and_lease() {
         assert_eq!(SchedulerPolicy::serial().worker_capacity, 1);
+        assert_eq!(SchedulerPolicy::serial().max_attempts, 1);
         assert_eq!(
-            SchedulerPolicy::new(0, 0),
+            SchedulerPolicy::new(0, 0).with_max_attempts(0),
             SchedulerPolicy {
                 worker_capacity: 1,
                 lease_seconds: 1,
+                max_attempts: 1,
             }
         );
     }
@@ -1114,6 +1159,7 @@ mod tests {
             SchedulerPolicy {
                 worker_capacity: 3,
                 lease_seconds: 45,
+                max_attempts: 1,
             }
         );
 
@@ -2185,6 +2231,68 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "worker_failed")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_retries_worker_failures_until_policy_is_exhausted() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Retry failure task".to_owned(),
+                    description: "Worker will fail twice".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::with_policy(
+            db.clone(),
+            FailingWorker,
+            SchedulerPolicy::new(1, 60).with_max_attempts(2),
+        );
+
+        let first_tick = scheduler.tick().await?;
+        let requeued = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+        let first_events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(
+            first_tick.outcome,
+            SchedulerOutcome::RetryScheduled {
+                next_attempt: 2,
+                max_attempts: 2,
+                ..
+            }
+        ));
+        assert_eq!(requeued.status, TaskStatus::Queued);
+        assert_eq!(requeued.attempt_count, 1);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "requeue_task_after_failure")
+        );
+        assert!(
+            first_events
+                .iter()
+                .any(|event| event.event_type == "worker_retry_scheduled")
+        );
+
+        let second_tick = scheduler.tick().await?;
+        let failed = db.get_task(task.id).await?;
+
+        assert!(matches!(
+            second_tick.outcome,
+            SchedulerOutcome::Failed { .. }
+        ));
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.attempt_count, 2);
 
         Ok(())
     }

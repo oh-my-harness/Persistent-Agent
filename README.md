@@ -29,6 +29,7 @@ The repository now contains the first executable skeleton:
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
 - Scheduler finalization preserves user status changes made while a task is running, such as cancellation or pause.
+- Worker execution failures can be retried according to scheduler policy before being marked permanently failed.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
@@ -50,6 +51,8 @@ Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local envir
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 
 `SCHEDULER_WORKER_CAPACITY` defines the scheduler policy capacity and defaults to `1`. The MVP still executes ticks through a serial lock; the explicit policy keeps the boundary ready for future parallel workers.
+
+`SCHEDULER_MAX_ATTEMPTS` defines how many worker failures are allowed before a task is marked `failed`, and defaults to `1`.
 
 Run the Web UI:
 
