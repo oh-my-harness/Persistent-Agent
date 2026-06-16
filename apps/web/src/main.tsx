@@ -508,7 +508,7 @@ function TaskComposer() {
 
 function TaskRow({ task }: { task: Task }) {
   const queryClient = useQueryClient();
-  const [showHistory, setShowHistory] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
   const [priorityDraft, setPriorityDraft] = useState(task.priority);
   const [queueDraft, setQueueDraft] = useState(task.queue_position);
   const refresh = async () => {
@@ -570,7 +570,7 @@ function TaskRow({ task }: { task: Task }) {
         </div>
       </div>
       <div className="task-actions">
-        <button title="Execution history" onClick={() => setShowHistory((value) => !value)}><History size={16} /></button>
+        <button title="Task details" onClick={() => setShowDetails((value) => !value)}><History size={16} /></button>
         {task.status === "paused" ? (
           <button title="Resume task" onClick={() => resume.mutate(task.id)}><Play size={16} /></button>
         ) : (
@@ -578,9 +578,27 @@ function TaskRow({ task }: { task: Task }) {
         )}
         <button title="Cancel task" onClick={() => cancel.mutate(task.id)}><SquareX size={16} /></button>
       </div>
-      {task.status === "waiting_for_user" && <TaskConversation task={task} />}
-      {showHistory && <TaskHistoryPanel taskId={task.id} />}
+      {showDetails && <TaskDetailPanel task={task} />}
     </article>
+  );
+}
+
+function TaskDetailPanel({ task }: { task: Task }) {
+  return (
+    <div className="task-detail">
+      <section className="task-result">
+        <h4>Latest result</h4>
+        {task.result_summary ? <p>{task.result_summary}</p> : <p className="empty">No result summary yet.</p>}
+        {task.blocked_reason && (
+          <>
+            <h4>Needs user</h4>
+            <p className="blocked-reason">{task.blocked_reason}</p>
+          </>
+        )}
+      </section>
+      <TaskConversation task={task} />
+      <TaskHistoryPanel taskId={task.id} />
+    </div>
   );
 }
 
@@ -649,6 +667,7 @@ function TaskConversation({ task }: { task: Task }) {
         {visibleMessages.map((message) => (
           <MessageBubble key={message.id} message={message} />
         ))}
+        {visibleMessages.length === 0 && <p className="empty">No task conversation yet.</p>}
       </div>
       <form
         className="chat-form"

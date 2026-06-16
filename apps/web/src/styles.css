@@ -549,12 +549,39 @@ textarea {
   width: 34px;
 }
 
-.task-conversation {
+.task-detail {
   border-top: 1px solid #e1e7ea;
+  display: grid;
+  gap: 14px;
+  grid-column: 1 / -1;
+  padding-top: 12px;
+}
+
+.task-result {
+  background: #f7f9fa;
+  border: 1px solid #e1e7ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.task-result h4 {
+  color: #52636c;
+  font-size: 13px;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.task-result p {
+  color: #34444d;
+  margin: 0;
+}
+
+.task-conversation {
   display: grid;
   gap: 10px;
   grid-column: 1 / -1;
-  padding-top: 12px;
 }
 
 .task-conversation-messages {
@@ -565,12 +592,10 @@ textarea {
 }
 
 .task-history {
-  border-top: 1px solid #e1e7ea;
   display: grid;
   gap: 14px;
   grid-column: 1 / -1;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  padding-top: 12px;
 }
 
 .history-column {
