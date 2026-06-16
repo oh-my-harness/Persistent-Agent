@@ -54,7 +54,8 @@ export interface SchedulerTick {
     | { type: "idle" }
     | { type: "completed"; summary: string }
     | { type: "blocked"; reason: string }
-    | { type: "failed"; error: string };
+    | { type: "failed"; error: string }
+    | { type: "superseded"; status: TaskStatus; reason: string };
 }
 
 export interface SchedulerState {

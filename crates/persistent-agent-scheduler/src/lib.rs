@@ -148,6 +148,17 @@ where
                         json!({ "error": error }),
                     )
                     .await?;
+                if let Some(outcome) = self
+                    .supersede_if_task_no_longer_running(task.id, attempt.id, "failed")
+                    .await?
+                {
+                    return Ok(SchedulerTick {
+                        recovered_tasks,
+                        requeued_tasks,
+                        claimed_task: Some(task),
+                        outcome,
+                    });
+                }
                 self.db
                     .create_attempt(task.id, TaskStatus::Failed, Some(&error))
                     .await?;
@@ -180,6 +191,17 @@ where
                         }),
                     )
                     .await?;
+                if let Some(outcome) = self
+                    .supersede_if_task_no_longer_running(task.id, attempt.id, "completed")
+                    .await?
+                {
+                    return Ok(SchedulerTick {
+                        recovered_tasks,
+                        requeued_tasks,
+                        claimed_task: Some(task),
+                        outcome,
+                    });
+                }
                 self.db
                     .create_attempt(task.id, TaskStatus::Completed, Some(&summary))
                     .await?;
@@ -227,6 +249,17 @@ where
                         json!({ "reason": reason }),
                     )
                     .await?;
+                if let Some(outcome) = self
+                    .supersede_if_task_no_longer_running(task.id, attempt.id, "blocked")
+                    .await?
+                {
+                    return Ok(SchedulerTick {
+                        recovered_tasks,
+                        requeued_tasks,
+                        claimed_task: Some(task),
+                        outcome,
+                    });
+                }
                 self.db
                     .create_attempt(task.id, TaskStatus::WaitingForUser, Some(&reason))
                     .await?;
@@ -251,6 +284,43 @@ where
                 })
             }
         }
+    }
+
+    async fn supersede_if_task_no_longer_running(
+        &self,
+        task_id: persistent_agent_domain::TaskId,
+        attempt_id: persistent_agent_domain::TaskAttemptId,
+        worker_result: &str,
+    ) -> anyhow::Result<Option<SchedulerOutcome>> {
+        let current = self.db.get_task(task_id).await?;
+        if current.status == TaskStatus::Running {
+            return Ok(None);
+        }
+
+        let reason = format!(
+            "Worker result '{worker_result}' was ignored because task status is now '{}'.",
+            current.status
+        );
+        self.db
+            .record_attempt_event(
+                attempt_id,
+                task_id,
+                "worker_outcome_superseded",
+                "Worker result ignored because task state changed during execution.",
+                json!({
+                    "worker_result": worker_result,
+                    "current_status": current.status,
+                }),
+            )
+            .await?;
+        self.db
+            .create_attempt(task_id, current.status, Some(&reason))
+            .await?;
+
+        Ok(Some(SchedulerOutcome::Superseded {
+            status: current.status,
+            reason,
+        }))
     }
 
     async fn execute_worker_with_heartbeat(
@@ -880,6 +950,7 @@ pub enum SchedulerOutcome {
     Completed { summary: String },
     Blocked { reason: String },
     Failed { error: String },
+    Superseded { status: TaskStatus, reason: String },
 }
 
 #[cfg(test)]
@@ -1477,6 +1548,57 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == "worker_heartbeat")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_does_not_overwrite_cancelled_running_task() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Cancelable work".to_owned(),
+                    description: "Worker result should not override cancellation".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let scheduler = Scheduler::with_policy(
+            db.clone(),
+            DelayedWorker {
+                delay: Duration::from_millis(100),
+            },
+            SchedulerPolicy::new(1, 60),
+        );
+        let tick_handle = tokio::spawn(async move { scheduler.tick().await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        db.set_task_status(task.id, TaskStatus::Cancelled, "test", None)
+            .await?;
+
+        let tick = tick_handle.await??;
+        let final_task = db.get_task(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(
+            tick.outcome,
+            SchedulerOutcome::Superseded {
+                status: TaskStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(final_task.status, TaskStatus::Cancelled);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_outcome_superseded")
         );
 
         Ok(())

@@ -651,6 +651,14 @@ function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): Timelin
         tone: "danger",
         timestamp,
       };
+    case "superseded":
+      return {
+        id: `${timestamp}-scheduler-superseded-${tick.claimed_task?.id ?? "none"}`,
+        title: "Scheduler preserved task state",
+        detail: `${taskTitle}: ${tick.outcome.reason}${suffix}`,
+        tone: tick.outcome.status === "cancelled" ? "danger" : "warning",
+        timestamp,
+      };
     case "idle":
       return {
         id: `${timestamp}-scheduler-idle`,

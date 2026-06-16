@@ -28,6 +28,7 @@ The repository now contains the first executable skeleton:
 - Task execution history API and UI for attempts and auditable task actions.
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
+- Scheduler finalization preserves user status changes made while a task is running, such as cancellation or pause.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
