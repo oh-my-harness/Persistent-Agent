@@ -11,12 +11,14 @@ import {
   listMainAgentMessages,
   listMemories,
   listSkills,
+  listTaskMessages,
   listTasks,
   pauseTask,
   rejectMemory,
   resumeTask,
   runSchedulerTick,
   sendMainAgentMessage,
+  sendTaskMessage,
 } from "./api";
 import type { ConversationMessage, Memory, Task, TaskType } from "./types";
 import type { Skill } from "./types";
@@ -432,6 +434,7 @@ function TaskRow({ task }: { task: Task }) {
           <span className={statusClass}>{task.status.replaceAll("_", " ")}</span>
         </div>
         <p>{task.description || "No description"}</p>
+        {task.blocked_reason && <p className="blocked-reason">{task.blocked_reason}</p>}
         <div className="task-meta">
           <span>{task.task_type.replace("_", " ")}</span>
           <span>priority {task.priority}</span>
@@ -448,7 +451,54 @@ function TaskRow({ task }: { task: Task }) {
         )}
         <button title="Cancel task" onClick={() => cancel.mutate(task.id)}><SquareX size={16} /></button>
       </div>
+      {task.status === "waiting_for_user" && <TaskConversation task={task} />}
     </article>
+  );
+}
+
+function TaskConversation({ task }: { task: Task }) {
+  const queryClient = useQueryClient();
+  const [content, setContent] = useState("");
+  const messages = useQuery({
+    queryKey: ["task-messages", task.id],
+    queryFn: () => listTaskMessages(task.id),
+  });
+  const mutation = useMutation({
+    mutationFn: (value: string) => sendTaskMessage(task.id, value),
+    onSuccess: async () => {
+      setContent("");
+      await queryClient.invalidateQueries({ queryKey: ["task-messages", task.id] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["summary"] });
+    },
+  });
+  const visibleMessages = messages.data ?? [];
+
+  return (
+    <div className="task-conversation">
+      <div className="task-conversation-messages">
+        {visibleMessages.map((message) => (
+          <MessageBubble key={message.id} message={message} />
+        ))}
+      </div>
+      <form
+        className="chat-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!content.trim()) return;
+          mutation.mutate(content);
+        }}
+      >
+        <input
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          placeholder="Reply with the missing context"
+        />
+        <button className="primary icon-button" type="submit" disabled={mutation.isPending}>
+          <Send size={16} />
+        </button>
+      </form>
+    </div>
   );
 }
 

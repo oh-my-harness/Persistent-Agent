@@ -87,6 +87,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}", get(get_task).patch(update_task))
         .route("/api/tasks/{id}/reprioritize", post(reprioritize_task))
         .route("/api/tasks/{id}/reorder", post(reorder_task))
+        .route(
+            "/api/tasks/{id}/messages",
+            get(task_messages).post(send_task_message),
+        )
         .route("/api/tasks/{id}/pause", post(pause_task))
         .route("/api/tasks/{id}/resume", post(resume_task))
         .route("/api/tasks/{id}/cancel", post(cancel_task))
@@ -182,6 +186,77 @@ async fn reorder_task(
         .events
         .send(AppEvent::TaskChanged { task: task.clone() });
     Ok(Json(task))
+}
+
+async fn task_messages(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Vec<ConversationMessage>>, ApiError> {
+    Ok(Json(
+        state.db.list_task_conversation_messages(id, 100).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskMessageRequest {
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskMessageResponse {
+    user_message: ConversationMessage,
+    assistant_message: Option<ConversationMessage>,
+    task: Task,
+}
+
+async fn send_task_message(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(input): Json<TaskMessageRequest>,
+) -> Result<Json<TaskMessageResponse>, ApiError> {
+    let content = input.content.trim();
+    if content.is_empty() {
+        return Err(ApiError::bad_request("message content cannot be empty"));
+    }
+
+    let task = state.db.get_task(id).await?;
+    let Some(conversation_id) = task.conversation_id else {
+        return Err(ApiError::bad_request("task has no conversation"));
+    };
+
+    let user_message = state
+        .db
+        .add_conversation_message(conversation_id, Some(id), "user", content)
+        .await?;
+
+    let mut assistant_message = None;
+    let task = if task.status == persistent_agent_domain::TaskStatus::WaitingForUser {
+        let resumed = state.main_agent.resume_task(id).await?;
+        assistant_message = Some(
+            state
+                .db
+                .add_conversation_message(
+                    conversation_id,
+                    Some(id),
+                    "assistant",
+                    "Thanks, I have the extra context and moved this task back to the queue.",
+                )
+                .await?,
+        );
+        resumed
+    } else {
+        task
+    };
+
+    state
+        .events
+        .send(AppEvent::TaskChanged { task: task.clone() });
+
+    Ok(Json(TaskMessageResponse {
+        user_message,
+        assistant_message,
+        task,
+    }))
 }
 
 async fn pause_task(
@@ -319,20 +394,35 @@ pub async fn spawn_heartbeat(events: EventBus) {
 }
 
 #[derive(Debug)]
-pub struct ApiError(anyhow::Error);
+pub struct ApiError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
+}
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        Self(error)
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error,
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!(error = ?self.0, "api error");
+        tracing::error!(error = ?self.error, "api error");
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
+            self.status,
+            Json(serde_json::json!({ "error": self.error.to_string() })),
         )
             .into_response()
     }

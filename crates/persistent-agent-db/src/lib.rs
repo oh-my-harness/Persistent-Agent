@@ -533,6 +533,20 @@ impl Db {
         Ok(messages)
     }
 
+    pub async fn list_task_conversation_messages(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ConversationMessage>> {
+        let task = self.get_task(task_id).await?;
+        let Some(conversation_id) = task.conversation_id else {
+            return Ok(Vec::new());
+        };
+
+        self.list_conversation_messages(conversation_id, limit)
+            .await
+    }
+
     pub async fn create_memory(&self, input: CreateMemory, actor: &str) -> anyhow::Result<Memory> {
         let memory = Memory {
             id: Uuid::now_v7(),

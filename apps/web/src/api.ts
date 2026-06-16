@@ -5,6 +5,7 @@ import type {
   SchedulerTick,
   Skill,
   Task,
+  TaskMessageResponse,
   TaskPoolSummary,
   TaskType,
 } from "./types";
@@ -75,6 +76,17 @@ export function listMainAgentMessages(): Promise<ConversationMessage[]> {
 
 export function sendMainAgentMessage(content: string): Promise<MainAgentMessageResponse> {
   return request<MainAgentMessageResponse>("/api/main-agent/messages", {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
+}
+
+export function listTaskMessages(id: string): Promise<ConversationMessage[]> {
+  return request<ConversationMessage[]>(`/api/tasks/${id}/messages`);
+}
+
+export function sendTaskMessage(id: string, content: string): Promise<TaskMessageResponse> {
+  return request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
     method: "POST",
     body: JSON.stringify({ content }),
   });

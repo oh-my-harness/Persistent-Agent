@@ -351,6 +351,14 @@ textarea {
   padding: 14px;
 }
 
+.blocked-reason {
+  background: #fff7ed;
+  border-left: 3px solid #ea580c;
+  color: #7c2d12;
+  margin-top: 8px;
+  padding: 8px 10px;
+}
+
 .task-title-line {
   align-items: center;
   display: flex;
@@ -437,6 +445,21 @@ textarea {
   height: 34px;
   justify-content: center;
   width: 34px;
+}
+
+.task-conversation {
+  border-top: 1px solid #e1e7ea;
+  display: grid;
+  gap: 10px;
+  grid-column: 1 / -1;
+  padding-top: 12px;
+}
+
+.task-conversation-messages {
+  display: grid;
+  gap: 8px;
+  max-height: 180px;
+  overflow: auto;
 }
 
 .event-panel {

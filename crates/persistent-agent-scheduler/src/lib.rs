@@ -79,6 +79,16 @@ where
                 self.db
                     .create_attempt(task.id, TaskStatus::WaitingForUser, Some(&reason))
                     .await?;
+                if let Some(conversation_id) = task.conversation_id {
+                    self.db
+                        .add_conversation_message(
+                            conversation_id,
+                            Some(task.id),
+                            "assistant",
+                            &reason,
+                        )
+                        .await?;
+                }
                 self.db
                     .set_task_status(task.id, TaskStatus::WaitingForUser, "worker", Some(&reason))
                     .await?;
@@ -103,6 +113,19 @@ pub struct StubWorker;
 #[async_trait]
 impl TaskWorker for StubWorker {
     async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+        let marker_text = format!("{} {}", task.title, task.description).to_lowercase();
+        if marker_text.contains("blocked")
+            || marker_text.contains("needs_user")
+            || marker_text.contains("need_user")
+        {
+            return Ok(WorkerResult::Blocked {
+                reason: format!(
+                    "I need more user input before continuing task '{}'. Please add the missing context in this task conversation.",
+                    task.title
+                ),
+            });
+        }
+
         Ok(WorkerResult::Completed {
             summary: format!(
                 "Stub worker accepted task '{}' and completed the lifecycle placeholder.",
@@ -286,7 +309,8 @@ pub enum SchedulerOutcome {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use persistent_agent_domain::TaskType;
+    use persistent_agent_db::Db;
+    use persistent_agent_domain::{CreateTask, TaskType};
     use uuid::Uuid;
 
     #[test]
@@ -369,5 +393,37 @@ mod tests {
 
         assert!(candidate.contains("Remember setup"));
         assert!(candidate.contains("Use cargo test."));
+    }
+
+    #[tokio::test]
+    async fn blocked_task_records_conversation_message() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Blocked smoke".to_owned(),
+                    description: "BLOCKED until the user provides a target repository.".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), StubWorker);
+
+        let tick = scheduler.tick().await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 10).await?;
+
+        assert!(matches!(tick.outcome, SchedulerOutcome::Blocked { .. }));
+        assert_eq!(updated.status, TaskStatus::WaitingForUser);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0].content.contains("more user input"));
+
+        Ok(())
     }
 }
