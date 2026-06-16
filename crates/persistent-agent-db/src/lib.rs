@@ -1296,6 +1296,25 @@ impl Db {
         rows.into_iter().map(row_to_skill).collect()
     }
 
+    pub async fn list_skills_by_names(&self, names: &[String]) -> anyhow::Result<Vec<Skill>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let skills = self.list_skills().await?;
+        let mut selected = Vec::new();
+        for name in names {
+            if selected.iter().any(|skill: &Skill| skill.name == *name) {
+                continue;
+            }
+            if let Some(skill) = skills.iter().find(|skill| skill.name == *name) {
+                selected.push(skill.clone());
+            }
+        }
+
+        Ok(selected)
+    }
+
     pub async fn get_skill(&self, id: SkillId) -> anyhow::Result<Skill> {
         let row = sqlx::query("SELECT * FROM skills WHERE id = ?")
             .bind(id.to_string())

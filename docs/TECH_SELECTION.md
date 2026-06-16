@@ -228,6 +228,7 @@ It should:
 
 - run through `AgentHarness`;
 - receive task context, selected skills, memories, and allowed tools;
+- receive active product skill metadata, tool subsets, and resource paths;
 - emit framework events into the product event stream;
 - produce a final task result;
 - report blockers in a structured form;
@@ -258,6 +259,10 @@ Recommended main-agent tools:
 - `resume_task`;
 - `cancel_task`;
 - `convert_task_type`;
+- `add_task_dependency`;
+- `remove_task_dependency`;
+- `add_resource_lock`;
+- `remove_resource_lock`;
 - `add_task_note`;
 - `list_tasks`;
 - `summarize_task_pool`;

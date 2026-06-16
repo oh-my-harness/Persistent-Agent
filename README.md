@@ -29,7 +29,7 @@ The repository now contains the first executable skeleton:
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, preventing long attempts from looking stale.
 - Worker execution failures are persisted as failed tasks with attempt events.
-- Skill management with automatic matching, explicit task selection, and active-skill context for workers.
+- Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate review, edit/delete controls, and approved-memory injection into worker context.
 - Worker-completed results can submit explicit memory candidates for review.
@@ -203,6 +203,7 @@ A worker agent executes one task attempt. It should:
 
 - understand the task and available context,
 - use matched or requested skills,
+- receive active skill descriptions, tool subsets, and resource paths as execution context,
 - perform the work,
 - produce artifacts or code changes,
 - summarize outcome and verification,
