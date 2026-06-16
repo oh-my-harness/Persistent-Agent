@@ -433,8 +433,7 @@ where
     ) -> anyhow::Result<WorkerResult> {
         let task_id = task.id;
         let worker = self.worker.clone();
-        let worker_task = tokio::spawn(async move { worker.execute(task, context).await });
-        tokio::pin!(worker_task);
+        let mut worker_task = tokio::spawn(async move { worker.execute(task, context).await });
 
         let heartbeat_every = heartbeat_interval(self.policy.lease_seconds);
         let heartbeat_delay = sleep(heartbeat_every);
@@ -465,7 +464,22 @@ where
                                 tracing::warn!(task_id = %task_id, %error, "failed to record worker heartbeat event");
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            if let Err(error) = self.db
+                                .record_attempt_event(
+                                    attempt_id,
+                                    task_id,
+                                    "worker_lease_lost",
+                                    "Stopped worker because task lease is no longer active.",
+                                    json!({ "lease_owner": self.lease_owner }),
+                                )
+                                .await
+                            {
+                                tracing::warn!(task_id = %task_id, %error, "failed to record worker lease loss event");
+                            }
+                            worker_task.abort();
+                            anyhow::bail!("task lease lost before worker completed");
+                        }
                         Err(error) => {
                             tracing::warn!(task_id = %task_id, %error, "failed to refresh running task lease");
                         }
@@ -1797,6 +1811,82 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == "worker_outcome_superseded")
+        );
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct AbortRecordingWorker {
+        finished: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TaskWorker for AbortRecordingWorker {
+        async fn execute(
+            &self,
+            task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.finished.fetch_add(1, Ordering::SeqCst);
+
+            Ok(WorkerResult::Completed {
+                summary: format!("completed {}", task.title),
+                memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_aborts_worker_when_running_task_is_cancelled() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Abortable work".to_owned(),
+                    description: "Worker should stop after cancellation".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let finished = Arc::new(AtomicUsize::new(0));
+        let scheduler = Scheduler::with_policy(
+            db.clone(),
+            AbortRecordingWorker {
+                finished: finished.clone(),
+            },
+            SchedulerPolicy::new(1, 1),
+        );
+        let tick_handle = tokio::spawn(async move { scheduler.tick().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        db.set_task_status(task.id, TaskStatus::Cancelled, "test", None)
+            .await?;
+
+        let tick = tick_handle.await??;
+        let final_task = db.get_task(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(
+            tick.outcome,
+            SchedulerOutcome::Superseded {
+                status: TaskStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(final_task.status, TaskStatus::Cancelled);
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_lease_lost")
         );
 
         Ok(())

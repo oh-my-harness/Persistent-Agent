@@ -29,6 +29,7 @@ The repository now contains the first executable skeleton:
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
 - Scheduler finalization preserves user status changes made while a task is running, such as cancellation or pause.
+- Running workers are stopped when their task lease is lost because the task was cancelled, paused, or otherwise moved out of `running`.
 - Worker execution failures can be retried according to scheduler policy before being marked permanently failed.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
