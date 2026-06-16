@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, resource-lock changes, and summarize.
+- Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, resource-lock changes, memory review, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, and execution history.
@@ -34,7 +34,7 @@ The repository now contains the first executable skeleton:
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
-- Long-term memory candidate review, edit/delete controls, and approved-memory injection into worker context.
+- Long-term memory candidate review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
 - Task detail history shows memory candidates proposed by that task.
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.

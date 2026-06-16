@@ -1,7 +1,7 @@
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateTask, Task, TaskId, TaskNote, TaskResourceLock,
-    TaskStatus, TaskType, UpdateTask,
+    ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task, TaskId,
+    TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,11 @@ const ZH_REMOVE_DEPENDENCY: &str = "\u{53d6}\u{6d88}\u{4f9d}\u{8d56}";
 const ZH_NOTE: &str = "\u{5907}\u{6ce8}";
 const ZH_RESOURCE_LOCK: &str = "\u{8d44}\u{6e90}\u{9501}";
 const ZH_RESOURCE: &str = "\u{8d44}\u{6e90}";
+const ZH_MEMORY: &str = "\u{8bb0}\u{5fc6}";
+const ZH_LONG_TERM_MEMORY: &str = "\u{957f}\u{671f}\u{8bb0}\u{5fc6}";
+const ZH_APPROVE: &str = "\u{91c7}\u{7eb3}";
+const ZH_ACCEPT: &str = "\u{63a5}\u{53d7}";
+const ZH_REJECT: &str = "\u{62d2}\u{7edd}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -275,6 +280,18 @@ impl MainAgent {
             .await?;
 
         Ok(format_task_explanation(&task, &dependency_states))
+    }
+
+    pub async fn approve_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
+        self.db
+            .set_memory_status(id, MemoryStatus::Approved, "main_agent")
+            .await
+    }
+
+    pub async fn reject_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
+        self.db
+            .set_memory_status(id, MemoryStatus::Rejected, "main_agent")
+            .await
     }
 
     pub async fn main_conversation_messages(
@@ -537,8 +554,31 @@ impl MainAgent {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
             },
+            MainAgentIntent::ApproveMemory { selector } => match self.find_memory(&selector).await?
+            {
+                Ok(memory) => {
+                    let memory = self.approve_memory(memory.id).await?;
+                    format!(
+                        "Approved memory '{}': {}",
+                        memory.id.to_string().chars().take(8).collect::<String>(),
+                        memory.content
+                    )
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::RejectMemory { selector } => match self.find_memory(&selector).await? {
+                Ok(memory) => {
+                    let memory = self.reject_memory(memory.id).await?;
+                    format!(
+                        "Rejected memory '{}': {}",
+                        memory.id.to_string().chars().take(8).collect::<String>(),
+                        memory.content
+                    )
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, add/remove resource locks, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -579,6 +619,37 @@ impl MainAgent {
             [] => Ok(Err(format!("No task matched '{selector}'."))),
             _ => Ok(Err(format!(
                 "Found {} tasks matching '{selector}'. Please use a more specific title or id.",
+                matches.len()
+            ))),
+        }
+    }
+
+    async fn find_memory(&self, selector: &str) -> anyhow::Result<Result<Memory, String>> {
+        let needle = selector.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Err(
+                "Please tell me which memory to review by content fragment or memory id."
+                    .to_owned(),
+            ));
+        }
+
+        let matches = self
+            .db
+            .list_memories()
+            .await?
+            .into_iter()
+            .filter(|memory| {
+                memory.id.to_string().starts_with(&needle)
+                    || memory.content.to_lowercase().contains(&needle)
+                    || memory.scope.to_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [memory] => Ok(Ok(memory.clone())),
+            [] => Ok(Err(format!("No memory matched '{selector}'."))),
+            _ => Ok(Err(format!(
+                "Found {} memories matching '{selector}'. Please use a more specific content fragment or id.",
                 matches.len()
             ))),
         }
@@ -675,6 +746,12 @@ enum MainAgentIntent {
     ExplainTask {
         selector: String,
     },
+    ApproveMemory {
+        selector: String,
+    },
+    RejectMemory {
+        selector: String,
+    },
     Summarize,
     Help,
 }
@@ -721,6 +798,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_clarification_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_memory_review_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -871,6 +952,22 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn replace_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    let needle = needle.to_lowercase();
+    let mut result = value.to_owned();
+
+    while let Some(index) = normalized_slice(&result).find(&needle) {
+        let end = index + needle.len();
+        result.replace_range(index..end, replacement);
+    }
+
+    result
+}
+
+fn normalized_slice(value: &str) -> String {
+    value.to_lowercase()
 }
 
 fn is_create_request(normalized: &str) -> bool {
@@ -1350,6 +1447,52 @@ fn parse_clarification_intent(content: &str, normalized: &str) -> Option<MainAge
         .map(|(selector, question)| MainAgentIntent::RequestClarification { selector, question })
 }
 
+fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "memory",
+            "memory candidate",
+            "long-term memory",
+            ZH_MEMORY,
+            ZH_LONG_TERM_MEMORY,
+        ],
+    ) {
+        return None;
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "approve memory",
+            "approve memory candidate",
+            "accept memory",
+            "accept memory candidate",
+            ZH_APPROVE,
+            ZH_ACCEPT,
+        ],
+    ) {
+        let selector = extract_memory_selector(content);
+        return (!selector.is_empty()).then_some(MainAgentIntent::ApproveMemory { selector });
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "reject memory",
+            "reject memory candidate",
+            "discard memory",
+            "discard memory candidate",
+            ZH_REJECT,
+        ],
+    ) {
+        let selector = extract_memory_selector(content);
+        return (!selector.is_empty()).then_some(MainAgentIntent::RejectMemory { selector });
+    }
+
+    None
+}
+
 fn split_clarification_selector_and_question(content: &str) -> Option<(String, String)> {
     for separator in ["\u{ff1a}", ":", "\n"] {
         if let Some((head, tail)) = content.split_once(separator) {
@@ -1443,6 +1586,49 @@ fn split_resource_lock_selector_and_key(content: &str) -> Option<(String, String
     }
 
     None
+}
+
+fn extract_memory_selector(content: &str) -> String {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((_, tail)) = content.split_once(separator) {
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                return tail.trim_matches(['"', '\'']).trim().to_owned();
+            }
+        }
+    }
+
+    let mut selector = content.to_owned();
+    for word in [
+        "approve memory candidate",
+        "approve memory",
+        "accept memory candidate",
+        "accept memory",
+        "reject memory candidate",
+        "reject memory",
+        "discard memory candidate",
+        "discard memory",
+        "memory candidate",
+        "long-term memory",
+        "approve",
+        "accept",
+        "reject",
+        "discard",
+        "memory",
+        ZH_LONG_TERM_MEMORY,
+        ZH_MEMORY,
+        ZH_APPROVE,
+        ZH_ACCEPT,
+        ZH_REJECT,
+    ] {
+        selector = replace_case_insensitive(&selector, word, "");
+    }
+
+    selector
+        .trim()
+        .trim_matches([':', '\u{ff1a}', ',', '\u{ff0c}', '.', '\u{3002}', '"', '\''])
+        .trim()
+        .to_owned()
 }
 
 fn split_dependency_selectors(
@@ -1941,6 +2127,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_memory_review_intents() {
+        assert_eq!(
+            parse_intent("approve memory candidate: prefer cargo test before push"),
+            MainAgentIntent::ApproveMemory {
+                selector: "prefer cargo test before push".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("reject memory candidate noisy temporary note"),
+            MainAgentIntent::RejectMemory {
+                selector: "noisy temporary note".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{91c7}\u{7eb3}\u{957f}\u{671f}\u{8bb0}\u{5fc6}\u{ff1a}\u{4f18}\u{5148}\u{8fd0}\u{884c} cargo test"
+            ),
+            MainAgentIntent::ApproveMemory {
+                selector: "\u{4f18}\u{5148}\u{8fd0}\u{884c} cargo test".to_owned(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
@@ -1967,6 +2177,68 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Paused task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_review_memory_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let approved_memory = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Prefer cargo test before push".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.84,
+                },
+                "worker",
+            )
+            .await?;
+        let rejected_memory = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Noisy temporary note".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.22,
+                },
+                "worker",
+            )
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: format!("approve memory candidate {}", approved_memory.id),
+            })
+            .await?;
+        let approved = db.get_memory(approved_memory.id).await?;
+
+        assert_eq!(approved.status, MemoryStatus::Approved);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Approved memory")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "reject memory candidate Noisy temporary note".to_owned(),
+            })
+            .await?;
+        let rejected = db.get_memory(rejected_memory.id).await?;
+
+        assert_eq!(rejected.status, MemoryStatus::Rejected);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Rejected memory")
+        );
 
         Ok(())
     }
