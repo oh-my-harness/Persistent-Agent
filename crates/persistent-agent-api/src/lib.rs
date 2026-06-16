@@ -402,8 +402,8 @@ async fn add_task_resource_lock(
     Json(input): Json<TaskResourceLockRequest>,
 ) -> Result<Json<TaskResourceLock>, ApiError> {
     let resource_lock = state
-        .db
-        .add_task_resource_lock(id, &input.resource_key, "main_agent")
+        .main_agent
+        .add_task_resource_lock(id, &input.resource_key)
         .await?;
     let task = state.db.get_task(id).await?;
     state.events.send(AppEvent::TaskChanged { task });
@@ -416,8 +416,8 @@ async fn remove_task_resource_lock(
     Json(input): Json<TaskResourceLockRequest>,
 ) -> Result<Json<TaskResourceLock>, ApiError> {
     let resource_lock = state
-        .db
-        .remove_task_resource_lock(id, &input.resource_key, "main_agent")
+        .main_agent
+        .remove_task_resource_lock(id, &input.resource_key)
         .await?;
     let task = state.db.get_task(id).await?;
     state.events.send(AppEvent::TaskChanged { task });

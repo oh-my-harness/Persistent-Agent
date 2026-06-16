@@ -1,7 +1,7 @@
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateTask, Task, TaskId, TaskNote, TaskStatus, TaskType,
-    UpdateTask,
+    ConversationId, ConversationMessage, CreateTask, Task, TaskId, TaskNote, TaskResourceLock,
+    TaskStatus, TaskType, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,8 @@ const ZH_INTERVAL: &str = "\u{95f4}\u{9694}";
 const ZH_DEPEND_ON: &str = "\u{4f9d}\u{8d56}";
 const ZH_REMOVE_DEPENDENCY: &str = "\u{53d6}\u{6d88}\u{4f9d}\u{8d56}";
 const ZH_NOTE: &str = "\u{5907}\u{6ce8}";
+const ZH_RESOURCE_LOCK: &str = "\u{8d44}\u{6e90}\u{9501}";
+const ZH_RESOURCE: &str = "\u{8d44}\u{6e90}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -146,6 +148,26 @@ impl MainAgent {
 
     pub async fn add_task_note(&self, task_id: TaskId, content: &str) -> anyhow::Result<TaskNote> {
         self.db.add_task_note(task_id, content, "main_agent").await
+    }
+
+    pub async fn add_task_resource_lock(
+        &self,
+        task_id: TaskId,
+        resource_key: &str,
+    ) -> anyhow::Result<TaskResourceLock> {
+        self.db
+            .add_task_resource_lock(task_id, resource_key, "main_agent")
+            .await
+    }
+
+    pub async fn remove_task_resource_lock(
+        &self,
+        task_id: TaskId,
+        resource_key: &str,
+    ) -> anyhow::Result<TaskResourceLock> {
+        self.db
+            .remove_task_resource_lock(task_id, resource_key, "main_agent")
+            .await
     }
 
     pub async fn request_user_clarification(
@@ -447,6 +469,38 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::AddResourceLock {
+                selector,
+                resource_key,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let resource_lock = self
+                        .add_task_resource_lock(task.id, &resource_key)
+                        .await?;
+                    changed_tasks.push(task.clone());
+                    format!(
+                        "Added resource lock to '{}': {}.",
+                        task.title, resource_lock.resource_key
+                    )
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::RemoveResourceLock {
+                selector,
+                resource_key,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let resource_lock = self
+                        .remove_task_resource_lock(task.id, &resource_key)
+                        .await?;
+                    changed_tasks.push(task.clone());
+                    format!(
+                        "Removed resource lock from '{}': {}.",
+                        task.title, resource_lock.resource_key
+                    )
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::RequestClarification { selector, question } => {
                 match self.find_task(&selector).await? {
                     Ok(task) => {
@@ -484,7 +538,7 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove task dependencies, add/remove resource locks, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -604,6 +658,14 @@ enum MainAgentIntent {
         selector: String,
         content: String,
     },
+    AddResourceLock {
+        selector: String,
+        resource_key: String,
+    },
+    RemoveResourceLock {
+        selector: String,
+        resource_key: String,
+    },
     RequestClarification {
         selector: String,
         question: String,
@@ -651,6 +713,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_note_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_resource_lock_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -1227,6 +1293,45 @@ fn parse_note_intent(content: &str, normalized: &str) -> Option<MainAgentIntent>
         .map(|(selector, content)| MainAgentIntent::AddTaskNote { selector, content })
 }
 
+fn parse_resource_lock_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "resource lock",
+            "resource-lock",
+            "lock resource",
+            ZH_RESOURCE_LOCK,
+        ],
+    ) {
+        return None;
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "remove resource lock",
+            "delete resource lock",
+            "clear resource lock",
+            "unlock resource",
+            ZH_CANCEL,
+        ],
+    ) {
+        return split_resource_lock_selector_and_key(content).map(|(selector, resource_key)| {
+            MainAgentIntent::RemoveResourceLock {
+                selector,
+                resource_key,
+            }
+        });
+    }
+
+    split_resource_lock_selector_and_key(content).map(|(selector, resource_key)| {
+        MainAgentIntent::AddResourceLock {
+            selector,
+            resource_key,
+        }
+    })
+}
+
 fn parse_clarification_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -1311,6 +1416,35 @@ fn split_note_selector_and_content(content: &str) -> Option<(String, String)> {
     None
 }
 
+fn split_resource_lock_selector_and_key(content: &str) -> Option<(String, String)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector = extract_task_selector(
+                head,
+                &[
+                    "resource",
+                    "lock",
+                    "resource lock",
+                    "resource-lock",
+                    "to",
+                    "for",
+                    "from",
+                    ZH_ADD,
+                    ZH_RESOURCE,
+                    ZH_RESOURCE_LOCK,
+                    ZH_TO,
+                ],
+            );
+            let resource_key = tail.trim();
+            if !selector.is_empty() && !resource_key.is_empty() {
+                return Some((selector, resource_key.to_owned()));
+            }
+        }
+    }
+
+    None
+}
+
 fn split_dependency_selectors(
     content: &str,
     normalized: &str,
@@ -1370,6 +1504,14 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "remove dependency",
         "delete dependency",
         "clear dependency",
+        "add resource lock to task",
+        "add resource lock",
+        "remove resource lock from task",
+        "remove resource lock",
+        "delete resource lock",
+        "clear resource lock",
+        "lock resource",
+        "unlock resource",
         "add note to task",
         "add note",
         "note to task",
@@ -1751,6 +1893,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_resource_lock_intents() {
+        assert_eq!(
+            parse_intent("add resource lock to task Deploy release: repo:persistent-agent"),
+            MainAgentIntent::AddResourceLock {
+                selector: "Deploy release".to_owned(),
+                resource_key: "repo:persistent-agent".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("remove resource lock from task Deploy release: repo:persistent-agent"),
+            MainAgentIntent::RemoveResourceLock {
+                selector: "Deploy release".to_owned(),
+                resource_key: "repo:persistent-agent".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{7ed9}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{6dfb}\u{52a0}\u{8d44}\u{6e90}\u{9501}\u{ff1a}repo:persistent-agent"
+            ),
+            MainAgentIntent::AddResourceLock {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                resource_key: "repo:persistent-agent".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_clarification_intents() {
         assert_eq!(
             parse_intent("ask clarification for task Deploy release: Which environment?"),
@@ -1930,6 +2099,60 @@ mod tests {
         assert_eq!(notes[0].content, "wait for staging approval");
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Added note"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_manage_resource_locks_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "add resource lock to task Deploy release: repo:persistent-agent"
+                    .to_owned(),
+            })
+            .await?;
+        let locks = db.list_task_resource_locks(task.id).await?;
+
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].resource_key, "repo:persistent-agent");
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Added resource lock")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "remove resource lock from task Deploy release: repo:persistent-agent"
+                    .to_owned(),
+            })
+            .await?;
+        let locks = db.list_task_resource_locks(task.id).await?;
+
+        assert!(locks.is_empty());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Removed resource lock")
+        );
 
         Ok(())
     }

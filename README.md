@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, and summarize.
+- Main-agent conversation commands in Chinese and English for create, split goals, list, explain state, request clarification, pause, resume, cancel, reprioritize, reorder, dependency changes, resource-lock changes, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
@@ -108,7 +108,7 @@ Tasks can enter the system through three channels:
 2. Structured creation through Web UI forms and queue controls.
 3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
 
-The conversational path should be a first-class product surface. Users can ask the main agent to create tasks, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, or summarize the queue.
+The conversational path should be a first-class product surface. Users can ask the main agent to create tasks, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add resource locks, or summarize the queue.
 
 Structured UI controls remain important for exact edits, batch operations, and reviewable state changes.
 
@@ -180,6 +180,7 @@ The main agent is the conversational task manager, scheduler, and worker coordin
 
 - discuss goals with the user and turn them into task changes,
 - create, update, pause, resume, cancel, reorder, and reprioritize tasks through explicit task-management tools,
+- add and remove dependencies, notes, and resource locks through explicit task-management tools,
 - summarize the task pool and explain current execution state,
 - perform lightweight local inspection when useful for task planning,
 - scan the task pool,
