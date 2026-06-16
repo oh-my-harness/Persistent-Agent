@@ -944,6 +944,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   });
   const attempts = history.data?.attempts ?? [];
   const attemptEvents = history.data?.attempt_events ?? [];
+  const artifacts = history.data?.artifacts ?? [];
   const actions = history.data?.actions ?? [];
 
   return (
@@ -974,6 +975,20 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && attemptEvents.length === 0 && <p className="empty">No worker events yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Artifacts</h4>
+        {artifacts.map((artifact) => (
+          <div className="history-item" key={artifact.id}>
+            <div>
+              <strong>{artifact.name}</strong>
+              <span>{artifact.artifact_type}</span>
+            </div>
+            {artifact.summary && <p>{artifact.summary}</p>}
+            <code>{artifact.uri}</code>
+          </div>
+        ))}
+        {!history.isLoading && artifacts.length === 0 && <p className="empty">No artifacts yet.</p>}
       </div>
       <div className="history-column">
         <h4>Actions</h4>

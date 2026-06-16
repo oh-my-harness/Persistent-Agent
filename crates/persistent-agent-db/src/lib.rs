@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
-    Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskAttempt,
+    Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskArtifact, TaskAttempt,
     TaskAttemptEvent, TaskAttemptId, TaskId, TaskStatus, TaskType, UpdateMemory, UpdateSkill,
     UpdateTask,
 };
@@ -560,6 +560,58 @@ impl Db {
         .await?;
 
         rows.into_iter().map(row_to_task_attempt_event).collect()
+    }
+
+    pub async fn record_task_artifact(
+        &self,
+        task_id: TaskId,
+        attempt_id: Option<TaskAttemptId>,
+        name: &str,
+        artifact_type: &str,
+        uri: &str,
+        summary: Option<&str>,
+    ) -> anyhow::Result<TaskArtifact> {
+        let artifact = TaskArtifact {
+            id: Uuid::now_v7(),
+            task_id,
+            attempt_id,
+            name: name.to_owned(),
+            artifact_type: artifact_type.to_owned(),
+            uri: uri.to_owned(),
+            summary: summary.map(ToOwned::to_owned),
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT INTO task_artifacts (id, task_id, attempt_id, name, artifact_type, uri, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(artifact.id.to_string())
+        .bind(artifact.task_id.to_string())
+        .bind(artifact.attempt_id.map(|id| id.to_string()))
+        .bind(&artifact.name)
+        .bind(&artifact.artifact_type)
+        .bind(&artifact.uri)
+        .bind(&artifact.summary)
+        .bind(artifact.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(artifact)
+    }
+
+    pub async fn list_task_artifacts(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskArtifact>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_artifacts
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_artifact).collect()
     }
 
     pub async fn record_action(
@@ -1141,6 +1193,20 @@ fn row_to_task_attempt_event(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Tas
     })
 }
 
+fn row_to_task_artifact(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskArtifact> {
+    let attempt_id: Option<String> = row.try_get("attempt_id")?;
+    Ok(TaskArtifact {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        attempt_id: attempt_id.map(parse_uuid).transpose()?,
+        name: row.try_get("name")?,
+        artifact_type: row.try_get("artifact_type")?,
+        uri: row.try_get("uri")?,
+        summary: row.try_get("summary")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
 fn row_to_task_action(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAction> {
     let task_id: Option<String> = row.try_get("task_id")?;
     let details: String = row.try_get("details")?;
@@ -1621,6 +1687,48 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "convert_task_type")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_artifacts_can_be_recorded_and_listed() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Artifact check".to_owned(),
+                    description: "Record artifact metadata".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let attempt = db
+            .create_attempt(task.id, TaskStatus::Completed, Some("done"))
+            .await?;
+
+        db.record_task_artifact(
+            task.id,
+            Some(attempt.id),
+            "summary.md",
+            "file",
+            "file://summary.md",
+            Some("Run summary"),
+        )
+        .await?;
+
+        let artifacts = db.list_task_artifacts(task.id).await?;
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].attempt_id, Some(attempt.id));
+        assert_eq!(artifacts[0].name, "summary.md");
+        assert_eq!(artifacts[0].artifact_type, "file");
+        assert_eq!(artifacts[0].summary.as_deref(), Some("Run summary"));
 
         Ok(())
     }

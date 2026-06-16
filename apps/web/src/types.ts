@@ -103,6 +103,17 @@ export interface TaskAttemptEvent {
   created_at: string;
 }
 
+export interface TaskArtifact {
+  id: string;
+  task_id: string;
+  attempt_id?: string | null;
+  name: string;
+  artifact_type: string;
+  uri: string;
+  summary?: string | null;
+  created_at: string;
+}
+
 export interface TaskAction {
   id: string;
   task_id?: string | null;
@@ -115,6 +126,7 @@ export interface TaskAction {
 export interface TaskHistory {
   attempts: TaskAttempt[];
   attempt_events: TaskAttemptEvent[];
+  artifacts: TaskArtifact[];
   actions: TaskAction[];
 }
 

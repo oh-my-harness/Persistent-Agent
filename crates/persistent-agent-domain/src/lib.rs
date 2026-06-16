@@ -8,6 +8,7 @@ pub type TaskId = Uuid;
 pub type ConversationId = Uuid;
 pub type TaskAttemptId = Uuid;
 pub type TaskAttemptEventId = Uuid;
+pub type TaskArtifactId = Uuid;
 pub type MemoryId = Uuid;
 pub type SkillId = Uuid;
 
@@ -217,6 +218,18 @@ pub struct TaskAttemptEvent {
     pub event_type: String,
     pub message: String,
     pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskArtifact {
+    pub id: TaskArtifactId,
+    pub task_id: TaskId,
+    pub attempt_id: Option<TaskAttemptId>,
+    pub name: String,
+    pub artifact_type: String,
+    pub uri: String,
+    pub summary: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

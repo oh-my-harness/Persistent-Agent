@@ -109,6 +109,7 @@ where
             WorkerResult::Completed {
                 summary,
                 memory_candidates,
+                artifacts,
             } => {
                 self.db
                     .record_attempt_event(
@@ -119,12 +120,25 @@ where
                         json!({
                             "summary": summary,
                             "memory_candidate_count": memory_candidates.len(),
+                            "artifact_count": artifacts.len(),
                         }),
                     )
                     .await?;
                 self.db
                     .create_attempt(task.id, TaskStatus::Completed, Some(&summary))
                     .await?;
+                for artifact in artifacts {
+                    self.db
+                        .record_task_artifact(
+                            task.id,
+                            Some(attempt.id),
+                            &artifact.name,
+                            &artifact.artifact_type,
+                            &artifact.uri,
+                            artifact.summary.as_deref(),
+                        )
+                        .await?;
+                }
                 for candidate in memory_candidate_contents(&task, &summary, &memory_candidates) {
                     self.db
                         .create_memory(
@@ -215,6 +229,7 @@ impl TaskWorker for StubWorker {
                         task.title
                     ),
                     memory_candidates: Vec::new(),
+                    artifacts: Vec::new(),
                 });
             }
 
@@ -232,6 +247,7 @@ impl TaskWorker for StubWorker {
                 task.title
             ),
             memory_candidates: Vec::new(),
+            artifacts: Vec::new(),
         })
     }
 }
@@ -309,7 +325,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
             CoreMessage {
                 role: CoreRole::System,
                 content: vec![CoreContent::Text {
-                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates.".to_owned(),
+                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts.".to_owned(),
                 }],
             },
             CoreMessage {
@@ -541,6 +557,7 @@ struct StructuredWorkerResult {
     summary: Option<String>,
     reason: Option<String>,
     memory_candidates: Option<Vec<String>>,
+    artifacts: Option<Vec<WorkerArtifact>>,
 }
 
 fn parse_worker_result_text(text: &str) -> WorkerResult {
@@ -561,6 +578,7 @@ fn parse_worker_result_text(text: &str) -> WorkerResult {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "Worker completed the task.".to_owned()),
                 memory_candidates: clean_memory_candidates(parsed.memory_candidates),
+                artifacts: clean_artifacts(parsed.artifacts),
             },
             _ => fallback_worker_result(text),
         };
@@ -589,6 +607,31 @@ fn clean_memory_candidates(candidates: Option<Vec<String>>) -> Vec<String> {
         .into_iter()
         .map(|candidate| candidate.trim().to_owned())
         .filter(|candidate| !candidate.is_empty())
+        .collect()
+}
+
+fn clean_artifacts(artifacts: Option<Vec<WorkerArtifact>>) -> Vec<WorkerArtifact> {
+    artifacts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|artifact| {
+            let name = artifact.name.trim().to_owned();
+            let artifact_type = artifact.artifact_type.trim().to_owned();
+            let uri = artifact.uri.trim().to_owned();
+            if name.is_empty() || artifact_type.is_empty() || uri.is_empty() {
+                return None;
+            }
+
+            Some(WorkerArtifact {
+                name,
+                artifact_type,
+                uri,
+                summary: artifact
+                    .summary
+                    .map(|summary| summary.trim().to_owned())
+                    .filter(|summary| !summary.is_empty()),
+            })
+        })
         .collect()
 }
 
@@ -623,6 +666,7 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
                 trimmed.to_owned()
             },
             memory_candidates: Vec::new(),
+            artifacts: Vec::new(),
         }
     }
 }
@@ -633,10 +677,19 @@ pub enum WorkerResult {
     Completed {
         summary: String,
         memory_candidates: Vec<String>,
+        artifacts: Vec<WorkerArtifact>,
     },
     Blocked {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerArtifact {
+    pub name: String,
+    pub artifact_type: String,
+    pub uri: String,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -714,6 +767,24 @@ mod tests {
                     "Prefer cargo test --workspace.".to_owned(),
                     "Avoid flaky selectors.".to_owned()
                 ]
+        ));
+    }
+
+    #[test]
+    fn parses_structured_worker_artifacts() {
+        let result = parse_worker_result_text(
+            r#"{"status":"completed","summary":"Finished.","artifacts":[{"name":"report.md","artifact_type":"file","uri":"file://report.md","summary":"Run report"},{"name":"","artifact_type":"file","uri":"file://ignored"}]}"#,
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed { ref artifacts, .. }
+                if artifacts == &vec![WorkerArtifact {
+                    name: "report.md".to_owned(),
+                    artifact_type: "file".to_owned(),
+                    uri: "file://report.md".to_owned(),
+                    summary: Some("Run report".to_owned()),
+                }]
         ));
     }
 
@@ -1021,6 +1092,7 @@ mod tests {
             Ok(WorkerResult::Completed {
                 summary: format!("completed {}", task.title),
                 memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
             })
         }
     }
@@ -1081,6 +1153,7 @@ mod tests {
             Ok(WorkerResult::Completed {
                 summary: format!("completed {}", task.title),
                 memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
             })
         }
     }
@@ -1154,6 +1227,7 @@ mod tests {
                     "Prefer cargo test --workspace before committing.".to_owned(),
                     "Avoid broad UI selectors in browser checks.".to_owned(),
                 ],
+                artifacts: Vec::new(),
             })
         }
     }
@@ -1195,6 +1269,63 @@ mod tests {
                 .iter()
                 .any(|memory| memory.content.contains("broad UI selectors"))
         );
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct ArtifactWorker;
+
+    #[async_trait]
+    impl TaskWorker for ArtifactWorker {
+        async fn execute(
+            &self,
+            _task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            Ok(WorkerResult::Completed {
+                summary: "created a report".to_owned(),
+                memory_candidates: Vec::new(),
+                artifacts: vec![WorkerArtifact {
+                    name: "report.md".to_owned(),
+                    artifact_type: "file".to_owned(),
+                    uri: "file://report.md".to_owned(),
+                    summary: Some("Run report".to_owned()),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_stores_worker_artifacts() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Capture worker artifacts".to_owned(),
+                    description: "Worker should report artifacts".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), ArtifactWorker);
+
+        scheduler.tick().await?;
+        let artifacts = db.list_task_artifacts(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "report.md");
+        assert_eq!(artifacts[0].artifact_type, "file");
+        assert_eq!(artifacts[0].summary.as_deref(), Some("Run report"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "worker_completed" && event.details["artifact_count"] == 1
+        }));
 
         Ok(())
     }
