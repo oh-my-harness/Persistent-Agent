@@ -106,31 +106,39 @@ where
             }
         };
         match result {
-            WorkerResult::Completed { summary } => {
+            WorkerResult::Completed {
+                summary,
+                memory_candidates,
+            } => {
                 self.db
                     .record_attempt_event(
                         attempt.id,
                         task.id,
                         "worker_completed",
                         "Worker completed the task.",
-                        json!({ "summary": summary }),
+                        json!({
+                            "summary": summary,
+                            "memory_candidate_count": memory_candidates.len(),
+                        }),
                     )
                     .await?;
                 self.db
                     .create_attempt(task.id, TaskStatus::Completed, Some(&summary))
                     .await?;
-                self.db
-                    .create_memory(
-                        CreateMemory {
-                            scope: "task".to_owned(),
-                            content: memory_candidate_content(&task, &summary),
-                            source_task_id: Some(task.id),
-                            status: MemoryStatus::Pending,
-                            confidence: 0.6,
-                        },
-                        "worker",
-                    )
-                    .await?;
+                for candidate in memory_candidate_contents(&task, &summary, &memory_candidates) {
+                    self.db
+                        .create_memory(
+                            CreateMemory {
+                                scope: "task".to_owned(),
+                                content: candidate,
+                                source_task_id: Some(task.id),
+                                status: MemoryStatus::Pending,
+                                confidence: 0.6,
+                            },
+                            "worker",
+                        )
+                        .await?;
+                }
                 self.db.complete_task(task.id, &summary, "worker").await?;
                 Ok(SchedulerTick {
                     requeued_tasks,
@@ -206,6 +214,7 @@ impl TaskWorker for StubWorker {
                         "Stub worker resumed task '{}' using the latest user conversation context.",
                         task.title
                     ),
+                    memory_candidates: Vec::new(),
                 });
             }
 
@@ -222,6 +231,7 @@ impl TaskWorker for StubWorker {
                 "Stub worker accepted task '{}' and completed the lifecycle placeholder.",
                 task.title
             ),
+            memory_candidates: Vec::new(),
         })
     }
 }
@@ -299,7 +309,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
             CoreMessage {
                 role: CoreRole::System,
                 content: vec![CoreContent::Text {
-                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\"} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input.".to_owned(),
+                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates.".to_owned(),
                 }],
             },
             CoreMessage {
@@ -478,12 +488,27 @@ fn active_skills(task: &Task) -> Vec<String> {
     }
 }
 
-fn memory_candidate_content(task: &Task, summary: &str) -> String {
-    format!(
-        "Task '{}' completed with summary: {}",
-        task.title,
-        summary.trim()
-    )
+fn memory_candidate_contents(
+    task: &Task,
+    summary: &str,
+    memory_candidates: &[String],
+) -> Vec<String> {
+    let cleaned = memory_candidates
+        .iter()
+        .map(|candidate| candidate.trim())
+        .filter(|candidate| !candidate.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if cleaned.is_empty() {
+        return vec![format!(
+            "Task '{}' completed with summary: {}",
+            task.title,
+            summary.trim()
+        )];
+    }
+
+    cleaned
 }
 
 fn extract_response_text(response: &CoreResponse) -> String {
@@ -515,6 +540,7 @@ struct StructuredWorkerResult {
     status: String,
     summary: Option<String>,
     reason: Option<String>,
+    memory_candidates: Option<Vec<String>>,
 }
 
 fn parse_worker_result_text(text: &str) -> WorkerResult {
@@ -534,6 +560,7 @@ fn parse_worker_result_text(text: &str) -> WorkerResult {
                     .or(parsed.reason)
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "Worker completed the task.".to_owned()),
+                memory_candidates: clean_memory_candidates(parsed.memory_candidates),
             },
             _ => fallback_worker_result(text),
         };
@@ -554,6 +581,15 @@ fn trim_json_code_fence(text: &str) -> &str {
         .strip_suffix("```")
         .unwrap_or(without_opening)
         .trim()
+}
+
+fn clean_memory_candidates(candidates: Option<Vec<String>>) -> Vec<String> {
+    candidates
+        .unwrap_or_default()
+        .into_iter()
+        .map(|candidate| candidate.trim().to_owned())
+        .filter(|candidate| !candidate.is_empty())
+        .collect()
 }
 
 fn fallback_worker_result(text: &str) -> WorkerResult {
@@ -586,6 +622,7 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
             } else {
                 trimmed.to_owned()
             },
+            memory_candidates: Vec::new(),
         }
     }
 }
@@ -593,8 +630,13 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum WorkerResult {
-    Completed { summary: String },
-    Blocked { reason: String },
+    Completed {
+        summary: String,
+        memory_candidates: Vec<String>,
+    },
+    Blocked {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,7 +697,23 @@ mod tests {
 
         assert!(matches!(
             result,
-            WorkerResult::Completed { ref summary } if summary.contains("Updated the README")
+            WorkerResult::Completed { ref summary, .. } if summary.contains("Updated the README")
+        ));
+    }
+
+    #[test]
+    fn parses_structured_worker_memory_candidates() {
+        let result = parse_worker_result_text(
+            r#"{"status":"completed","summary":"Finished.","memory_candidates":["Prefer cargo test --workspace.","  ","Avoid flaky selectors."]}"#,
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed { ref memory_candidates, .. }
+                if memory_candidates == &vec![
+                    "Prefer cargo test --workspace.".to_owned(),
+                    "Avoid flaky selectors.".to_owned()
+                ]
         ));
     }
 
@@ -679,7 +737,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            WorkerResult::Completed { ref summary } if summary == "Finished the task."
+            WorkerResult::Completed { ref summary, .. } if summary == "Finished the task."
         ));
     }
 
@@ -846,7 +904,7 @@ mod tests {
             updated_at: now,
         };
 
-        let candidate = memory_candidate_content(&task, "Use cargo test.");
+        let candidate = memory_candidate_contents(&task, "Use cargo test.", &Vec::new()).remove(0);
 
         assert!(candidate.contains("Remember setup"));
         assert!(candidate.contains("Use cargo test."));
@@ -962,6 +1020,7 @@ mod tests {
 
             Ok(WorkerResult::Completed {
                 summary: format!("completed {}", task.title),
+                memory_candidates: Vec::new(),
             })
         }
     }
@@ -1021,6 +1080,7 @@ mod tests {
 
             Ok(WorkerResult::Completed {
                 summary: format!("completed {}", task.title),
+                memory_candidates: Vec::new(),
             })
         }
     }
@@ -1074,6 +1134,67 @@ mod tests {
         scheduler.tick().await?;
 
         assert_eq!(*memory_counts.lock().expect("memory count lock"), vec![1]);
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct MemoryCandidateWorker;
+
+    #[async_trait]
+    impl TaskWorker for MemoryCandidateWorker {
+        async fn execute(
+            &self,
+            _task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            Ok(WorkerResult::Completed {
+                summary: "finished with reusable lessons".to_owned(),
+                memory_candidates: vec![
+                    "Prefer cargo test --workspace before committing.".to_owned(),
+                    "Avoid broad UI selectors in browser checks.".to_owned(),
+                ],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_stores_worker_memory_candidates() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_task(
+            CreateTask {
+                title: "Capture worker memories".to_owned(),
+                description: "Worker should suggest memories".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            },
+            "test",
+        )
+        .await?;
+        let scheduler = Scheduler::new(db.clone(), MemoryCandidateWorker);
+
+        scheduler.tick().await?;
+        let memories = db.list_memories().await?;
+
+        assert_eq!(memories.len(), 2);
+        assert!(
+            memories
+                .iter()
+                .all(|memory| memory.status == MemoryStatus::Pending)
+        );
+        assert!(
+            memories
+                .iter()
+                .any(|memory| memory.content.contains("cargo test --workspace"))
+        );
+        assert!(
+            memories
+                .iter()
+                .any(|memory| memory.content.contains("broad UI selectors"))
+        );
 
         Ok(())
     }
