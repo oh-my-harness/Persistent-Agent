@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
     Conversation, ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask,
-    Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskAttempt, TaskId,
-    TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
+    Memory, MemoryId, MemoryStatus, Skill, SkillId, Task, TaskAction, TaskAttempt,
+    TaskAttemptEvent, TaskAttemptId, TaskId, TaskStatus, TaskType, UpdateMemory, UpdateSkill,
+    UpdateTask,
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -423,6 +424,58 @@ impl Db {
         .await?;
 
         rows.into_iter().map(row_to_task_attempt).collect()
+    }
+
+    pub async fn record_attempt_event(
+        &self,
+        attempt_id: TaskAttemptId,
+        task_id: TaskId,
+        event_type: &str,
+        message: &str,
+        details: serde_json::Value,
+    ) -> anyhow::Result<TaskAttemptEvent> {
+        let event = TaskAttemptEvent {
+            id: Uuid::now_v7(),
+            attempt_id,
+            task_id,
+            event_type: event_type.to_owned(),
+            message: message.to_owned(),
+            details,
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT INTO task_attempt_events (id, attempt_id, task_id, event_type, message, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.id.to_string())
+        .bind(event.attempt_id.to_string())
+        .bind(event.task_id.to_string())
+        .bind(&event.event_type)
+        .bind(&event.message)
+        .bind(serde_json::to_string(&event.details)?)
+        .bind(event.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(event)
+    }
+
+    pub async fn list_task_attempt_events(
+        &self,
+        task_id: TaskId,
+    ) -> anyhow::Result<Vec<TaskAttemptEvent>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_attempt_events
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_attempt_event).collect()
     }
 
     pub async fn record_action(
@@ -991,6 +1044,19 @@ fn row_to_task_attempt(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAttem
     })
 }
 
+fn row_to_task_attempt_event(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAttemptEvent> {
+    let details: String = row.try_get("details")?;
+    Ok(TaskAttemptEvent {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        attempt_id: parse_uuid(row.try_get::<String, _>("attempt_id")?)?,
+        task_id: parse_uuid(row.try_get::<String, _>("task_id")?)?,
+        event_type: row.try_get("event_type")?,
+        message: row.try_get("message")?,
+        details: serde_json::from_str(&details)?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
+}
+
 fn row_to_task_action(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskAction> {
     let task_id: Option<String> = row.try_get("task_id")?;
     let details: String = row.try_get("details")?;
@@ -1359,14 +1425,29 @@ mod tests {
             .await?;
         db.create_attempt(task.id, TaskStatus::Running, Some("started"))
             .await?;
+        let attempt = db
+            .create_attempt(task.id, TaskStatus::Completed, Some("finished"))
+            .await?;
+        db.record_attempt_event(
+            attempt.id,
+            task.id,
+            "worker_completed",
+            "Worker completed the task.",
+            json!({ "summary": "finished" }),
+        )
+        .await?;
         db.set_task_status(task.id, TaskStatus::Paused, "test", None)
             .await?;
 
         let attempts = db.list_task_attempts(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
         let actions = db.list_task_actions(task.id).await?;
 
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].summary.as_deref(), Some("started"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "worker_completed");
+        assert_eq!(events[0].details["summary"], "finished");
         assert!(
             actions
                 .iter()

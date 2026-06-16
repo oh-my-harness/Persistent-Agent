@@ -14,7 +14,7 @@ use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus, Skill, SkillId,
-    Task, TaskAction, TaskAttempt, TaskId, UpdateMemory, UpdateSkill, UpdateTask,
+    Task, TaskAction, TaskAttempt, TaskAttemptEvent, TaskId, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
@@ -268,6 +268,7 @@ async fn send_task_message(
 #[derive(Debug, Serialize)]
 struct TaskHistoryResponse {
     attempts: Vec<TaskAttempt>,
+    attempt_events: Vec<TaskAttemptEvent>,
     actions: Vec<TaskAction>,
 }
 
@@ -278,6 +279,7 @@ async fn task_history(
     state.db.get_task(id).await?;
     Ok(Json(TaskHistoryResponse {
         attempts: state.db.list_task_attempts(id).await?,
+        attempt_events: state.db.list_task_attempt_events(id).await?,
         actions: state.db.list_task_actions(id).await?,
     }))
 }

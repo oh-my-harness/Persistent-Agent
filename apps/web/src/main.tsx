@@ -935,6 +935,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
     queryFn: () => getTaskHistory(taskId),
   });
   const attempts = history.data?.attempts ?? [];
+  const attemptEvents = history.data?.attempt_events ?? [];
   const actions = history.data?.actions ?? [];
 
   return (
@@ -951,6 +952,20 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
           </div>
         ))}
         {!history.isLoading && attempts.length === 0 && <p className="empty">No attempts yet.</p>}
+      </div>
+      <div className="history-column">
+        <h4>Worker Events</h4>
+        {attemptEvents.map((event) => (
+          <div className="history-item" key={event.id}>
+            <div>
+              <strong>{event.event_type}</strong>
+              <time>{new Date(event.created_at).toLocaleString()}</time>
+            </div>
+            <p>{event.message}</p>
+            <code>{JSON.stringify(event.details)}</code>
+          </div>
+        ))}
+        {!history.isLoading && attemptEvents.length === 0 && <p className="empty">No worker events yet.</p>}
       </div>
       <div className="history-column">
         <h4>Actions</h4>

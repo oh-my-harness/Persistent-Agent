@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub type TaskId = Uuid;
 pub type ConversationId = Uuid;
 pub type TaskAttemptId = Uuid;
+pub type TaskAttemptEventId = Uuid;
 pub type MemoryId = Uuid;
 pub type SkillId = Uuid;
 
@@ -206,6 +207,17 @@ pub struct TaskAttempt {
     pub summary: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAttemptEvent {
+    pub id: TaskAttemptEventId,
+    pub attempt_id: TaskAttemptId,
+    pub task_id: TaskId,
+    pub event_type: String,
+    pub message: String,
+    pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

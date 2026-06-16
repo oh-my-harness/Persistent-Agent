@@ -10,6 +10,7 @@ use persistent_agent_domain::{
     ConversationMessage, CreateMemory, Memory, MemoryStatus, Task, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -56,7 +57,8 @@ where
         };
 
         tracing::info!(task_id = %task.id, title = %task.title, "claimed task");
-        self.db
+        let attempt = self
+            .db
             .create_attempt(task.id, TaskStatus::Running, Some("worker started"))
             .await?;
 
@@ -64,9 +66,32 @@ where
             memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
             conversation_messages: self.db.list_task_conversation_messages(task.id, 20).await?,
         };
+        self.db
+            .record_attempt_event(
+                attempt.id,
+                task.id,
+                "worker_context_prepared",
+                "Prepared worker context.",
+                json!({
+                    "memory_count": context.memories.len(),
+                    "conversation_message_count": context.conversation_messages.len(),
+                    "requested_skills": &task.requested_skills,
+                    "matched_skills": &task.matched_skills,
+                }),
+            )
+            .await?;
         let result = self.worker.execute(task.clone(), context).await?;
         match result {
             WorkerResult::Completed { summary } => {
+                self.db
+                    .record_attempt_event(
+                        attempt.id,
+                        task.id,
+                        "worker_completed",
+                        "Worker completed the task.",
+                        json!({ "summary": summary }),
+                    )
+                    .await?;
                 self.db
                     .create_attempt(task.id, TaskStatus::Completed, Some(&summary))
                     .await?;
@@ -90,6 +115,15 @@ where
                 })
             }
             WorkerResult::Blocked { reason } => {
+                self.db
+                    .record_attempt_event(
+                        attempt.id,
+                        task.id,
+                        "worker_blocked",
+                        "Worker needs user input.",
+                        json!({ "reason": reason }),
+                    )
+                    .await?;
                 self.db
                     .create_attempt(task.id, TaskStatus::WaitingForUser, Some(&reason))
                     .await?;
@@ -1015,6 +1049,42 @@ mod tests {
         scheduler.tick().await?;
 
         assert_eq!(*memory_counts.lock().expect("memory count lock"), vec![1]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_records_worker_attempt_events() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Observable task".to_owned(),
+                    description: "Record worker events".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), StubWorker);
+
+        scheduler.tick().await?;
+
+        let events = db.list_task_attempt_events(task.id).await?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_context_prepared")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_completed")
+        );
 
         Ok(())
     }
