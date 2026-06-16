@@ -1,17 +1,19 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, CirclePause, ListTodo, Play, Plus, RotateCw, SquareX, Zap } from "lucide-react";
+import { Bot, CirclePause, ListTodo, Play, Plus, RotateCw, Send, SquareX, Zap } from "lucide-react";
 import {
   cancelTask,
   createTask,
   getTaskPoolSummary,
+  listMainAgentMessages,
   listTasks,
   pauseTask,
   resumeTask,
   runSchedulerTick,
+  sendMainAgentMessage,
 } from "./api";
-import type { Task, TaskType } from "./types";
+import type { ConversationMessage, Task, TaskType } from "./types";
 import "./styles.css";
 
 const queryClient = new QueryClient();
@@ -37,6 +39,7 @@ function Shell() {
       setLastEvent(event.data);
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
+      void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
     });
     source.onerror = () => setLastEvent("Event stream disconnected");
     return () => source.close();
@@ -80,6 +83,7 @@ function Shell() {
 
         <section className="content-grid">
           <TaskComposer />
+          <MainAgentChat />
           <section className="panel task-list-panel">
             <div className="panel-heading">
               <h2>Queue</h2>
@@ -102,6 +106,66 @@ function Shell() {
         </section>
       </section>
     </main>
+  );
+}
+
+function MainAgentChat() {
+  const queryClient = useQueryClient();
+  const [content, setContent] = useState("");
+  const messages = useQuery({ queryKey: ["main-agent-messages"], queryFn: listMainAgentMessages });
+  const mutation = useMutation({
+    mutationFn: sendMainAgentMessage,
+    onSuccess: async () => {
+      setContent("");
+      await queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["summary"] });
+    },
+  });
+
+  const visibleMessages = messages.data ?? [];
+
+  return (
+    <section className="panel chat-panel">
+      <div className="panel-heading">
+        <h2>Main Agent Conversation</h2>
+        <span>task tools</span>
+      </div>
+      <div className="message-list">
+        {visibleMessages.map((message) => (
+          <MessageBubble key={message.id} message={message} />
+        ))}
+        {visibleMessages.length === 0 && (
+          <p className="empty">Try: 创建任务：检查 Persistent-Agent 的 README 是否需要更新</p>
+        )}
+      </div>
+      <form
+        className="chat-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!content.trim()) return;
+          mutation.mutate(content);
+        }}
+      >
+        <input
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          placeholder="Ask the main agent to create or summarize tasks"
+        />
+        <button className="primary icon-button" type="submit" disabled={mutation.isPending}>
+          <Send size={16} />
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function MessageBubble({ message }: { message: ConversationMessage }) {
+  return (
+    <div className={`message ${message.role === "user" ? "user-message" : "assistant-message"}`}>
+      <span>{message.role === "user" ? "You" : "Main agent"}</span>
+      <p>{message.content}</p>
+    </div>
   );
 }
 

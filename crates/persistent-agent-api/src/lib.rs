@@ -10,9 +10,9 @@ use axum::{
     },
     routing::{get, post},
 };
-use persistent_agent_agent::{MainAgent, TaskPoolSummary};
+use persistent_agent_agent::{MainAgent, MainAgentMessageInput, TaskPoolSummary};
 use persistent_agent_db::Db;
-use persistent_agent_domain::{CreateTask, Task, TaskId, UpdateTask};
+use persistent_agent_domain::{ConversationMessage, CreateTask, Task, TaskId, UpdateTask};
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, StubWorker};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -72,6 +72,7 @@ impl Default for EventBus {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AppEvent {
     TaskChanged { task: Task },
+    MainAgentReply { message: ConversationMessage },
     SchedulerTick { tick: SchedulerTick },
     Heartbeat,
 }
@@ -87,6 +88,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/resume", post(resume_task))
         .route("/api/tasks/{id}/cancel", post(cancel_task))
         .route("/api/main-agent/task-pool-summary", get(task_pool_summary))
+        .route(
+            "/api/main-agent/messages",
+            get(main_agent_messages).post(send_main_agent_message),
+        )
         .route("/api/scheduler/tick", post(run_scheduler_tick))
         .route("/api/events", get(events))
         .layer(CorsLayer::permissive())
@@ -209,6 +214,30 @@ async fn task_pool_summary(
     State(state): State<AppState>,
 ) -> Result<Json<TaskPoolSummary>, ApiError> {
     Ok(Json(state.main_agent.summarize_task_pool().await?))
+}
+
+async fn main_agent_messages(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ConversationMessage>>, ApiError> {
+    Ok(Json(
+        state.main_agent.main_conversation_messages(100).await?,
+    ))
+}
+
+async fn send_main_agent_message(
+    State(state): State<AppState>,
+    Json(input): Json<MainAgentMessageInput>,
+) -> Result<Json<persistent_agent_agent::MainAgentMessageResponse>, ApiError> {
+    let response = state.main_agent.handle_user_message(input).await?;
+    for task in &response.changed_tasks {
+        state
+            .events
+            .send(AppEvent::TaskChanged { task: task.clone() });
+    }
+    state.events.send(AppEvent::MainAgentReply {
+        message: response.assistant_message.clone(),
+    });
+    Ok(Json(response))
 }
 
 async fn run_scheduler_tick(

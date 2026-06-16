@@ -129,7 +129,7 @@ h1 {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(300px, 380px) 1fr;
+  grid-template-columns: minmax(300px, 360px) minmax(360px, 1fr);
   gap: 18px;
   align-items: start;
 }
@@ -157,7 +157,8 @@ h1 {
 }
 
 .composer form,
-.task-list {
+.task-list,
+.message-list {
   display: grid;
   gap: 12px;
 }
@@ -209,7 +210,58 @@ textarea {
 }
 
 .task-list-panel {
+  grid-column: 1 / -1;
   min-height: 420px;
+}
+
+.chat-panel {
+  min-height: 362px;
+}
+
+.message-list {
+  align-content: start;
+  max-height: 250px;
+  min-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.message {
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.message span {
+  color: #657680;
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.message p {
+  margin: 0;
+}
+
+.user-message {
+  background: #e7f4ee;
+}
+
+.assistant-message {
+  background: #f0f3f5;
+}
+
+.chat-form {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr auto;
+  margin-top: 14px;
+}
+
+.icon-button {
+  min-width: 42px;
+  padding-left: 12px;
+  padding-right: 12px;
 }
 
 .task-row {

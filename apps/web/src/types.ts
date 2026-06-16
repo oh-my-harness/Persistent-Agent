@@ -50,3 +50,19 @@ export interface SchedulerTick {
   claimed_task?: Task | null;
   outcome: { type: "idle" } | { type: "completed"; summary: string } | { type: "blocked"; reason: string };
 }
+
+export interface ConversationMessage {
+  id: string;
+  conversation_id: string;
+  task_id?: string | null;
+  role: "user" | "assistant" | string;
+  content: string;
+  created_at: string;
+}
+
+export interface MainAgentMessageResponse {
+  conversation_id: string;
+  user_message: ConversationMessage;
+  assistant_message: ConversationMessage;
+  changed_tasks: Task[];
+}

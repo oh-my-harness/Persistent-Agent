@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use persistent_agent_domain::{
-    CreateTask, Task, TaskAction, TaskAttempt, TaskId, TaskStatus, TaskType, UpdateTask,
+    Conversation, ConversationId, ConversationMessage, CreateTask, Task, TaskAction, TaskAttempt,
+    TaskId, TaskStatus, TaskType, UpdateTask,
 };
 use serde_json::json;
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
@@ -372,12 +373,138 @@ impl Db {
         Ok(action)
     }
 
+    pub async fn get_or_create_main_conversation(&self) -> anyhow::Result<Conversation> {
+        if let Some(conversation) = self.get_main_conversation().await? {
+            return Ok(conversation);
+        }
+
+        let now = Utc::now();
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO conversations (id, task_id, title, created_at, updated_at) VALUES (?, NULL, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind("Main Agent")
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_conversation(id).await
+    }
+
+    pub async fn get_main_conversation(&self) -> anyhow::Result<Option<Conversation>> {
+        let row = sqlx::query(
+            "SELECT * FROM conversations WHERE task_id IS NULL AND title = 'Main Agent' ORDER BY created_at ASC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_conversation).transpose()
+    }
+
+    pub async fn get_conversation(&self, id: ConversationId) -> anyhow::Result<Conversation> {
+        let row = sqlx::query("SELECT * FROM conversations WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        row_to_conversation(row)
+    }
+
+    pub async fn add_conversation_message(
+        &self,
+        conversation_id: ConversationId,
+        task_id: Option<TaskId>,
+        role: &str,
+        content: &str,
+    ) -> anyhow::Result<ConversationMessage> {
+        let message = ConversationMessage {
+            id: Uuid::now_v7(),
+            conversation_id,
+            task_id,
+            role: role.to_owned(),
+            content: content.to_owned(),
+            created_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "INSERT INTO conversation_messages (id, conversation_id, task_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(message.id.to_string())
+        .bind(message.conversation_id.to_string())
+        .bind(message.task_id.map(|id| id.to_string()))
+        .bind(&message.role)
+        .bind(&message.content)
+        .bind(message.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+            .bind(message.created_at)
+            .bind(message.conversation_id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(message)
+    }
+
+    pub async fn list_conversation_messages(
+        &self,
+        conversation_id: ConversationId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ConversationMessage>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM conversation_messages
+            WHERE conversation_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(conversation_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut messages = rows
+            .into_iter()
+            .map(row_to_conversation_message)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     async fn next_queue_position(&self) -> anyhow::Result<i64> {
         let value: Option<i64> = sqlx::query_scalar("SELECT MAX(queue_position) + 1 FROM tasks")
             .fetch_one(&self.pool)
             .await?;
         Ok(value.unwrap_or(0))
     }
+}
+
+fn row_to_conversation(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Conversation> {
+    let task_id: Option<String> = row.try_get("task_id")?;
+    Ok(Conversation {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        task_id: task_id.map(parse_uuid).transpose()?,
+        title: row.try_get("title")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
+    })
+}
+
+fn row_to_conversation_message(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<ConversationMessage> {
+    let task_id: Option<String> = row.try_get("task_id")?;
+    Ok(ConversationMessage {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        conversation_id: parse_uuid(row.try_get::<String, _>("conversation_id")?)?,
+        task_id: task_id.map(parse_uuid).transpose()?,
+        role: row.try_get("role")?,
+        content: row.try_get("content")?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+    })
 }
 
 fn row_to_task(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {

@@ -1,4 +1,4 @@
-import type { SchedulerTick, Task, TaskPoolSummary, TaskType } from "./types";
+import type { ConversationMessage, MainAgentMessageResponse, SchedulerTick, Task, TaskPoolSummary, TaskType } from "./types";
 
 const apiBase = "";
 
@@ -58,4 +58,15 @@ export function cancelTask(id: string): Promise<Task> {
 
 export function runSchedulerTick(): Promise<SchedulerTick> {
   return request<SchedulerTick>("/api/scheduler/tick", { method: "POST" });
+}
+
+export function listMainAgentMessages(): Promise<ConversationMessage[]> {
+  return request<ConversationMessage[]>("/api/main-agent/messages");
+}
+
+export function sendMainAgentMessage(content: string): Promise<MainAgentMessageResponse> {
+  return request<MainAgentMessageResponse>("/api/main-agent/messages", {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
 }

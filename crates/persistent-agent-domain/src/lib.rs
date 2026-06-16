@@ -143,6 +143,20 @@ pub struct CreateTask {
     pub created_by: String,
 }
 
+impl CreateTask {
+    pub fn one_off_from_user(title: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            description: description.into(),
+            task_type: TaskType::OneOff,
+            priority: 0,
+            requested_skills: Vec::new(),
+            schedule: None,
+            created_by: "user".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateTask {
     pub title: Option<String>,
@@ -180,6 +194,15 @@ pub struct ConversationMessage {
     pub role: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: ConversationId,
+    pub task_id: Option<TaskId>,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
