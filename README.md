@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Serial scheduler tick with a stub worker that exercises task claiming, attempts, completion, and event emission.
+- Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - Axum API with REST endpoints and an SSE event stream.
 - Vite React Web UI under `apps/web`.
 
@@ -26,6 +26,8 @@ cargo run -p persistent-agent-server
 ```
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
+
+The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 
 Run the Web UI:
 

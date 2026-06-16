@@ -19,7 +19,7 @@ use persistent_agent_domain::{
 use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -390,6 +390,28 @@ pub async fn spawn_heartbeat(events: EventBus) {
     loop {
         interval.tick().await;
         events.send(AppEvent::Heartbeat);
+    }
+}
+
+pub async fn spawn_scheduler_loop(state: AppState, interval_duration: Duration) {
+    if interval_duration.is_zero() {
+        tracing::info!("scheduler loop disabled");
+        return;
+    }
+
+    tracing::info!(
+        interval_seconds = interval_duration.as_secs(),
+        "scheduler loop enabled"
+    );
+
+    sleep(interval_duration).await;
+    let mut interval = interval(interval_duration);
+    loop {
+        interval.tick().await;
+        match state.scheduler.tick().await {
+            Ok(tick) => state.events.send(AppEvent::SchedulerTick { tick }),
+            Err(error) => tracing::error!(?error, "scheduler loop tick failed"),
+        }
     }
 }
 

@@ -8,7 +8,8 @@ use llm_adapter::{
 use persistent_agent_db::Db;
 use persistent_agent_domain::{CreateMemory, MemoryStatus, Task, TaskStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct Scheduler<W> {
@@ -16,6 +17,7 @@ pub struct Scheduler<W> {
     worker: W,
     lease_owner: String,
     lease_seconds: i64,
+    serial_lock: Arc<Mutex<()>>,
 }
 
 impl<W> Scheduler<W>
@@ -28,10 +30,16 @@ where
             worker,
             lease_owner: "persistent-agent-scheduler".to_owned(),
             lease_seconds: 300,
+            serial_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn tick(&self) -> anyhow::Result<SchedulerTick> {
+        let _guard = self.serial_lock.lock().await;
+        self.tick_inner().await
+    }
+
+    async fn tick_inner(&self) -> anyhow::Result<SchedulerTick> {
         let requeued_tasks = self.db.requeue_due_recurring_tasks("scheduler").await?;
         let Some(task) = self
             .db
@@ -311,6 +319,13 @@ mod tests {
     use chrono::Utc;
     use persistent_agent_db::Db;
     use persistent_agent_domain::{CreateTask, TaskType};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -423,6 +438,62 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert!(messages[0].content.contains("more user input"));
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct SlowCountingWorker {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TaskWorker for SlowCountingWorker {
+        async fn execute(&self, task: Task) -> anyhow::Result<WorkerResult> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(WorkerResult::Completed {
+                summary: format!("completed {}", task.title),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_ticks_share_serial_execution_lock() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        for title in ["First", "Second"] {
+            db.create_task(
+                CreateTask {
+                    title: title.to_owned(),
+                    description: "Run slowly".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        }
+
+        let worker = SlowCountingWorker {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        };
+        let max_active = worker.max_active.clone();
+        let scheduler = Scheduler::new(db, worker);
+        let scheduler_clone = scheduler.clone();
+
+        let (first, second) = tokio::join!(scheduler.tick(), scheduler_clone.tick());
+
+        first?;
+        second?;
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
 
         Ok(())
     }

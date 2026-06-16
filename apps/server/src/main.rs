@@ -1,6 +1,6 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
-use persistent_agent_api::{AppState, router, spawn_heartbeat};
+use persistent_agent_api::{AppState, router, spawn_heartbeat, spawn_scheduler_loop};
 use persistent_agent_db::Db;
 use persistent_agent_scheduler::{LlmWorker, LlmWorkerConfig, StubWorker, WorkerBackend};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -18,8 +18,10 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::connect(&database_url).await?;
     let worker = build_worker();
     let state = AppState::new(db, worker);
+    let scheduler_interval = scheduler_interval();
 
     tokio::spawn(spawn_heartbeat(state.events.clone()));
+    tokio::spawn(spawn_scheduler_loop(state.clone(), scheduler_interval));
 
     let app = router(state);
     let addr: SocketAddr = bind_addr.parse()?;
@@ -46,6 +48,14 @@ fn build_worker() -> WorkerBackend {
             WorkerBackend::Stub(StubWorker)
         }
     }
+}
+
+fn scheduler_interval() -> Duration {
+    std::env::var("SCHEDULER_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(30))
 }
 
 async fn shutdown_signal() {
