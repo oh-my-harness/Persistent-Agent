@@ -21,7 +21,7 @@ The repository now contains the first executable skeleton:
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
-- Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
+- Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
@@ -44,6 +44,8 @@ cargo run -p persistent-agent-server
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
+
+`SCHEDULER_WORKER_CAPACITY` defines the scheduler policy capacity and defaults to `1`. The MVP still executes ticks through a serial lock; the explicit policy keeps the boundary ready for future parallel workers.
 
 Run the Web UI:
 

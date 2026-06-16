@@ -19,8 +19,36 @@ pub struct Scheduler<W> {
     db: Db,
     worker: W,
     lease_owner: String,
-    lease_seconds: i64,
+    policy: SchedulerPolicy,
     serial_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerPolicy {
+    pub worker_capacity: usize,
+    pub lease_seconds: i64,
+}
+
+impl SchedulerPolicy {
+    pub fn serial() -> Self {
+        Self {
+            worker_capacity: 1,
+            lease_seconds: 300,
+        }
+    }
+
+    pub fn new(worker_capacity: usize, lease_seconds: i64) -> Self {
+        Self {
+            worker_capacity: worker_capacity.max(1),
+            lease_seconds: lease_seconds.max(1),
+        }
+    }
+}
+
+impl Default for SchedulerPolicy {
+    fn default() -> Self {
+        Self::serial()
+    }
 }
 
 impl<W> Scheduler<W>
@@ -32,9 +60,23 @@ where
             db,
             worker,
             lease_owner: "persistent-agent-scheduler".to_owned(),
-            lease_seconds: 300,
+            policy: SchedulerPolicy::serial(),
             serial_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn with_policy(db: Db, worker: W, policy: SchedulerPolicy) -> Self {
+        Self {
+            db,
+            worker,
+            lease_owner: "persistent-agent-scheduler".to_owned(),
+            policy,
+            serial_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn policy(&self) -> SchedulerPolicy {
+        self.policy
     }
 
     pub async fn tick(&self) -> anyhow::Result<SchedulerTick> {
@@ -46,7 +88,7 @@ where
         let requeued_tasks = self.db.requeue_due_recurring_tasks("scheduler").await?;
         let Some(task) = self
             .db
-            .claim_next_runnable(&self.lease_owner, self.lease_seconds)
+            .claim_next_runnable(&self.lease_owner, self.policy.lease_seconds)
             .await?
         else {
             return Ok(SchedulerTick {
@@ -744,6 +786,34 @@ mod tests {
         time::Duration,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn scheduler_policy_clamps_capacity_and_lease() {
+        assert_eq!(SchedulerPolicy::serial().worker_capacity, 1);
+        assert_eq!(
+            SchedulerPolicy::new(0, 0),
+            SchedulerPolicy {
+                worker_capacity: 1,
+                lease_seconds: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_can_be_constructed_with_policy() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let scheduler = Scheduler::with_policy(db, StubWorker, SchedulerPolicy::new(3, 45));
+
+        assert_eq!(
+            scheduler.policy(),
+            SchedulerPolicy {
+                worker_capacity: 3,
+                lease_seconds: 45,
+            }
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn extracts_text_from_core_response() {

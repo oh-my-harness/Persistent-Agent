@@ -2,7 +2,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use persistent_agent_api::{AppState, router, spawn_heartbeat, spawn_scheduler_loop};
 use persistent_agent_db::Db;
-use persistent_agent_scheduler::{LlmWorker, LlmWorkerConfig, StubWorker, WorkerBackend};
+use persistent_agent_scheduler::{
+    LlmWorker, LlmWorkerConfig, SchedulerPolicy, StubWorker, WorkerBackend,
+};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -17,7 +19,8 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Db::connect(&database_url).await?;
     let worker = build_worker();
-    let state = AppState::new(db, worker);
+    let scheduler_policy = scheduler_policy();
+    let state = AppState::new_with_scheduler_policy(db, worker, scheduler_policy);
     let scheduler_interval = scheduler_interval();
 
     tokio::spawn(spawn_heartbeat(state.events.clone()));
@@ -56,6 +59,15 @@ fn scheduler_interval() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(30))
+}
+
+fn scheduler_policy() -> SchedulerPolicy {
+    let worker_capacity = std::env::var("SCHEDULER_WORKER_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+
+    SchedulerPolicy::new(worker_capacity, 300)
 }
 
 async fn shutdown_signal() {

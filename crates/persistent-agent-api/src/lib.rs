@@ -17,7 +17,7 @@ use persistent_agent_domain::{
     Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskDependency, TaskId,
     TaskNote, UpdateMemory, UpdateSkill, UpdateTask,
 };
-use persistent_agent_scheduler::{Scheduler, SchedulerTick, WorkerBackend};
+use persistent_agent_scheduler::{Scheduler, SchedulerPolicy, SchedulerTick, WorkerBackend};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
@@ -35,8 +35,16 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Db, worker: WorkerBackend) -> Self {
+        Self::new_with_scheduler_policy(db, worker, SchedulerPolicy::serial())
+    }
+
+    pub fn new_with_scheduler_policy(
+        db: Db,
+        worker: WorkerBackend,
+        scheduler_policy: SchedulerPolicy,
+    ) -> Self {
         let main_agent = MainAgent::new(db.clone());
-        let scheduler = Scheduler::new(db.clone(), worker);
+        let scheduler = Scheduler::with_policy(db.clone(), worker, scheduler_policy);
         Self {
             db,
             main_agent,
