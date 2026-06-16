@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands for pause, resume, cancel, reprioritize, reorder, create, and summarize.
+- Main-agent conversation commands in Chinese and English for create, pause, resume, cancel, reprioritize, reorder, and summarize.
 - Web task pool controls for priority and queue-position changes.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - Task execution history API and UI for attempts and auditable task actions.

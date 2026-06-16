@@ -62,8 +62,10 @@ impl MainAgent {
 
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
         let tasks = self.db.list_tasks().await?;
-        let mut summary = TaskPoolSummary::default();
-        summary.total = tasks.len();
+        let mut summary = TaskPoolSummary {
+            total: tasks.len(),
+            ..Default::default()
+        };
 
         for task in tasks {
             match task.status {
@@ -132,7 +134,7 @@ impl MainAgent {
             MainAgentIntent::PauseTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.pause_task(task.id).await?;
-                    let reply = format!("Paused task '{}'.", task.title);
+                    let reply = format!("已暂停任务：{}。", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -141,7 +143,7 @@ impl MainAgent {
             MainAgentIntent::ResumeTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.resume_task(task.id).await?;
-                    let reply = format!("Resumed task '{}'.", task.title);
+                    let reply = format!("已恢复任务：{}。", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -150,7 +152,7 @@ impl MainAgent {
             MainAgentIntent::CancelTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => {
                     let task = self.cancel_task(task.id).await?;
-                    let reply = format!("Cancelled task '{}'.", task.title);
+                    let reply = format!("已取消任务：{}。", task.title);
                     changed_tasks.push(task);
                     reply
                 }
@@ -160,7 +162,8 @@ impl MainAgent {
                 match self.find_task(&selector).await? {
                     Ok(task) => {
                         let task = self.reprioritize_task(task.id, priority).await?;
-                        let reply = format!("Set task '{}' priority to {}.", task.title, task.priority);
+                        let reply =
+                            format!("已将任务 {} 的优先级调整为 {}。", task.title, task.priority);
                         changed_tasks.push(task);
                         reply
                     }
@@ -174,7 +177,7 @@ impl MainAgent {
                 Ok(task) => {
                     let task = self.reorder_task(task.id, queue_position).await?;
                     let reply = format!(
-                        "Moved task '{}' to queue position {}.",
+                        "已将任务 {} 移动到队列位置 {}。",
                         task.title, task.queue_position
                     );
                     changed_tasks.push(task);
@@ -195,7 +198,7 @@ impl MainAgent {
                 )
             }
             MainAgentIntent::Help => {
-                "我现在可以通过对话帮你创建任务或总结任务池。比如：\"创建任务：检查 GitHub issue\"，或 \"总结任务池\"。更复杂的修改会逐步接入到显式 task-management tools。".to_owned()
+                "我可以通过对话帮你创建任务、暂停/恢复/取消任务、调整优先级、移动队列位置，或总结任务池。比如：“创建循环任务：每天检查 GitHub issue 优先级 3”。".to_owned()
             }
         };
 
@@ -216,7 +219,7 @@ impl MainAgent {
         let needle = selector.trim().to_lowercase();
         if needle.is_empty() {
             return Ok(Err(
-                "Tell me which task to change, by title text or task id.".to_owned(),
+                "请告诉我要调整哪个任务，可以使用标题片段或任务 id。".to_owned()
             ));
         }
 
@@ -233,11 +236,9 @@ impl MainAgent {
 
         match matches.as_slice() {
             [task] => Ok(Ok(task.clone())),
-            [] => Ok(Err(format!(
-                "I could not find a task matching '{selector}'."
-            ))),
+            [] => Ok(Err(format!("没有找到匹配“{selector}”的任务。"))),
             _ => Ok(Err(format!(
-                "I found {} tasks matching '{selector}'. Please use a more specific title or id.",
+                "找到了 {} 个匹配“{selector}”的任务，请使用更具体的标题或 id。",
                 matches.len()
             ))),
         }
@@ -304,24 +305,22 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     let trimmed = content.trim();
     let normalized = trimmed.to_lowercase();
 
-    if normalized.contains("总结")
-        || normalized.contains("概览")
-        || normalized.contains("summary")
-        || normalized.contains("summarize")
-        || normalized.contains("任务池")
-    {
+    if contains_any(
+        &normalized,
+        &["总结", "概览", "任务池", "summary", "summarize"],
+    ) {
         return MainAgentIntent::Summarize;
     }
 
     if let Some(priority) = extract_priority(&normalized) {
         if !is_create_request(&normalized)
-            && (normalized.contains("reprioritize")
-                || normalized.contains("set priority")
-                || normalized.contains("change priority")
-                || normalized.contains("优先级"))
+            && contains_any(
+                &normalized,
+                &["reprioritize", "set priority", "change priority", "优先级"],
+            )
         {
             return MainAgentIntent::ReprioritizeTask {
-                selector: extract_task_selector(trimmed, &["priority", "to", "优先级"]),
+                selector: extract_task_selector(trimmed, &["priority", "to", "优先级", "为", "到"]),
                 priority,
             };
         }
@@ -329,41 +328,46 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(queue_position) = extract_queue_position(&normalized) {
         if !is_create_request(&normalized)
-            && (normalized.contains("reorder")
-                || normalized.contains("queue position")
-                || normalized.contains("move task")
-                || normalized.contains("队列")
-                || normalized.contains("排序"))
+            && contains_any(
+                &normalized,
+                &[
+                    "reorder",
+                    "queue position",
+                    "move task",
+                    "队列",
+                    "排序",
+                    "移动",
+                ],
+            )
         {
             return MainAgentIntent::ReorderTask {
-                selector: extract_task_selector(trimmed, &["queue", "position", "to", "队列"]),
+                selector: extract_task_selector(
+                    trimmed,
+                    &[
+                        "queue", "position", "to", "队列", "排序", "位置", "为", "到",
+                    ],
+                ),
                 queue_position,
             };
         }
     }
 
-    if normalized.contains("pause task")
-        || normalized.starts_with("pause ")
-        || normalized.contains("暂停任务")
+    if contains_any(&normalized, &["pause task", "暂停任务"]) || normalized.starts_with("pause ")
     {
         return MainAgentIntent::PauseTask {
             selector: extract_task_selector(trimmed, &[]),
         };
     }
 
-    if normalized.contains("resume task")
+    if contains_any(&normalized, &["resume task", "unpause task", "恢复任务"])
         || normalized.starts_with("resume ")
-        || normalized.contains("unpause task")
-        || normalized.contains("恢复任务")
     {
         return MainAgentIntent::ResumeTask {
             selector: extract_task_selector(trimmed, &[]),
         };
     }
 
-    if normalized.contains("cancel task")
-        || normalized.starts_with("cancel ")
-        || normalized.contains("取消任务")
+    if contains_any(&normalized, &["cancel task", "取消任务"]) || normalized.starts_with("cancel ")
     {
         return MainAgentIntent::CancelTask {
             selector: extract_task_selector(trimmed, &[]),
@@ -371,22 +375,17 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if is_create_request(&normalized) {
-        let task_type = if normalized.contains("循环")
-            || normalized.contains("定期")
-            || normalized.contains("recurring")
-            || normalized.contains("repeat")
-        {
+        let task_type = if contains_any(&normalized, &["循环", "定期", "recurring", "repeat"]) {
             TaskType::Recurring
         } else {
             TaskType::OneOff
         };
         let priority = extract_priority(&normalized).unwrap_or(0);
         let title = extract_title(trimmed);
-        let description = trimmed.to_owned();
 
         return MainAgentIntent::CreateTask {
             title,
-            description,
+            description: trimmed.to_owned(),
             task_type,
             priority,
         };
@@ -395,18 +394,19 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     MainAgentIntent::Help
 }
 
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn is_create_request(normalized: &str) -> bool {
-    normalized.contains("创建")
-        || normalized.contains("新建")
-        || normalized.contains("添加")
-        || normalized.contains("加一个")
-        || normalized.contains("create")
-        || normalized.contains("add task")
+    contains_any(
+        normalized,
+        &["创建", "新建", "添加", "加一个", "create", "add task"],
+    )
 }
 
 fn extract_title(content: &str) -> String {
-    let separators = ["：", ":", "，", ",", "\n"];
-    for separator in separators {
+    for separator in ["：", ":", "，", ",", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
             let title = tail.trim();
             if !title.is_empty() {
@@ -416,6 +416,8 @@ fn extract_title(content: &str) -> String {
     }
 
     let title = content
+        .replace("创建循环任务", "")
+        .replace("创建一次性任务", "")
         .replace("创建任务", "")
         .replace("新建任务", "")
         .replace("添加任务", "")
@@ -451,6 +453,8 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "暂停",
         "恢复",
         "取消",
+        "调整",
+        "移动",
     ];
 
     let mut start = 0;
@@ -472,7 +476,7 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
 
     selector
         .trim()
-        .trim_matches([':', ',', '.', '：', '，', '"', '\''])
+        .trim_matches([':', '：', ',', '，', '.', '。', '"', '\''])
         .trim()
         .to_owned()
 }
@@ -488,24 +492,25 @@ fn clamp_title(title: &str) -> String {
 }
 
 fn extract_priority(normalized: &str) -> Option<i64> {
-    for marker in ["priority", "优先级"] {
-        if let Some(index) = normalized.find(marker) {
-            let after = &normalized[index + marker.len()..];
-            let digits: String = after
-                .chars()
-                .skip_while(|ch| !ch.is_ascii_digit() && *ch != '-')
-                .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
-                .collect();
-            if let Ok(value) = digits.parse() {
-                return Some(value);
-            }
-        }
-    }
-    None
+    extract_number_after_any(normalized, &["priority", "优先级"])
 }
 
 fn extract_queue_position(normalized: &str) -> Option<i64> {
-    for marker in ["queue position", "queue", "position", "队列", "排序"] {
+    extract_number_after_any(
+        normalized,
+        &[
+            "queue position",
+            "queue",
+            "position",
+            "队列",
+            "排序",
+            "位置",
+        ],
+    )
+}
+
+fn extract_number_after_any(normalized: &str, markers: &[&str]) -> Option<i64> {
+    for marker in markers {
         if let Some(index) = normalized.find(marker) {
             let after = &normalized[index + marker.len()..];
             let digits: String = after
@@ -543,13 +548,14 @@ mod tests {
 
     #[test]
     fn parses_recurring_chinese_create_task() {
-        let intent = parse_intent("创建循环任务：每天检查仓库 issue 优先级 3");
+        let content = "创建循环任务：每天检查仓库 issue 优先级 3";
+        let intent = parse_intent(content);
 
         assert_eq!(
             intent,
             MainAgentIntent::CreateTask {
                 title: "每天检查仓库 issue 优先级 3".to_owned(),
-                description: "创建循环任务：每天检查仓库 issue 优先级 3".to_owned(),
+                description: content.to_owned(),
                 task_type: TaskType::Recurring,
                 priority: 3,
             }
@@ -597,6 +603,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_chinese_task_management_intents() {
+        assert_eq!(
+            parse_intent("暂停任务 检查 GitHub issues"),
+            MainAgentIntent::PauseTask {
+                selector: "检查 GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("恢复任务 检查 GitHub issues"),
+            MainAgentIntent::ResumeTask {
+                selector: "检查 GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("取消任务 检查 GitHub issues"),
+            MainAgentIntent::CancelTask {
+                selector: "检查 GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("调整任务 检查 GitHub issues 优先级为 8"),
+            MainAgentIntent::ReprioritizeTask {
+                selector: "检查 GitHub issues".to_owned(),
+                priority: 8,
+            }
+        );
+        assert_eq!(
+            parse_intent("移动任务 检查 GitHub issues 到队列位置 4"),
+            MainAgentIntent::ReorderTask {
+                selector: "检查 GitHub issues".to_owned(),
+                queue_position: 4,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn main_agent_can_pause_task_by_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
@@ -622,7 +664,7 @@ mod tests {
 
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
-        assert!(response.assistant_message.content.contains("Paused task"));
+        assert!(response.assistant_message.content.contains("已暂停任务"));
 
         Ok(())
     }
