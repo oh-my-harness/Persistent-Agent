@@ -33,6 +33,7 @@ The repository now contains the first executable skeleton:
 - Worker execution failures can be retried according to scheduler policy before being marked permanently failed.
 - Worker execution failures are persisted as failed tasks with attempt events.
 - Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
+- Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
 - Task detail history shows memory candidates proposed by that task.

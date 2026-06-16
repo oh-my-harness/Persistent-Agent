@@ -230,6 +230,7 @@ It should:
 - run through `AgentHarness`;
 - receive task context, selected skills, memories, and allowed tools;
 - receive active product skill metadata, tool subsets, and resource paths;
+- derive the allowed-tool list from active skill tool subsets and emit it in attempt events;
 - emit framework events into the product event stream;
 - produce a final task result;
 - report blockers in a structured form;

@@ -12,7 +12,10 @@ use persistent_agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -116,12 +119,15 @@ where
             .create_attempt(task.id, TaskStatus::Running, Some("worker started"))
             .await?;
 
+        let skills = self
+            .db
+            .list_skills_by_names(&active_skill_names(&task))
+            .await?;
+        let allowed_tools = allowed_tools_for_skills(&skills);
         let context = WorkerContext {
             memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
-            skills: self
-                .db
-                .list_skills_by_names(&active_skill_names(&task))
-                .await?,
+            skills,
+            allowed_tools,
             notes: self.db.list_task_notes(task.id).await?,
             conversation_messages: self.db.list_task_conversation_messages(task.id, 20).await?,
         };
@@ -134,6 +140,7 @@ where
                 json!({
                     "memory_count": context.memories.len(),
                     "skill_count": context.skills.len(),
+                    "allowed_tools": &context.allowed_tools,
                     "note_count": context.notes.len(),
                     "conversation_message_count": context.conversation_messages.len(),
                     "requested_skills": &task.requested_skills,
@@ -502,6 +509,7 @@ pub trait TaskWorker: Clone + Send + Sync + 'static {
 pub struct WorkerContext {
     pub memories: Vec<Memory>,
     pub skills: Vec<Skill>,
+    pub allowed_tools: Vec<String>,
     pub notes: Vec<TaskNote>,
     pub conversation_messages: Vec<ConversationMessage>,
 }
@@ -612,6 +620,7 @@ impl TaskWorker for LlmWorker {
             &task,
             &context.memories,
             &context.skills,
+            &context.allowed_tools,
             &context.notes,
             &context.conversation_messages,
         );
@@ -669,11 +678,12 @@ fn task_prompt(
     task: &Task,
     memories: &[Memory],
     skills: &[Skill],
+    allowed_tools: &[String],
     notes: &[TaskNote],
     conversation_messages: &[ConversationMessage],
 ) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\n\nActive skill resources:\n{}\n\nRelevant approved memories:\n{}\n\nTask notes:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\nAllowed tools: {}\n\nActive skill resources:\n{}\n\nRelevant approved memories:\n{}\n\nTask notes:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -688,6 +698,7 @@ fn task_prompt(
             task.matched_skills.join(", ")
         },
         format_active_skill_names(task),
+        format_allowed_tools(allowed_tools),
         format_skills(skills),
         format_memories(memories),
         format_notes(notes),
@@ -722,6 +733,26 @@ fn format_skills(skills: &[Skill]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn allowed_tools_for_skills(skills: &[Skill]) -> Vec<String> {
+    skills
+        .iter()
+        .flat_map(|skill| skill.tool_subset.iter())
+        .map(|tool| tool.trim())
+        .filter(|tool| !tool.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn format_allowed_tools(allowed_tools: &[String]) -> String {
+    if allowed_tools.is_empty() {
+        "none".to_owned()
+    } else {
+        allowed_tools.join(", ")
+    }
 }
 
 fn format_memories(memories: &[Memory]) -> String {
@@ -1377,13 +1408,21 @@ mod tests {
             updated_at: now,
         };
 
-        let prompt = task_prompt(&task, &[], &[skill], &[], &[]);
+        let prompt = task_prompt(
+            &task,
+            &[],
+            &[skill],
+            &["github_search".to_owned(), "shell".to_owned()],
+            &[],
+            &[],
+        );
 
         assert!(prompt.contains("Check issues"));
         assert!(prompt.contains("recurring"));
         assert!(prompt.contains("github"));
         assert!(prompt.contains("Matched skills: rust, github"));
         assert!(prompt.contains("Active skills: github, rust"));
+        assert!(prompt.contains("Allowed tools: github_search, shell"));
         assert!(prompt.contains("Active skill resources"));
         assert!(prompt.contains("Inspect GitHub repositories"));
         assert!(prompt.contains("tools: github_search, shell"));
@@ -1434,7 +1473,7 @@ mod tests {
         };
 
         let memories = select_relevant_memories(&task, vec![unrelated, relevant], 5);
-        let prompt = task_prompt(&task, &memories, &[], &[], &[]);
+        let prompt = task_prompt(&task, &memories, &[], &[], &[], &[]);
 
         assert_eq!(memories.len(), 1);
         assert!(prompt.contains("Prefer cargo test --workspace"));
@@ -1476,7 +1515,7 @@ mod tests {
             created_at: now,
         }];
 
-        let prompt = task_prompt(&task, &[], &[], &[], &messages);
+        let prompt = task_prompt(&task, &[], &[], &[], &[], &messages);
 
         assert!(prompt.contains("Recent task conversation"));
         assert!(prompt.contains("user: The target repository"));
@@ -1514,7 +1553,7 @@ mod tests {
             created_at: now,
         }];
 
-        let prompt = task_prompt(&task, &[], &[], &notes, &[]);
+        let prompt = task_prompt(&task, &[], &[], &[], &notes, &[]);
 
         assert!(prompt.contains("Task notes"));
         assert!(prompt.contains("main_agent: Wait for staging approval."));
@@ -1896,6 +1935,7 @@ mod tests {
     struct ContextRecordingWorker {
         memory_counts: Arc<StdMutex<Vec<usize>>>,
         skill_names: Arc<StdMutex<Vec<Vec<String>>>>,
+        allowed_tools: Arc<StdMutex<Vec<Vec<String>>>>,
     }
 
     #[async_trait]
@@ -1916,6 +1956,10 @@ mod tests {
                     .map(|skill| skill.name.clone())
                     .collect(),
             );
+            self.allowed_tools
+                .lock()
+                .expect("allowed tools lock")
+                .push(context.allowed_tools);
 
             Ok(WorkerResult::Completed {
                 summary: format!("completed {}", task.title),
@@ -1966,11 +2010,13 @@ mod tests {
         .await?;
         let memory_counts = Arc::new(StdMutex::new(Vec::new()));
         let skill_names = Arc::new(StdMutex::new(Vec::new()));
+        let allowed_tools = Arc::new(StdMutex::new(Vec::new()));
         let scheduler = Scheduler::new(
             db,
             ContextRecordingWorker {
                 memory_counts: memory_counts.clone(),
                 skill_names,
+                allowed_tools,
             },
         );
 
@@ -2021,20 +2067,36 @@ mod tests {
         .await?;
         let memory_counts = Arc::new(StdMutex::new(Vec::new()));
         let skill_names = Arc::new(StdMutex::new(Vec::new()));
+        let allowed_tools = Arc::new(StdMutex::new(Vec::new()));
         let scheduler = Scheduler::new(
-            db,
+            db.clone(),
             ContextRecordingWorker {
                 memory_counts,
                 skill_names: skill_names.clone(),
+                allowed_tools: allowed_tools.clone(),
             },
         );
 
         scheduler.tick().await?;
+        let tasks = db.list_tasks().await?;
+        let task = tasks
+            .iter()
+            .find(|task| task.title == "Run cargo checks")
+            .expect("task exists");
+        let events = db.list_task_attempt_events(task.id).await?;
 
         assert_eq!(
             *skill_names.lock().expect("skill names lock"),
             vec![vec!["github".to_owned(), "rust".to_owned()]]
         );
+        assert_eq!(
+            *allowed_tools.lock().expect("allowed tools lock"),
+            vec![vec!["github".to_owned(), "shell".to_owned()]]
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "worker_context_prepared"
+                && event.details["allowed_tools"] == json!(["github", "shell"])
+        }));
 
         Ok(())
     }
