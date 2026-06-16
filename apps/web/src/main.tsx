@@ -628,6 +628,14 @@ function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): Timelin
         tone: "warning",
         timestamp,
       };
+    case "failed":
+      return {
+        id: `${timestamp}-scheduler-failed-${tick.claimed_task?.id ?? "none"}`,
+        title: "Scheduler failed a task",
+        detail: `${taskTitle}: ${tick.outcome.error}${suffix}`,
+        tone: "danger",
+        timestamp,
+      };
     case "idle":
       return {
         id: `${timestamp}-scheduler-idle`,

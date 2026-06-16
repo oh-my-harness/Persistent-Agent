@@ -377,6 +377,29 @@ impl Db {
         self.get_task(id).await
     }
 
+    pub async fn fail_task(&self, id: TaskId, error: &str, actor: &str) -> anyhow::Result<Task> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET status = ?, result_summary = ?, blocked_reason = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(TaskStatus::Failed.to_string())
+        .bind(error)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(Some(id), actor, "fail_task", json!({ "error": error }))
+            .await?;
+
+        self.get_task(id).await
+    }
+
     pub async fn create_attempt(
         &self,
         task_id: TaskId,
@@ -1457,6 +1480,40 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "set_task_status")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_task_records_summary_and_action() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Fail check".to_owned(),
+                    description: "Record failure".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.claim_next_runnable("test-worker", 60).await?;
+
+        let failed = db.fail_task(task.id, "tool crashed", "worker").await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.result_summary.as_deref(), Some("tool crashed"));
+        assert!(failed.blocked_reason.is_none());
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "fail_task")
         );
 
         Ok(())

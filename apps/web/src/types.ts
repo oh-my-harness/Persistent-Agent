@@ -49,7 +49,11 @@ export interface TaskPoolSummary {
 export interface SchedulerTick {
   requeued_tasks: Task[];
   claimed_task?: Task | null;
-  outcome: { type: "idle" } | { type: "completed"; summary: string } | { type: "blocked"; reason: string };
+  outcome:
+    | { type: "idle" }
+    | { type: "completed"; summary: string }
+    | { type: "blocked"; reason: string }
+    | { type: "failed"; error: string };
 }
 
 export type AppEvent =

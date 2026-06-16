@@ -80,7 +80,31 @@ where
                 }),
             )
             .await?;
-        let result = self.worker.execute(task.clone(), context).await?;
+        let result = match self.worker.execute(task.clone(), context).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.to_string();
+                self.db
+                    .record_attempt_event(
+                        attempt.id,
+                        task.id,
+                        "worker_failed",
+                        "Worker execution failed.",
+                        json!({ "error": error }),
+                    )
+                    .await?;
+                self.db
+                    .create_attempt(task.id, TaskStatus::Failed, Some(&error))
+                    .await?;
+                self.db.fail_task(task.id, &error, "worker").await?;
+
+                return Ok(SchedulerTick {
+                    requeued_tasks,
+                    claimed_task: Some(task),
+                    outcome: SchedulerOutcome::Failed { error },
+                });
+            }
+        };
         match result {
             WorkerResult::Completed { summary } => {
                 self.db
@@ -586,6 +610,7 @@ pub enum SchedulerOutcome {
     Idle,
     Completed { summary: String },
     Blocked { reason: String },
+    Failed { error: String },
 }
 
 #[cfg(test)]
@@ -1084,6 +1109,61 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == "worker_completed")
+        );
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct FailingWorker;
+
+    #[async_trait]
+    impl TaskWorker for FailingWorker {
+        async fn execute(
+            &self,
+            _task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            anyhow::bail!("simulated worker failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_persists_worker_failures() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Failure task".to_owned(),
+                    description: "Worker will fail".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), FailingWorker);
+
+        let tick = scheduler.tick().await?;
+        let updated = db.get_task(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(tick.outcome, SchedulerOutcome::Failed { .. }));
+        assert_eq!(updated.status, TaskStatus::Failed);
+        assert!(
+            updated
+                .result_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("simulated worker failure")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_failed")
         );
 
         Ok(())
