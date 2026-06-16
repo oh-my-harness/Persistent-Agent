@@ -219,14 +219,14 @@ impl TaskWorker for LlmWorker {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let config = self.config.clone();
         let prompt = task_prompt(&task, &context.memories, &context.conversation_messages);
-        let summary =
+        let result =
             tokio::task::spawn_blocking(move || dispatch_task_prompt(config, prompt)).await??;
 
-        Ok(WorkerResult::Completed { summary })
+        Ok(result)
     }
 }
 
-fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Result<String> {
+fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Result<WorkerResult> {
     let backend_config = BackendConfig {
         base_url: config.base_url,
         auth_token: config.api_key,
@@ -241,7 +241,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
             CoreMessage {
                 role: CoreRole::System,
                 content: vec![CoreContent::Text {
-                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible and return a concise result summary. If the task cannot truly be completed from the provided context, clearly explain what is missing.".to_owned(),
+                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\"} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input.".to_owned(),
                 }],
             },
             CoreMessage {
@@ -266,7 +266,7 @@ fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Resu
         BackendProtocol::OpenaiChatCompletions,
         &request,
     )?;
-    Ok(extract_response_text(&response))
+    Ok(parse_worker_result_text(&extract_response_text(&response)))
 }
 
 fn task_prompt(
@@ -452,6 +452,86 @@ fn extract_response_text(response: &CoreResponse) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct StructuredWorkerResult {
+    status: String,
+    summary: Option<String>,
+    reason: Option<String>,
+}
+
+fn parse_worker_result_text(text: &str) -> WorkerResult {
+    let trimmed = trim_json_code_fence(text.trim());
+    if let Ok(parsed) = serde_json::from_str::<StructuredWorkerResult>(trimmed) {
+        return match parsed.status.to_lowercase().as_str() {
+            "blocked" => WorkerResult::Blocked {
+                reason: parsed
+                    .reason
+                    .or(parsed.summary)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "Worker is blocked and needs user input.".to_owned()),
+            },
+            "completed" => WorkerResult::Completed {
+                summary: parsed
+                    .summary
+                    .or(parsed.reason)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "Worker completed the task.".to_owned()),
+            },
+            _ => fallback_worker_result(text),
+        };
+    }
+
+    fallback_worker_result(text)
+}
+
+fn trim_json_code_fence(text: &str) -> &str {
+    let Some(without_opening) = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+    else {
+        return text;
+    };
+
+    without_opening
+        .strip_suffix("```")
+        .unwrap_or(without_opening)
+        .trim()
+}
+
+fn fallback_worker_result(text: &str) -> WorkerResult {
+    let trimmed = text.trim();
+    let normalized = text.to_lowercase();
+    if [
+        "need more user input",
+        "need user input",
+        "please provide",
+        "missing context",
+        "cannot complete",
+        "can't complete",
+        "unable to complete",
+        "i need",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        WorkerResult::Blocked {
+            reason: if trimmed.is_empty() {
+                "Worker is blocked and needs user input.".to_owned()
+            } else {
+                trimmed.to_owned()
+            },
+        }
+    } else {
+        WorkerResult::Completed {
+            summary: if trimmed.is_empty() {
+                "Worker completed the task.".to_owned()
+            } else {
+                trimmed.to_owned()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum WorkerResult {
@@ -506,6 +586,54 @@ mod tests {
         };
 
         assert_eq!(extract_response_text(&response), "done");
+    }
+
+    #[test]
+    fn parses_structured_completed_worker_result() {
+        let result = parse_worker_result_text(
+            r#"{"status":"completed","summary":"Updated the README and ran tests."}"#,
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed { ref summary } if summary.contains("Updated the README")
+        ));
+    }
+
+    #[test]
+    fn parses_structured_blocked_worker_result() {
+        let result = parse_worker_result_text(
+            r#"{"status":"blocked","reason":"I need the target repository URL."}"#,
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Blocked { ref reason } if reason.contains("target repository")
+        ));
+    }
+
+    #[test]
+    fn parses_fenced_structured_worker_result() {
+        let result = parse_worker_result_text(
+            "```json\n{\"status\":\"completed\",\"summary\":\"Finished the task.\"}\n```",
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed { ref summary } if summary == "Finished the task."
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_blocked_for_missing_context_text() {
+        let result = parse_worker_result_text(
+            "I cannot complete this because the task is missing context. Please provide the repository.",
+        );
+
+        assert!(matches!(
+            result,
+            WorkerResult::Blocked { ref reason } if reason.contains("missing context")
+        ));
     }
 
     #[test]

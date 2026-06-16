@@ -19,6 +19,7 @@ The repository now contains the first executable skeleton:
 - Web task pool controls for priority and queue-position changes.
 - Web task detail panel with editable task title/description, task conversation, latest result, and execution history.
 - Serial scheduler loop with a shared execution lock, manual tick endpoint, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
+- DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Skill management with automatic matching, explicit task selection, and active-skill context for workers.

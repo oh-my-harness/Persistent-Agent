@@ -1289,6 +1289,7 @@ dependencies = [
  "persistent-agent-db",
  "persistent-agent-domain",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
