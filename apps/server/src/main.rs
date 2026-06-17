@@ -62,18 +62,75 @@ fn scheduler_interval() -> Duration {
 }
 
 fn scheduler_policy() -> SchedulerPolicy {
-    let worker_capacity = std::env::var("SCHEDULER_WORKER_CAPACITY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    let max_attempts = std::env::var("SCHEDULER_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(1);
+    scheduler_policy_from_env(|name| std::env::var(name).ok())
+}
 
-    SchedulerPolicy::new(worker_capacity, 300).with_max_attempts(max_attempts)
+fn scheduler_policy_from_env(get_env: impl Fn(&str) -> Option<String>) -> SchedulerPolicy {
+    let worker_capacity = env_usize(&get_env, "SCHEDULER_WORKER_CAPACITY", 1);
+    let lease_seconds = env_i64(&get_env, "SCHEDULER_LEASE_SECONDS", 300);
+    let max_attempts = env_i64(&get_env, "SCHEDULER_MAX_ATTEMPTS", 1);
+
+    SchedulerPolicy::new(worker_capacity, lease_seconds).with_max_attempts(max_attempts)
+}
+
+fn env_usize(get_env: impl Fn(&str) -> Option<String>, name: &str, default: usize) -> usize {
+    get_env(name)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(get_env: impl Fn(&str) -> Option<String>, name: &str, default: i64) -> i64 {
+    get_env(name)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
 }
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn scheduler_policy_uses_defaults_when_env_is_missing() {
+        let policy = scheduler_policy_from_env(|_| None);
+
+        assert_eq!(policy, SchedulerPolicy::serial());
+    }
+
+    #[test]
+    fn scheduler_policy_reads_capacity_lease_and_retry_limits() {
+        let values = HashMap::from([
+            ("SCHEDULER_WORKER_CAPACITY", "4"),
+            ("SCHEDULER_LEASE_SECONDS", "45"),
+            ("SCHEDULER_MAX_ATTEMPTS", "3"),
+        ]);
+        let policy =
+            scheduler_policy_from_env(|name| values.get(name).map(|value| value.to_string()));
+
+        assert_eq!(
+            policy,
+            SchedulerPolicy {
+                worker_capacity: 4,
+                lease_seconds: 45,
+                max_attempts: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn scheduler_policy_ignores_invalid_values() {
+        let values = HashMap::from([
+            ("SCHEDULER_WORKER_CAPACITY", "many"),
+            ("SCHEDULER_LEASE_SECONDS", "soon"),
+            ("SCHEDULER_MAX_ATTEMPTS", "often"),
+        ]);
+        let policy =
+            scheduler_policy_from_env(|name| values.get(name).map(|value| value.to_string()));
+
+        assert_eq!(policy, SchedulerPolicy::serial());
+    }
 }

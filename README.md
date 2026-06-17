@@ -56,6 +56,8 @@ The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTER
 
 `SCHEDULER_WORKER_CAPACITY` defines the scheduler policy capacity and defaults to `1`. The MVP still executes ticks through a serial lock; the explicit policy keeps the boundary ready for future parallel workers.
 
+`SCHEDULER_LEASE_SECONDS` defines how long a running task lease lasts before heartbeat refresh or recovery, and defaults to `300`.
+
 `SCHEDULER_MAX_ATTEMPTS` defines how many worker failures are allowed before a task is marked `failed`, and defaults to `1`.
 
 Run the Web UI:
