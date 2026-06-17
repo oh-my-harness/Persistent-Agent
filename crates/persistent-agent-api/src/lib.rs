@@ -895,3 +895,56 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use persistent_agent_domain::CreateTask;
+    use persistent_agent_scheduler::StubWorker;
+
+    #[tokio::test]
+    async fn main_agent_scheduler_scan_appends_tick_summary_to_chat() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_task(
+            CreateTask::one_off_from_user(
+                "API scheduler summary",
+                "exercise the chat-visible scheduler scan result",
+            ),
+            "test",
+        )
+        .await?;
+        let state = AppState::new(db.clone(), WorkerBackend::Stub(StubWorker));
+
+        let Json(response) = send_main_agent_message(
+            State(state),
+            Json(MainAgentMessageInput {
+                content: "run scheduler scan".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+
+        let scheduler_message = response
+            .scheduler_message
+            .expect("scheduler scan should append a chat-visible summary");
+        assert!(response.scheduler_tick_requested);
+        assert!(response.scheduler_tick.is_some());
+        assert!(
+            scheduler_message
+                .content
+                .contains("Scheduler scan completed")
+        );
+        assert!(scheduler_message.content.contains("Completed claimed task"));
+
+        let conversation = db.get_or_create_main_conversation().await?;
+        let messages = db.list_conversation_messages(conversation.id, 10).await?;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.id == scheduler_message.id),
+            "main-agent conversation should persist the scheduler summary"
+        );
+
+        Ok(())
+    }
+}
