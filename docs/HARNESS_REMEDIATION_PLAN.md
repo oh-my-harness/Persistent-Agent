@@ -16,14 +16,13 @@ agent loop, runtime, tool registry, hooks, sub-agent support, or skill system.
 
 ## Immediate Remediation
 
-1. Remove the non-approved `llm_runtime` dependency.
-2. Change `llm_adapter` to the approved `oh-my-harness/llm-api-adapter` git dependency.
-3. Remove the temporary `HarnessWorker` built on the non-approved runtime loop.
+1. Remove the non-approved `llm_runtime` dependency. Done.
+2. Change `llm_adapter` to the approved `oh-my-harness/llm-api-adapter` git dependency. Done.
+3. Remove the temporary `HarnessWorker` built on the non-approved runtime loop. Done.
 4. Restore the worker path to either:
    - `StubWorker` when no model key is configured, or
-   - the transitional single-response DeepSeek worker using the approved `llm_adapter`.
-5. Add `oh-my-harness` core/runtime dependencies only after their public API is inspected and the
-   worker can use them directly.
+   - `OhMyHarnessWorker`, which executes through `AgentHarness` from `llm-harness-core` and calls DeepSeek through the approved `llm-api-adapter`.
+5. Add `oh-my-harness` core/runtime dependencies only after their public API is inspected and the worker can use them directly. Core is wired; runtime is still pending repository availability.
 
 ## Target Worker Shape
 
@@ -35,9 +34,9 @@ Scheduler -> TaskWorker -> OhMyHarnessWorker -> AgentHarness -> WorkerResult
 
 `OhMyHarnessWorker` must use:
 
-- `AgentHarness` from `llm-harness-core`
-- runtime tool registry, hooks, audit, and sub-agent services from `llm-harness-runtime`
-- provider calls through `llm-api-adapter`
+- `AgentHarness` from `llm-harness-core` (wired)
+- provider calls through `llm-api-adapter` (wired)
+- runtime tool registry, hooks, audit, and sub-agent services from `llm-harness-runtime` (pending repository availability)
 
 ## Product Context To Inject
 
@@ -54,11 +53,11 @@ The harness worker must receive:
 
 The first harness-backed product tools are:
 
-- `complete_task`
-- `block_task`
-- `remember`
-- `record_artifact`
-- `create_follow_up_task`
+- `complete_task` (wired)
+- `block_task` (wired)
+- `remember` (wired)
+- `record_artifact` (wired)
+- `create_follow_up_task` (wired)
 
 External tools such as shell, browser, git, and GitHub must be added later through the approved
 runtime tool policy and audit path.
@@ -77,4 +76,3 @@ The dependency gate is:
 
 - `Cargo.toml` must not contain non-approved runtime/agent framework dependencies.
 - `Cargo.lock` must resolve the framework crates from approved `oh-my-harness` git repositories.
-

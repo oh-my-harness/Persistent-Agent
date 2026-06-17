@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use llm_adapter::{Provider, deepseek, types::*};
+use llm_adapter::deepseek;
+use llm_harness::prelude::{
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock, Tool, ToolContext,
+    ToolError, ToolExecutionMode, ToolResult, UnsupportedEnv,
+};
+use llm_harness_loop::LlmClient;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateMemory, CreateTask, Memory, MemoryStatus, Skill, Task, TaskNote,
@@ -579,7 +584,7 @@ impl TaskWorker for StubWorker {
 #[derive(Debug, Clone)]
 pub enum WorkerBackend {
     Stub(StubWorker),
-    Llm(LlmWorker),
+    Harness(OhMyHarnessWorker),
 }
 
 #[async_trait]
@@ -587,17 +592,19 @@ impl TaskWorker for WorkerBackend {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         match self {
             Self::Stub(worker) => worker.execute(task, context).await,
-            Self::Llm(worker) => worker.execute(task, context).await,
+            Self::Harness(worker) => worker.execute(task, context).await,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LlmWorker {
+pub struct OhMyHarnessWorker {
     config: LlmWorkerConfig,
 }
 
-impl LlmWorker {
+pub type LlmWorker = OhMyHarnessWorker;
+
+impl OhMyHarnessWorker {
     pub fn new(config: LlmWorkerConfig) -> Self {
         Self { config }
     }
@@ -623,7 +630,7 @@ impl LlmWorkerConfig {
 }
 
 #[async_trait]
-impl TaskWorker for LlmWorker {
+impl TaskWorker for OhMyHarnessWorker {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
         let config = self.config.clone();
         let prompt = task_prompt(
@@ -634,23 +641,445 @@ impl TaskWorker for LlmWorker {
             &context.notes,
             &context.conversation_messages,
         );
-        dispatch_task_prompt(config, prompt).await
+        dispatch_task_with_harness(config, prompt).await
     }
 }
 
-async fn dispatch_task_prompt(
+async fn dispatch_task_with_harness(
     config: LlmWorkerConfig,
     prompt: String,
 ) -> anyhow::Result<WorkerResult> {
-    let provider = deepseek::client(config.api_key);
-    let request = ChatRequest::builder(config.model, 900)
-        .message(Message::System("You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}],\"follow_up_tasks\":[{\"title\":\"...\",\"description\":\"...\",\"priority\":0,\"requested_skills\":[\"...\"]}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts. Use follow_up_tasks only for concrete one-off work that should be queued after this task succeeds.".to_owned()))
-        .message(Message::User(vec![RequestContent::Text(prompt)]))
-        .temperature(0.2)
-        .build();
-    let response = provider.chat(&request).await?;
+    let client = Arc::new(deepseek::client(config.api_key)) as Arc<dyn LlmClient>;
+    let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
+    let mut opts = AgentHarnessOptions::new(config.model);
+    opts.max_tokens = 1200;
+    opts.system_prompt = Some(HARNESS_WORKER_SYSTEM_PROMPT.to_owned());
+    opts.tools = worker_tools(state.clone());
 
-    Ok(parse_worker_result_text(&response.text()))
+    let harness = AgentHarness::new_in_memory(client, Arc::new(UnsupportedEnv::new()), opts).await;
+    let mut events = harness.subscribe();
+    harness.prompt(prompt).await?;
+    harness.wait_for_idle().await;
+
+    let mut assistant_text = String::new();
+    while let Ok(event) = events.try_recv() {
+        if let AgentHarnessEvent::Agent(llm_harness::prelude::AgentEvent::AgentEnd {
+            new_messages,
+        }) = event.as_ref()
+        {
+            assistant_text.push_str(&assistant_text_from_messages(new_messages));
+        }
+    }
+
+    let mut state = state.lock().await.clone();
+    let result = state
+        .result
+        .take()
+        .unwrap_or_else(|| parse_worker_result_text(&assistant_text));
+    Ok(state.merge_into_result(result))
+}
+
+const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+
+#[derive(Debug, Clone, Default)]
+struct HarnessWorkerState {
+    result: Option<WorkerResult>,
+    memory_candidates: Vec<String>,
+    artifacts: Vec<WorkerArtifact>,
+    follow_up_tasks: Vec<WorkerFollowUpTask>,
+}
+
+impl HarnessWorkerState {
+    fn merge_into_result(&mut self, result: WorkerResult) -> WorkerResult {
+        match result {
+            WorkerResult::Completed {
+                summary,
+                mut memory_candidates,
+                mut artifacts,
+                mut follow_up_tasks,
+            } => {
+                memory_candidates.extend(std::mem::take(&mut self.memory_candidates));
+                artifacts.extend(std::mem::take(&mut self.artifacts));
+                follow_up_tasks.extend(std::mem::take(&mut self.follow_up_tasks));
+                WorkerResult::Completed {
+                    summary,
+                    memory_candidates: dedupe_strings(memory_candidates),
+                    artifacts: dedupe_artifacts(artifacts),
+                    follow_up_tasks: dedupe_follow_up_tasks(follow_up_tasks),
+                }
+            }
+            WorkerResult::Blocked { reason } => WorkerResult::Blocked { reason },
+        }
+    }
+}
+
+fn worker_tools(state: Arc<Mutex<HarnessWorkerState>>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(RememberTool::new(state.clone())),
+        Arc::new(RecordArtifactTool::new(state.clone())),
+        Arc::new(CreateFollowUpTaskTool::new(state.clone())),
+        Arc::new(CompleteTaskTool::new(state.clone())),
+        Arc::new(BlockTaskTool::new(state)),
+    ]
+}
+
+struct CompleteTaskTool {
+    state: Arc<Mutex<HarnessWorkerState>>,
+    schema: serde_json::Value,
+}
+
+impl CompleteTaskTool {
+    fn new(state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self {
+            state,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string" },
+                    "memory_candidates": { "type": "array", "items": { "type": "string" } },
+                    "artifacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "artifact_type": { "type": "string" },
+                                "uri": { "type": "string" },
+                                "summary": { "type": "string" }
+                            },
+                            "required": ["name", "artifact_type", "uri"]
+                        }
+                    },
+                    "follow_up_tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "description": { "type": "string" },
+                                "priority": { "type": "integer" },
+                                "requested_skills": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": ["title"]
+                        }
+                    }
+                },
+                "required": ["summary"]
+            }),
+        }
+    }
+}
+
+impl Tool for CompleteTaskTool {
+    fn name(&self) -> &str {
+        "complete_task"
+    }
+
+    fn description(&self) -> &str {
+        "Mark the assigned task as completed and provide the final durable result."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let summary = required_string(&args, "summary")?;
+            let parsed = serde_json::from_value::<StructuredWorkerResult>(json!({
+                "status": "completed",
+                "summary": summary,
+                "memory_candidates": args.get("memory_candidates").cloned().unwrap_or_else(|| json!([])),
+                "artifacts": args.get("artifacts").cloned().unwrap_or_else(|| json!([])),
+                "follow_up_tasks": args.get("follow_up_tasks").cloned().unwrap_or_else(|| json!([])),
+            }))
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            let result = parse_structured_worker_result(parsed);
+            self.state.lock().await.result = Some(result);
+            Ok(tool_text_result("task marked completed", true))
+        })
+    }
+}
+
+struct BlockTaskTool {
+    state: Arc<Mutex<HarnessWorkerState>>,
+    schema: serde_json::Value,
+}
+
+impl BlockTaskTool {
+    fn new(state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self {
+            state,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string" }
+                },
+                "required": ["reason"]
+            }),
+        }
+    }
+}
+
+impl Tool for BlockTaskTool {
+    fn name(&self) -> &str {
+        "block_task"
+    }
+
+    fn description(&self) -> &str {
+        "Mark the assigned task as blocked because user input or external context is required."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let reason = required_string(&args, "reason")?;
+            self.state.lock().await.result = Some(WorkerResult::Blocked { reason });
+            Ok(tool_text_result("task marked blocked", true))
+        })
+    }
+}
+
+struct RememberTool {
+    state: Arc<Mutex<HarnessWorkerState>>,
+    schema: serde_json::Value,
+}
+
+impl RememberTool {
+    fn new(state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self {
+            state,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" }
+                },
+                "required": ["content"]
+            }),
+        }
+    }
+}
+
+impl Tool for RememberTool {
+    fn name(&self) -> &str {
+        "remember"
+    }
+
+    fn description(&self) -> &str {
+        "Record one durable memory candidate learned while executing this task."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let content = required_string(&args, "content")?;
+            self.state.lock().await.memory_candidates.push(content);
+            Ok(tool_text_result("memory candidate recorded", false))
+        })
+    }
+}
+
+struct RecordArtifactTool {
+    state: Arc<Mutex<HarnessWorkerState>>,
+    schema: serde_json::Value,
+}
+
+impl RecordArtifactTool {
+    fn new(state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self {
+            state,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "artifact_type": { "type": "string" },
+                    "uri": { "type": "string" },
+                    "summary": { "type": "string" }
+                },
+                "required": ["name", "artifact_type", "uri"]
+            }),
+        }
+    }
+}
+
+impl Tool for RecordArtifactTool {
+    fn name(&self) -> &str {
+        "record_artifact"
+    }
+
+    fn description(&self) -> &str {
+        "Record a durable artifact or external reference produced by the task."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let artifact = WorkerArtifact {
+                name: required_string(&args, "name")?,
+                artifact_type: required_string(&args, "artifact_type")?,
+                uri: required_string(&args, "uri")?,
+                summary: args
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
+            };
+            self.state.lock().await.artifacts.push(artifact);
+            Ok(tool_text_result("artifact recorded", false))
+        })
+    }
+}
+
+struct CreateFollowUpTaskTool {
+    state: Arc<Mutex<HarnessWorkerState>>,
+    schema: serde_json::Value,
+}
+
+impl CreateFollowUpTaskTool {
+    fn new(state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self {
+            state,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "priority": { "type": "integer" },
+                    "requested_skills": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["title"]
+            }),
+        }
+    }
+}
+
+impl Tool for CreateFollowUpTaskTool {
+    fn name(&self) -> &str {
+        "create_follow_up_task"
+    }
+
+    fn description(&self) -> &str {
+        "Queue a concrete one-off follow-up task after the current task succeeds."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let follow_up = WorkerFollowUpTask {
+                title: required_string(&args, "title")?,
+                description: args
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_owned(),
+                priority: args
+                    .get("priority")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0),
+                requested_skills: args
+                    .get("requested_skills")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            self.state.lock().await.follow_up_tasks.push(follow_up);
+            Ok(tool_text_result("follow-up task recorded", false))
+        })
+    }
+}
+
+fn tool_text_result(text: &str, terminate: bool) -> ToolResult {
+    ToolResult {
+        content: vec![ContentBlock::Text {
+            text: text.to_owned(),
+        }],
+        details: json!({ "message": text }),
+        terminate,
+    }
+}
+
+fn required_string(args: &serde_json::Value, field: &str) -> Result<String, ToolError> {
+    args.get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
+}
+
+fn assistant_text_from_messages(messages: &[llm_harness::prelude::AgentMessage]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let llm_harness::prelude::AgentMessage::Assistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.content {
+            if let ContentBlock::Text { text } = block {
+                output.push_str(text);
+            }
+        }
+    }
+    output
 }
 
 fn task_prompt(
@@ -911,29 +1340,33 @@ struct StructuredWorkerResult {
 fn parse_worker_result_text(text: &str) -> WorkerResult {
     let trimmed = trim_json_code_fence(text.trim());
     if let Ok(parsed) = serde_json::from_str::<StructuredWorkerResult>(trimmed) {
-        return match parsed.status.to_lowercase().as_str() {
-            "blocked" => WorkerResult::Blocked {
-                reason: parsed
-                    .reason
-                    .or(parsed.summary)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "Worker is blocked and needs user input.".to_owned()),
-            },
-            "completed" => WorkerResult::Completed {
-                summary: parsed
-                    .summary
-                    .or(parsed.reason)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "Worker completed the task.".to_owned()),
-                memory_candidates: clean_memory_candidates(parsed.memory_candidates),
-                artifacts: clean_artifacts(parsed.artifacts),
-                follow_up_tasks: clean_follow_up_tasks(parsed.follow_up_tasks),
-            },
-            _ => fallback_worker_result(text),
-        };
+        return parse_structured_worker_result(parsed);
     }
 
     fallback_worker_result(text)
+}
+
+fn parse_structured_worker_result(parsed: StructuredWorkerResult) -> WorkerResult {
+    match parsed.status.to_lowercase().as_str() {
+        "blocked" => WorkerResult::Blocked {
+            reason: parsed
+                .reason
+                .or(parsed.summary)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Worker is blocked and needs user input.".to_owned()),
+        },
+        "completed" => WorkerResult::Completed {
+            summary: parsed
+                .summary
+                .or(parsed.reason)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Worker completed the task.".to_owned()),
+            memory_candidates: clean_memory_candidates(parsed.memory_candidates),
+            artifacts: clean_artifacts(parsed.artifacts),
+            follow_up_tasks: clean_follow_up_tasks(parsed.follow_up_tasks),
+        },
+        _ => fallback_worker_result(""),
+    }
 }
 
 fn trim_json_code_fence(text: &str) -> &str {
@@ -1014,6 +1447,35 @@ fn clean_follow_up_tasks(tasks: Option<Vec<WorkerFollowUpTask>>) -> Vec<WorkerFo
                 requested_skills,
             })
         })
+        .collect()
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn dedupe_artifacts(artifacts: Vec<WorkerArtifact>) -> Vec<WorkerArtifact> {
+    let mut seen = BTreeSet::new();
+    artifacts
+        .into_iter()
+        .filter(|artifact| {
+            seen.insert(format!(
+                "{}\u{1f}{}\u{1f}{}",
+                artifact.name, artifact.artifact_type, artifact.uri
+            ))
+        })
+        .collect()
+}
+
+fn dedupe_follow_up_tasks(tasks: Vec<WorkerFollowUpTask>) -> Vec<WorkerFollowUpTask> {
+    let mut seen = BTreeSet::new();
+    tasks
+        .into_iter()
+        .filter(|task| seen.insert(format!("{}\u{1f}{}", task.title, task.description)))
         .collect()
 }
 
@@ -1167,6 +1629,64 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_worker_registers_product_lifecycle_tools() {
+        let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
+        let tools = worker_tools(state);
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "remember",
+                "record_artifact",
+                "create_follow_up_task",
+                "complete_task",
+                "block_task"
+            ]
+        );
+    }
+
+    #[test]
+    fn harness_worker_merges_tool_outputs_into_completion() {
+        let mut state = HarnessWorkerState {
+            result: None,
+            memory_candidates: vec!["Prefer focused regression checks.".to_owned()],
+            artifacts: vec![WorkerArtifact {
+                name: "report.md".to_owned(),
+                artifact_type: "file".to_owned(),
+                uri: "file://report.md".to_owned(),
+                summary: Some("Run report".to_owned()),
+            }],
+            follow_up_tasks: vec![WorkerFollowUpTask {
+                title: "Run regression tests".to_owned(),
+                description: "Validate the worker change".to_owned(),
+                priority: 1,
+                requested_skills: vec!["testing".to_owned()],
+            }],
+        };
+
+        let result = state.merge_into_result(WorkerResult::Completed {
+            summary: "Harness completed the task.".to_owned(),
+            memory_candidates: vec!["Prefer focused regression checks.".to_owned()],
+            artifacts: Vec::new(),
+            follow_up_tasks: Vec::new(),
+        });
+
+        assert!(matches!(
+            result,
+            WorkerResult::Completed {
+                ref summary,
+                ref memory_candidates,
+                ref artifacts,
+                ref follow_up_tasks,
+            } if summary == "Harness completed the task."
+                && memory_candidates == &vec!["Prefer focused regression checks.".to_owned()]
+                && artifacts.len() == 1
+                && follow_up_tasks.len() == 1
+        ));
     }
 
     #[tokio::test]

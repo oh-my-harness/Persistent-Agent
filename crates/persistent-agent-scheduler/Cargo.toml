@@ -10,6 +10,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 llm_adapter.workspace = true
+llm-harness.workspace = true
+llm-harness-loop.workspace = true
 persistent-agent-db = { path = "../persistent-agent-db" }
 persistent-agent-domain = { path = "../persistent-agent-domain" }
 serde.workspace = true

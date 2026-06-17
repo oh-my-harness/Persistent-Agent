@@ -20,7 +20,7 @@ product code must not substitute unrelated packages with similar names. Crates s
 `llm_adapter` or `llm_runtime` from non-`oh-my-harness` publishers are not approved substitutes for
 the agent loop, provider adapter, runtime, tool registry, or skill system.
 
-Product code should prefer `AgentHarness` from `oh-my-harness/llm-harness-core` as the product-facing agent entry point.
+Product code should prefer `AgentHarness` from `oh-my-harness/llm-harness-core` as the product-facing agent entry point. The current DeepSeek worker already uses this path and exposes product lifecycle tools through the harness loop; `llm-harness-runtime` remains the next layer for OS tools, sandboxing, sub-agents, audit, auth, approval, and budget policy.
 
 Use runtime services where they already match product concerns:
 

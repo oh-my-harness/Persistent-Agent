@@ -33,6 +33,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,9 +1043,60 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "llm-harness"
+version = "0.1.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "llm-harness-loop",
+ "llm-harness-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "llm-harness-loop"
+version = "0.1.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "llm-harness-types",
+ "llm_adapter",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "llm-harness-types"
+version = "0.1.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "llm_adapter"
 version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-api-adapter.git#c1d2cb87cb2bb94803144cfc28133a394b7fca18"
+source = "git+https://github.com/oh-my-harness/llm-api-adapter.git?rev=c1d2cb87cb2bb94803144cfc28133a394b7fca18#c1d2cb87cb2bb94803144cfc28133a394b7fca18"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -1344,6 +1417,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "llm-harness",
+ "llm-harness-loop",
  "llm_adapter",
  "persistent-agent-db",
  "persistent-agent-domain",
@@ -2217,6 +2292,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -2276,6 +2352,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
