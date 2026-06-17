@@ -709,6 +709,65 @@ impl MainAgent {
         Ok(format_memory_list(filter, &filtered))
     }
 
+    pub async fn inspect_scheduler_state(&self) -> anyhow::Result<String> {
+        let tasks = self.db.list_tasks().await?;
+        let running_tasks = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Running)
+            .cloned()
+            .collect::<Vec<_>>();
+        let waiting_for_user_tasks = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::WaitingForUser)
+            .cloned()
+            .collect::<Vec<_>>();
+        let queued_count = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Queued)
+            .count();
+        let waiting_for_schedule_count = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::WaitingForSchedule)
+            .count();
+        let next_queued_task = tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Queued)
+            .min_by(|left, right| {
+                right
+                    .priority
+                    .cmp(&left.priority)
+                    .then_with(|| left.queue_position.cmp(&right.queue_position))
+                    .then_with(|| left.created_at.cmp(&right.created_at))
+            })
+            .cloned();
+        let next_runnable_task = self.db.peek_next_runnable().await?;
+
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_scheduler_state",
+                serde_json::json!({
+                    "running_count": running_tasks.len(),
+                    "queued_count": queued_count,
+                    "waiting_for_user_count": waiting_for_user_tasks.len(),
+                    "waiting_for_schedule_count": waiting_for_schedule_count,
+                    "next_queued_task_id": next_queued_task.as_ref().map(|task| task.id),
+                    "next_runnable_task_id": next_runnable_task.as_ref().map(|task| task.id),
+                }),
+            )
+            .await?;
+
+        Ok(format_scheduler_state(
+            &running_tasks,
+            next_queued_task.as_ref(),
+            next_runnable_task.as_ref(),
+            queued_count,
+            &waiting_for_user_tasks,
+            waiting_for_schedule_count,
+        ))
+    }
+
     pub async fn main_conversation_messages(
         &self,
         limit: i64,
@@ -1035,6 +1094,7 @@ impl MainAgent {
                 let tasks = self.list_task_pool().await?;
                 format_task_list(&tasks)
             }
+            MainAgentIntent::ShowSchedulerState => self.inspect_scheduler_state().await?,
             MainAgentIntent::ListGlobalActions => self.list_main_agent_actions().await?,
             MainAgentIntent::ExplainTaskPool => self.explain_task_pool_state().await?,
             MainAgentIntent::ExplainTask { selector } => match self.find_task(&selector).await? {
@@ -1564,6 +1624,7 @@ pub enum MainAgentPlan {
     ListMemories {
         filter: MemoryListFilter,
     },
+    ShowSchedulerState,
     ListSkillDefinitions,
     ListTasks,
     Summarize,
@@ -1684,6 +1745,7 @@ impl MainAgentPlan {
             }
             Self::DeleteMemory { selector } => MainAgentIntent::DeleteMemory { selector },
             Self::ListMemories { filter } => MainAgentIntent::ListMemories { filter },
+            Self::ShowSchedulerState => MainAgentIntent::ShowSchedulerState,
             Self::ListSkillDefinitions => MainAgentIntent::ListSkillDefinitions,
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
@@ -1868,6 +1930,7 @@ enum MainAgentIntent {
     ListMemories {
         filter: MemoryListFilter,
     },
+    ShowSchedulerState,
     CreateSkillDefinition {
         input: CreateSkill,
     },
@@ -1887,6 +1950,10 @@ enum MainAgentIntent {
 fn parse_intent(content: &str) -> MainAgentIntent {
     let trimmed = content.trim();
     let normalized = trimmed.to_lowercase();
+
+    if is_scheduler_state_request(&normalized) {
+        return MainAgentIntent::ShowSchedulerState;
+    }
 
     if let Some(intent) = parse_explain_intent(trimmed, &normalized) {
         return intent;
@@ -2324,6 +2391,7 @@ async fn dispatch_main_agent_planner(
         "plan_update_memory",
         "plan_delete_memory",
         "plan_list_memories",
+        "plan_show_scheduler_state",
         "plan_list_skill_definitions",
         "plan_list_tasks",
         "plan_summarize_task_pool",
@@ -2458,6 +2526,12 @@ fn main_agent_planner_tool_registry(
         PlannedMemoryReviewAction::Delete,
     )));
     registry.register(Arc::new(PlanListMemoriesTool::new(state.clone())));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_show_scheduler_state",
+        "Plan to show current scheduler execution state without running a scan.",
+        MainAgentPlan::ShowSchedulerState,
+    )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_skill_definitions",
@@ -4068,7 +4142,7 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     )
     .replace(
         "- plan_list_memories: list memory candidates by status.",
-        "- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.",
+        "- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.\n- plan_show_scheduler_state: show current scheduler execution state without running a scan.",
     )
 }
 
@@ -4686,6 +4760,27 @@ fn is_scheduler_scan_request(normalized: &str) -> bool {
     ) && !is_create_request(normalized)
 }
 
+fn is_scheduler_state_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "scheduler state",
+            "scheduler status",
+            "execution state",
+            "execution status",
+            "agent state",
+            "agent status",
+            "what is running",
+            "what is the agent doing",
+            "next runnable",
+            "next task",
+            "\u{8c03}\u{5ea6}\u{72b6}\u{6001}",
+            "\u{6267}\u{884c}\u{72b6}\u{6001}",
+            "\u{4e0b}\u{4e00}\u{4e2a}\u{4efb}\u{52a1}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
 fn is_workspace_inspection_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -4759,6 +4854,62 @@ fn format_task_list(tasks: &[Task]) -> String {
     }
 
     lines.join("\n")
+}
+
+fn format_scheduler_state(
+    running_tasks: &[Task],
+    next_queued_task: Option<&Task>,
+    next_runnable_task: Option<&Task>,
+    queued_count: usize,
+    waiting_for_user_tasks: &[Task],
+    waiting_for_schedule_count: usize,
+) -> String {
+    let mut lines = vec![format!(
+        "Execution state: {} running, {} queued, {} waiting for user, {} waiting for schedule.",
+        running_tasks.len(),
+        queued_count,
+        waiting_for_user_tasks.len(),
+        waiting_for_schedule_count
+    )];
+
+    if running_tasks.is_empty() {
+        lines.push("Running: none.".to_owned());
+    } else {
+        lines.push("Running:".to_owned());
+        for task in running_tasks.iter().take(5) {
+            lines.push(format!("- {}", format_task_brief(task)));
+        }
+    }
+
+    lines.push(match next_queued_task {
+        Some(task) => format!("Next queued: {}", format_task_brief(task)),
+        None => "Next queued: none.".to_owned(),
+    });
+    lines.push(match next_runnable_task {
+        Some(task) => format!("Next runnable: {}", format_task_brief(task)),
+        None => "Next runnable: none.".to_owned(),
+    });
+
+    if !waiting_for_user_tasks.is_empty() {
+        lines.push("Waiting for user:".to_owned());
+        for task in waiting_for_user_tasks.iter().take(5) {
+            let reason = task.blocked_reason.as_deref().unwrap_or("needs input");
+            lines.push(format!("- {} ({})", format_task_brief(task), reason));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_brief(task: &Task) -> String {
+    format!(
+        "{} [{} priority {} queue {}] {}",
+        task.id.to_string().chars().take(8).collect::<String>(),
+        task.status,
+        task.priority,
+        task.queue_position,
+        task.title
+    )
 }
 
 fn format_global_action_list(actions: &[TaskAction]) -> String {
@@ -6264,6 +6415,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_scheduler_state_intents() {
+        assert_eq!(
+            parse_intent("show scheduler status"),
+            MainAgentIntent::ShowSchedulerState
+        );
+        assert_eq!(
+            parse_intent("what is the agent doing?"),
+            MainAgentIntent::ShowSchedulerState
+        );
+        assert_eq!(
+            parse_intent("\u{8c03}\u{5ea6}\u{72b6}\u{6001}"),
+            MainAgentIntent::ShowSchedulerState
+        );
+    }
+
+    #[test]
     fn parses_explain_intents() {
         assert_eq!(
             parse_intent("explain task pool state"),
@@ -7471,6 +7638,25 @@ mod tests {
                 .contains("Execution state")
         );
 
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ShowSchedulerState),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "What is the worker scheduler doing right now?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(response.assistant_message.content.contains("Next runnable"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "inspect_scheduler_state")
+        );
+
         Ok(())
     }
 
@@ -8270,6 +8456,71 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "list_tasks")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_show_scheduler_state_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let queued = agent
+            .create_task(CreateTask {
+                title: "Check repository issues".to_owned(),
+                description: "Look for open issues".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 3,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let blocked = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy after environment is known".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        db.set_task_status(
+            blocked.id,
+            TaskStatus::WaitingForUser,
+            "test",
+            Some("Which environment?"),
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show scheduler status".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Execution state")
+        );
+        assert!(response.assistant_message.content.contains("Next runnable"));
+        assert!(response.assistant_message.content.contains(&queued.title));
+        assert!(response.assistant_message.content.contains(&blocked.title));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Which environment?")
+        );
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "inspect_scheduler_state")
         );
 
         Ok(())
