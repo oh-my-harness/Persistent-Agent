@@ -3,7 +3,7 @@ use std::{net::SocketAddr, time::Duration};
 use persistent_agent_api::{AppState, router, spawn_heartbeat, spawn_scheduler_loop};
 use persistent_agent_db::Db;
 use persistent_agent_scheduler::{
-    HarnessWorker, LlmWorker, LlmWorkerConfig, SchedulerPolicy, StubWorker, WorkerBackend,
+    LlmWorker, LlmWorkerConfig, SchedulerPolicy, StubWorker, WorkerBackend,
 };
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -43,20 +43,8 @@ fn build_worker() -> WorkerBackend {
         Ok(api_key) if !api_key.trim().is_empty() => {
             let model =
                 std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
-            let config = LlmWorkerConfig::deepseek(api_key, model.clone());
-            match std::env::var("PERSISTENT_AGENT_WORKER_MODE")
-                .unwrap_or_else(|_| "harness".to_owned())
-                .as_str()
-            {
-                "llm_json" => {
-                    tracing::info!(%model, "using DeepSeek single-response LLM worker");
-                    WorkerBackend::Llm(LlmWorker::new(config))
-                }
-                _ => {
-                    tracing::info!(%model, "using DeepSeek harness tool-loop worker");
-                    WorkerBackend::Harness(HarnessWorker::new(config))
-                }
-            }
+            tracing::info!(%model, "using transitional DeepSeek worker through oh-my-harness llm-api-adapter");
+            WorkerBackend::Llm(LlmWorker::new(LlmWorkerConfig::deepseek(api_key, model)))
         }
         _ => {
             tracing::info!("DEEPSEEK_API_KEY not set; using stub worker");

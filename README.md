@@ -38,7 +38,7 @@ The repository now contains the first executable skeleton:
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
-- DeepSeek worker plumbing exists, but the agent worker must be migrated to the approved `oh-my-harness` repositories above before it is considered framework-compliant.
+- DeepSeek worker plumbing now uses the approved `oh-my-harness/llm-api-adapter`; the agent worker must still be migrated to `llm-harness-core` and `llm-harness-runtime` before it is considered full framework-compliant.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Main-agent global action audit API and Web panel for non-task-specific tool calls.
@@ -67,7 +67,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server can call DeepSeek. The current worker dependency wiring is transitional and must be replaced with `oh-my-harness/llm-api-adapter`, `oh-my-harness/llm-harness-core`, and `oh-my-harness/llm-harness-runtime`.
+When `DEEPSEEK_API_KEY` is set, the server can call DeepSeek through the approved `oh-my-harness/llm-api-adapter`. The current worker remains transitional until execution is moved onto `oh-my-harness/llm-harness-core` and `oh-my-harness/llm-harness-runtime`.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 

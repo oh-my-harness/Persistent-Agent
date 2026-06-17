@@ -1,16 +1,5 @@
 use async_trait::async_trait;
-use llm_adapter::{
-    backend::{
-        BackendConfig, BackendRequestLayer, ChatProtocol, ReqwestHttpClient, dispatch_request,
-    },
-    core::{
-        CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
-        CoreToolChoiceMode, CoreToolDefinition,
-    },
-};
-use llm_runtime::{
-    AccumulatedToolCall, EventSink, RoundOutcome, ToolExecutionResult, ToolLoopEvent, run_tool_loop,
-};
+use llm_adapter::{Provider, deepseek, types::*};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateMemory, CreateTask, Memory, MemoryStatus, Skill, Task, TaskNote,
@@ -18,10 +7,7 @@ use persistent_agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -594,7 +580,6 @@ impl TaskWorker for StubWorker {
 pub enum WorkerBackend {
     Stub(StubWorker),
     Llm(LlmWorker),
-    Harness(HarnessWorker),
 }
 
 #[async_trait]
@@ -603,7 +588,6 @@ impl TaskWorker for WorkerBackend {
         match self {
             Self::Stub(worker) => worker.execute(task, context).await,
             Self::Llm(worker) => worker.execute(task, context).await,
-            Self::Harness(worker) => worker.execute(task, context).await,
         }
     }
 }
@@ -638,26 +622,6 @@ impl LlmWorkerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct HarnessWorker {
-    config: LlmWorkerConfig,
-    max_steps: usize,
-}
-
-impl HarnessWorker {
-    pub fn new(config: LlmWorkerConfig) -> Self {
-        Self {
-            config,
-            max_steps: 8,
-        }
-    }
-
-    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
-        self.max_steps = max_steps.max(1);
-        self
-    }
-}
-
 #[async_trait]
 impl TaskWorker for LlmWorker {
     async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
@@ -670,393 +634,23 @@ impl TaskWorker for LlmWorker {
             &context.notes,
             &context.conversation_messages,
         );
-        let result =
-            tokio::task::spawn_blocking(move || dispatch_task_prompt(config, prompt)).await??;
-
-        Ok(result)
+        dispatch_task_prompt(config, prompt).await
     }
 }
 
-fn dispatch_task_prompt(config: LlmWorkerConfig, prompt: String) -> anyhow::Result<WorkerResult> {
-    let backend_config = BackendConfig {
-        base_url: config.base_url,
-        auth_token: config.api_key,
-        request_layer: Some(BackendRequestLayer::ChatCompletions),
-        headers: BTreeMap::new(),
-        no_streaming: true,
-        timeout_ms: Some(config.timeout_ms),
-    };
-    let request = CoreRequest {
-        model: config.model,
-        messages: vec![
-            CoreMessage {
-                role: CoreRole::System,
-                content: vec![CoreContent::Text {
-                    text: "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}],\"follow_up_tasks\":[{\"title\":\"...\",\"description\":\"...\",\"priority\":0,\"requested_skills\":[\"...\"]}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts. Use follow_up_tasks only for concrete one-off work that should be queued after this task succeeds.".to_owned(),
-                }],
-            },
-            CoreMessage {
-                role: CoreRole::User,
-                content: vec![CoreContent::Text { text: prompt }],
-            },
-        ],
-        stream: false,
-        max_tokens: Some(900),
-        temperature: Some(0.2),
-        tools: Vec::new(),
-        tool_choice: None,
-        include: None,
-        reasoning: None,
-        response_schema: None,
-    };
-
-    let client = ReqwestHttpClient::default();
-    let response = dispatch_request(
-        &client,
-        &backend_config,
-        ChatProtocol::OpenaiChatCompletions,
-        &request,
-    )?;
-    Ok(parse_worker_result_text(&extract_response_text(&response)))
-}
-
-#[async_trait]
-impl TaskWorker for HarnessWorker {
-    async fn execute(&self, task: Task, context: WorkerContext) -> anyhow::Result<WorkerResult> {
-        let config = self.config.clone();
-        let max_steps = self.max_steps;
-        let prompt = task_prompt(
-            &task,
-            &context.memories,
-            &context.skills,
-            &context.allowed_tools,
-            &context.notes,
-            &context.conversation_messages,
-        );
-        tokio::task::spawn_blocking(move || dispatch_harness_task(config, prompt, max_steps))
-            .await?
-    }
-}
-
-fn dispatch_harness_task(
+async fn dispatch_task_prompt(
     config: LlmWorkerConfig,
     prompt: String,
-    max_steps: usize,
 ) -> anyhow::Result<WorkerResult> {
-    let backend_config = BackendConfig {
-        base_url: config.base_url,
-        auth_token: config.api_key,
-        request_layer: Some(BackendRequestLayer::ChatCompletions),
-        headers: BTreeMap::new(),
-        no_streaming: true,
-        timeout_ms: Some(config.timeout_ms),
-    };
-    let client = ReqwestHttpClient::default();
-    let mut messages = vec![
-        CoreMessage {
-            role: CoreRole::System,
-            content: vec![CoreContent::Text {
-                text: harness_system_prompt(),
-            }],
-        },
-        CoreMessage {
-            role: CoreRole::User,
-            content: vec![CoreContent::Text { text: prompt }],
-        },
-    ];
-    let mut executor = ProductToolExecutor::default();
-    let mut final_text = String::new();
+    let provider = deepseek::client(config.api_key);
+    let request = ChatRequest::builder(config.model, 900)
+        .message(Message::System("You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible. Return only JSON with this shape: {\"status\":\"completed\",\"summary\":\"...\",\"memory_candidates\":[\"...\"],\"artifacts\":[{\"name\":\"...\",\"artifact_type\":\"file|url|note\",\"uri\":\"...\",\"summary\":\"...\"}],\"follow_up_tasks\":[{\"title\":\"...\",\"description\":\"...\",\"priority\":0,\"requested_skills\":[\"...\"]}]} or {\"status\":\"blocked\",\"reason\":\"...\"}. Use blocked when you cannot truly complete the task from the provided context and need user input. Put only durable preferences, pitfalls, project conventions, or reusable task learnings in memory_candidates. Put durable outputs or references in artifacts. Use follow_up_tasks only for concrete one-off work that should be queued after this task succeeds.".to_owned()))
+        .message(Message::User(vec![RequestContent::Text(prompt)]))
+        .temperature(0.2)
+        .build();
+    let response = provider.chat(&request).await?;
 
-    run_tool_loop(
-        &mut messages,
-        max_steps,
-        |round_messages| {
-            let request = CoreRequest {
-                model: config.model.clone(),
-                messages: round_messages.to_vec(),
-                stream: false,
-                max_tokens: Some(1_200),
-                temperature: Some(0.2),
-                tools: product_tool_definitions(),
-                tool_choice: Some(CoreToolChoice::Mode(CoreToolChoiceMode::Auto)),
-                include: None,
-                reasoning: None,
-                response_schema: None,
-            };
-            let response = dispatch_request(
-                &client,
-                &backend_config,
-                ChatProtocol::OpenaiChatCompletions,
-                &request,
-            )?;
-            final_text = extract_response_text(&response);
-            Ok::<RoundOutcome, anyhow::Error>(round_outcome_from_response(&response))
-        },
-        |call: &AccumulatedToolCall| {
-            Ok::<ToolExecutionResult, anyhow::Error>(executor.execute(call))
-        },
-        NoopEventSink,
-        || anyhow::anyhow!("harness worker reached max tool-loop steps"),
-    )?;
-
-    if let Some(result) = executor.into_result() {
-        return Ok(result);
-    }
-
-    Ok(parse_worker_result_text(&final_text))
-}
-
-fn round_outcome_from_response(response: &CoreResponse) -> RoundOutcome {
-    let tool_calls = response
-        .message
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            CoreContent::ToolCall {
-                call_id,
-                name,
-                arguments,
-                thought,
-            } => Some(AccumulatedToolCall {
-                id: call_id.clone(),
-                name: name.clone(),
-                args: arguments.clone(),
-                raw_arguments_text: None,
-                argument_parse_error: None,
-                thought: thought.clone(),
-            }),
-            _ => None,
-        })
-        .collect();
-
-    RoundOutcome {
-        tool_calls,
-        final_done: None,
-    }
-}
-
-fn harness_system_prompt() -> String {
-    "You are a worker agent inside Persistent Agent. Use the provided tools to finish exactly one task attempt. Call complete_task when the task is done, block_task when user input is required, remember for durable reusable lessons, record_artifact for durable outputs or references, and create_follow_up_task for concrete follow-up work. Do not claim completion in plain text without calling complete_task.".to_owned()
-}
-
-fn product_tool_definitions() -> Vec<CoreToolDefinition> {
-    vec![
-        CoreToolDefinition {
-            name: "complete_task".to_owned(),
-            description: Some("Finish the task with a concise verified summary.".to_owned()),
-            parameters: json_schema_object(
-                &[("summary", "string", "Outcome and verification summary.")],
-                &["summary"],
-            ),
-        },
-        CoreToolDefinition {
-            name: "block_task".to_owned(),
-            description: Some(
-                "Stop the task because user input or missing context is required.".to_owned(),
-            ),
-            parameters: json_schema_object(
-                &[(
-                    "reason",
-                    "string",
-                    "Specific question or missing context for the user.",
-                )],
-                &["reason"],
-            ),
-        },
-        CoreToolDefinition {
-            name: "remember".to_owned(),
-            description: Some("Propose a durable memory candidate for future tasks.".to_owned()),
-            parameters: json_schema_object(
-                &[(
-                    "content",
-                    "string",
-                    "Reusable preference, pitfall, convention, or lesson.",
-                )],
-                &["content"],
-            ),
-        },
-        CoreToolDefinition {
-            name: "record_artifact".to_owned(),
-            description: Some("Record durable output metadata produced by the task.".to_owned()),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "artifact_type": { "type": "string", "description": "file, url, note, or another concise type" },
-                    "uri": { "type": "string" },
-                    "summary": { "type": "string" }
-                },
-                "required": ["name", "artifact_type", "uri"],
-                "additionalProperties": false
-            }),
-        },
-        CoreToolDefinition {
-            name: "create_follow_up_task".to_owned(),
-            description: Some(
-                "Queue a concrete one-off follow-up task after this task succeeds.".to_owned(),
-            ),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string" },
-                    "description": { "type": "string" },
-                    "priority": { "type": "integer" },
-                    "requested_skills": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["title"],
-                "additionalProperties": false
-            }),
-        },
-    ]
-}
-
-fn json_schema_object(properties: &[(&str, &str, &str)], required: &[&str]) -> serde_json::Value {
-    let properties = properties
-        .iter()
-        .map(|(name, value_type, description)| {
-            (
-                (*name).to_owned(),
-                json!({ "type": value_type, "description": description }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Default)]
-struct ProductToolExecutor {
-    summary: Option<String>,
-    blocked_reason: Option<String>,
-    memory_candidates: Vec<String>,
-    artifacts: Vec<WorkerArtifact>,
-    follow_up_tasks: Vec<WorkerFollowUpTask>,
-}
-
-struct NoopEventSink;
-
-impl EventSink<anyhow::Error> for NoopEventSink {
-    fn emit(&mut self, _event: &ToolLoopEvent) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-}
-
-impl ProductToolExecutor {
-    fn execute(&mut self, call: &AccumulatedToolCall) -> ToolExecutionResult {
-        let output = match call.name.as_str() {
-            "complete_task" => {
-                self.summary = string_arg(&call.args, "summary");
-                json!({ "ok": self.summary.is_some() })
-            }
-            "block_task" => {
-                self.blocked_reason = string_arg(&call.args, "reason");
-                json!({ "ok": self.blocked_reason.is_some() })
-            }
-            "remember" => {
-                if let Some(content) = string_arg(&call.args, "content") {
-                    self.memory_candidates.push(content);
-                    json!({ "ok": true })
-                } else {
-                    json!({ "ok": false, "error": "content is required" })
-                }
-            }
-            "record_artifact" => match worker_artifact_from_args(&call.args) {
-                Some(artifact) => {
-                    self.artifacts.push(artifact);
-                    json!({ "ok": true })
-                }
-                None => {
-                    json!({ "ok": false, "error": "name, artifact_type, and uri are required" })
-                }
-            },
-            "create_follow_up_task" => match worker_follow_up_from_args(&call.args) {
-                Some(task) => {
-                    self.follow_up_tasks.push(task);
-                    json!({ "ok": true })
-                }
-                None => json!({ "ok": false, "error": "title is required" }),
-            },
-            _ => json!({ "ok": false, "error": format!("unknown tool '{}'", call.name) }),
-        };
-        let is_error = output
-            .get("ok")
-            .and_then(|value| value.as_bool())
-            .map(|ok| !ok);
-
-        ToolExecutionResult {
-            call_id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: call.args.clone(),
-            arguments_text: call.raw_arguments_text.clone(),
-            arguments_error: call.argument_parse_error.clone(),
-            output,
-            is_error,
-        }
-    }
-
-    fn into_result(self) -> Option<WorkerResult> {
-        if let Some(reason) = self.blocked_reason {
-            return Some(WorkerResult::Blocked { reason });
-        }
-
-        self.summary.map(|summary| WorkerResult::Completed {
-            summary,
-            memory_candidates: self.memory_candidates,
-            artifacts: self.artifacts,
-            follow_up_tasks: self.follow_up_tasks,
-        })
-    }
-}
-
-fn string_arg(args: &serde_json::Value, name: &str) -> Option<String> {
-    args.get(name)
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn worker_artifact_from_args(args: &serde_json::Value) -> Option<WorkerArtifact> {
-    Some(WorkerArtifact {
-        name: string_arg(args, "name")?,
-        artifact_type: string_arg(args, "artifact_type")?,
-        uri: string_arg(args, "uri")?,
-        summary: string_arg(args, "summary"),
-    })
-}
-
-fn worker_follow_up_from_args(args: &serde_json::Value) -> Option<WorkerFollowUpTask> {
-    let requested_skills = args
-        .get("requested_skills")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Some(WorkerFollowUpTask {
-        title: string_arg(args, "title")?,
-        description: string_arg(args, "description").unwrap_or_default(),
-        priority: args
-            .get("priority")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0),
-        requested_skills,
-    })
+    Ok(parse_worker_result_text(&response.text()))
 }
 
 fn task_prompt(
@@ -1302,30 +896,6 @@ fn memory_candidate_contents(
     }
 
     cleaned
-}
-
-fn extract_response_text(response: &CoreResponse) -> String {
-    let text = response
-        .message
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            CoreContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned();
-
-    if text.is_empty() {
-        format!(
-            "LLM worker returned no text. Finish reason: {}. Usage: {} total tokens.",
-            response.finish_reason, response.usage.total_tokens
-        )
-    } else {
-        text
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1634,25 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_text_from_core_response() {
-        let response = CoreResponse {
-            id: "r1".to_owned(),
-            model: "deepseek-chat".to_owned(),
-            message: CoreMessage {
-                role: CoreRole::Assistant,
-                content: vec![CoreContent::Text {
-                    text: "done".to_owned(),
-                }],
-            },
-            usage: Default::default(),
-            finish_reason: "stop".to_owned(),
-            reasoning_details: None,
-        };
-
-        assert_eq!(extract_response_text(&response), "done");
-    }
-
-    #[test]
     fn parses_structured_completed_worker_result() {
         let result = parse_worker_result_text(
             r#"{"status":"completed","summary":"Updated the README and ran tests."}"#,
@@ -1721,74 +1272,6 @@ mod tests {
                         requested_skills: Vec::new(),
                     },
                 ]
-        ));
-    }
-
-    #[test]
-    fn product_tool_executor_builds_worker_result() {
-        let mut executor = ProductToolExecutor::default();
-        let calls = vec![
-            AccumulatedToolCall {
-                id: "call_memory".to_owned(),
-                name: "remember".to_owned(),
-                args: json!({ "content": "Prefer cargo test --workspace." }),
-                raw_arguments_text: None,
-                argument_parse_error: None,
-                thought: None,
-            },
-            AccumulatedToolCall {
-                id: "call_artifact".to_owned(),
-                name: "record_artifact".to_owned(),
-                args: json!({
-                    "name": "report.md",
-                    "artifact_type": "file",
-                    "uri": "workspace://report.md",
-                    "summary": "Run report"
-                }),
-                raw_arguments_text: None,
-                argument_parse_error: None,
-                thought: None,
-            },
-            AccumulatedToolCall {
-                id: "call_followup".to_owned(),
-                name: "create_follow_up_task".to_owned(),
-                args: json!({
-                    "title": "Run regression tests",
-                    "description": "Validate the fix",
-                    "priority": 2,
-                    "requested_skills": ["testing"]
-                }),
-                raw_arguments_text: None,
-                argument_parse_error: None,
-                thought: None,
-            },
-            AccumulatedToolCall {
-                id: "call_complete".to_owned(),
-                name: "complete_task".to_owned(),
-                args: json!({ "summary": "Finished through the harness tool loop." }),
-                raw_arguments_text: None,
-                argument_parse_error: None,
-                thought: None,
-            },
-        ];
-
-        for call in &calls {
-            let result = executor.execute(call);
-            assert_eq!(result.is_error, Some(false));
-        }
-
-        assert!(matches!(
-            executor.into_result(),
-            Some(WorkerResult::Completed {
-                summary,
-                memory_candidates,
-                artifacts,
-                follow_up_tasks,
-            }) if summary == "Finished through the harness tool loop."
-                && memory_candidates == vec!["Prefer cargo test --workspace.".to_owned()]
-                && artifacts.len() == 1
-                && follow_up_tasks.len() == 1
-                && follow_up_tasks[0].requested_skills == vec!["testing".to_owned()]
         ));
     }
 
