@@ -1154,6 +1154,7 @@ impl MainAgent {
         let context = MainAgentPlanContext {
             user_message: content.to_owned(),
             task_pool_summary: self.summarize_task_pool().await?,
+            task_snapshot: self.db.list_tasks().await?,
             recent_messages: self
                 .db
                 .list_conversation_messages(conversation.id, 8)
@@ -1276,10 +1277,24 @@ impl MainAgent {
             ));
         }
 
-        let matches = self
-            .db
-            .list_tasks()
-            .await?
+        let tasks = self.db.list_tasks().await?;
+        if let Some(status) = task_selector_status(&needle) {
+            let matches = tasks
+                .iter()
+                .filter(|task| task.status == status)
+                .cloned()
+                .collect::<Vec<_>>();
+            return match matches.as_slice() {
+                [task] => Ok(Ok(task.clone())),
+                [] => Ok(Err(format!("No {status} task is available."))),
+                _ => Ok(Err(format!(
+                    "Found {} {status} tasks. Please use a title fragment or task id.",
+                    matches.len()
+                ))),
+            };
+        }
+
+        let matches = tasks
             .into_iter()
             .filter(|task| {
                 task.id.to_string().starts_with(&needle)
@@ -1405,6 +1420,7 @@ pub trait MainAgentAdvisor: Send + Sync {
 pub struct MainAgentPlanContext {
     pub user_message: String,
     pub task_pool_summary: TaskPoolSummary,
+    pub task_snapshot: Vec<Task>,
     pub recent_messages: Vec<ConversationMessage>,
 }
 
@@ -3907,9 +3923,10 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
+        format_planner_task_snapshot(&context.task_snapshot),
         format_advisor_recent_messages(&context.recent_messages),
     )
 }
@@ -3956,6 +3973,35 @@ fn format_advisor_changed_tasks(tasks: &[Task]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_planner_task_snapshot(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "none".to_owned();
+    }
+
+    let mut lines = Vec::new();
+    for task in tasks.iter().take(20) {
+        let blocked = task
+            .blocked_reason
+            .as_deref()
+            .map(|reason| format!(" blocked_reason={}", bounded_preview(reason, 120)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- id={} title={} status={} type={} priority={} queue={}{}",
+            task.id.to_string().chars().take(8).collect::<String>(),
+            bounded_preview(&task.title, 120),
+            task.status,
+            task.task_type,
+            task.priority,
+            task.queue_position,
+            blocked
+        ));
+    }
+    if tasks.len() > 20 {
+        lines.push(format!("- ... and {} more", tasks.len() - 20));
+    }
+    lines.join("\n")
 }
 
 fn format_advisor_summary(summary: &TaskPoolSummary) -> String {
@@ -4011,6 +4057,23 @@ fn bounded_preview(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
+}
+
+fn task_selector_status(selector: &str) -> Option<TaskStatus> {
+    let selector = selector.trim();
+    match selector {
+        "blocked"
+        | "blocked task"
+        | "waiting"
+        | "waiting task"
+        | "waiting for user"
+        | "waiting for user task" => Some(TaskStatus::WaitingForUser),
+        "running" | "running task" => Some(TaskStatus::Running),
+        "queued" | "queued task" | "next task" => Some(TaskStatus::Queued),
+        "paused" | "paused task" => Some(TaskStatus::Paused),
+        "failed" | "failed task" => Some(TaskStatus::Failed),
+        _ => None,
+    }
 }
 
 fn is_create_request(normalized: &str) -> bool {
@@ -5054,11 +5117,19 @@ fn parse_reply_to_task_intent(content: &str, normalized: &str) -> Option<MainAge
         normalized,
         &[
             "reply to task",
+            "reply to blocked task",
+            "reply to waiting task",
             "reply for task",
+            "reply for blocked task",
+            "reply for waiting task",
             "answer task",
             "answer for task",
+            "answer blocked task",
+            "answer waiting task",
             "respond to task",
             "respond for task",
+            "respond to blocked task",
+            "respond to waiting task",
             "task reply",
         ],
     ) {
@@ -5149,12 +5220,14 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
 fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
     for separator in ["\u{ff1a}", ":", "\n"] {
         if let Some((head, tail)) = content.split_once(separator) {
-            let selector = extract_task_selector(
-                head,
-                &[
-                    "reply", "answer", "respond", "task", "to", "for", "with", "message",
-                ],
-            );
+            let selector = semantic_task_selector(head).unwrap_or_else(|| {
+                extract_task_selector(
+                    head,
+                    &[
+                        "reply", "answer", "respond", "task", "to", "for", "with", "message",
+                    ],
+                )
+            });
             let content = tail.trim();
             if !selector.is_empty() && !content.is_empty() {
                 return Some((selector, content.to_owned()));
@@ -5163,6 +5236,31 @@ fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+fn semantic_task_selector(value: &str) -> Option<String> {
+    let normalized = value.to_lowercase();
+    if contains_any(
+        &normalized,
+        &[
+            "blocked task",
+            "blocked",
+            "waiting task",
+            "waiting for user",
+        ],
+    ) {
+        Some("blocked".to_owned())
+    } else if contains_any(&normalized, &["running task", "running"]) {
+        Some("running".to_owned())
+    } else if contains_any(&normalized, &["queued task", "queued", "next task"]) {
+        Some("queued".to_owned())
+    } else if contains_any(&normalized, &["paused task", "paused"]) {
+        Some("paused".to_owned())
+    } else if contains_any(&normalized, &["failed task", "failed"]) {
+        Some("failed".to_owned())
+    } else {
+        None
+    }
 }
 
 fn split_clarification_selector_and_question(content: &str) -> Option<(String, String)> {
@@ -6267,6 +6365,13 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_intent("reply to blocked task: use production"),
+            MainAgentIntent::ReplyToTask {
+                selector: "blocked".to_owned(),
+                content: "use production".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent(
                 "answer for task Check release: the repo is oh-my-harness/Persistent-Agent"
             ),
@@ -6650,7 +6755,10 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Paused task"));
-        assert_eq!(contexts.lock().expect("planner contexts lock").len(), 1);
+        let captured = contexts.lock().expect("planner contexts lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].task_snapshot.len(), 1);
+        assert_eq!(captured[0].task_snapshot[0].title, "Watch GitHub issues");
 
         Ok(())
     }
@@ -8228,6 +8336,44 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "reply_to_task")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_reply_to_the_only_blocked_task() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .request_user_clarification(task.id, "Which environment?")
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "reply to blocked task: use staging first".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 20).await?;
+
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "user" && message.content == "use staging first")
         );
 
         Ok(())
