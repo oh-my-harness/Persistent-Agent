@@ -477,17 +477,63 @@ impl MainAgent {
             let dependency_task = self.db.get_task(dependency.depends_on_task_id).await?;
             dependency_states.push(dependency_task);
         }
+        let resource_lock_conflicts = self.resource_lock_conflicts(&task).await?;
 
         self.db
             .record_action(
                 Some(id),
                 "main_agent",
                 "explain_task_state",
-                serde_json::json!({ "status": task.status }),
+                serde_json::json!({
+                    "status": task.status,
+                    "dependency_count": dependency_states.len(),
+                    "resource_lock_conflict_count": resource_lock_conflicts.len(),
+                }),
             )
             .await?;
 
-        Ok(format_task_explanation(&task, &dependency_states))
+        Ok(format_task_explanation(
+            &task,
+            &dependency_states,
+            &resource_lock_conflicts,
+        ))
+    }
+
+    async fn resource_lock_conflicts(
+        &self,
+        task: &Task,
+    ) -> anyhow::Result<Vec<ResourceLockConflict>> {
+        let candidate_locks = self.db.list_task_resource_locks(task.id).await?;
+        let exclusive_resources = candidate_locks
+            .iter()
+            .filter(|lock| lock.lock_mode == "exclusive")
+            .map(|lock| lock.resource_key.as_str())
+            .collect::<Vec<_>>();
+        if exclusive_resources.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conflicts = Vec::new();
+        for running_task in
+            self.db.list_tasks().await?.into_iter().filter(|candidate| {
+                candidate.status == TaskStatus::Running && candidate.id != task.id
+            })
+        {
+            for lock in self.db.list_task_resource_locks(running_task.id).await? {
+                if lock.lock_mode == "exclusive"
+                    && exclusive_resources
+                        .iter()
+                        .any(|resource| *resource == lock.resource_key)
+                {
+                    conflicts.push(ResourceLockConflict {
+                        resource_key: lock.resource_key,
+                        running_task: running_task.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(conflicts)
     }
 
     pub async fn list_task_artifacts(&self, id: TaskId) -> anyhow::Result<String> {
@@ -1543,6 +1589,12 @@ pub struct MainAgentPlanContext {
     pub task_pool_summary: TaskPoolSummary,
     pub task_snapshot: Vec<Task>,
     pub recent_messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceLockConflict {
+    resource_key: String,
+    running_task: Task,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -5339,7 +5391,11 @@ fn format_task_pool_explanation(tasks: &[Task]) -> String {
     lines.join("\n")
 }
 
-fn format_task_explanation(task: &Task, dependencies: &[Task]) -> String {
+fn format_task_explanation(
+    task: &Task,
+    dependencies: &[Task],
+    resource_lock_conflicts: &[ResourceLockConflict],
+) -> String {
     let mut lines = vec![format!(
         "Task '{}' is currently {}.",
         task.title, task.status
@@ -5356,16 +5412,35 @@ fn format_task_explanation(task: &Task, dependencies: &[Task]) -> String {
                     )
                 })
                 .collect::<Vec<_>>();
-            if unsatisfied.is_empty() {
+            if unsatisfied.is_empty() && resource_lock_conflicts.is_empty() {
                 lines.push("It is queued and eligible for the scheduler once it reaches the front of priority and queue order.".to_owned());
             } else {
-                lines.push(format!(
-                    "It is queued but blocked by {} unfinished dependenc{}:",
-                    unsatisfied.len(),
-                    if unsatisfied.len() == 1 { "y" } else { "ies" }
-                ));
-                for dependency in unsatisfied {
-                    lines.push(format!("- '{}' is {}", dependency.title, dependency.status));
+                if !unsatisfied.is_empty() {
+                    lines.push(format!(
+                        "It is queued but blocked by {} unfinished dependenc{}:",
+                        unsatisfied.len(),
+                        if unsatisfied.len() == 1 { "y" } else { "ies" }
+                    ));
+                    for dependency in unsatisfied {
+                        lines.push(format!("- '{}' is {}", dependency.title, dependency.status));
+                    }
+                }
+                if !resource_lock_conflicts.is_empty() {
+                    lines.push(format!(
+                        "It is also blocked by {} active resource lock conflict{}:",
+                        resource_lock_conflicts.len(),
+                        if resource_lock_conflicts.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
+                    for conflict in resource_lock_conflicts {
+                        lines.push(format!(
+                            "- '{}' is held by running task '{}'.",
+                            conflict.resource_key, conflict.running_task.title
+                        ));
+                    }
                 }
             }
         }
@@ -5409,6 +5484,12 @@ fn format_task_explanation(task: &Task, dependencies: &[Task]) -> String {
 
     if !dependencies.is_empty() {
         lines.push(format!("Dependencies: {}.", dependencies.len()));
+    }
+    if !resource_lock_conflicts.is_empty() {
+        lines.push(format!(
+            "Resource lock conflicts: {}.",
+            resource_lock_conflicts.len()
+        ));
     }
 
     lines.join("\n")
@@ -9126,6 +9207,74 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "explain_task_state")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_explains_resource_lock_conflicts() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let running = agent
+            .create_task(CreateTask {
+                title: "Fix repository issue".to_owned(),
+                description: "Work in the repository".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let blocked = agent
+            .create_task(CreateTask {
+                title: "Update repository docs".to_owned(),
+                description: "Also needs the repository".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 10,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .add_task_resource_lock(running.id, "repo:oh-my-harness/Persistent-Agent")
+            .await?;
+        agent
+            .add_task_resource_lock(blocked.id, "repo:oh-my-harness/Persistent-Agent")
+            .await?;
+        db.set_task_status(running.id, TaskStatus::Running, "test", None)
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "why is task Update repository docs not running?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(blocked.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("resource lock conflict")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("repo:oh-my-harness/Persistent-Agent")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Fix repository issue")
+        );
+        assert!(actions.iter().any(|action| {
+            action.action_type == "explain_task_state"
+                && action.details["resource_lock_conflict_count"] == 1
+        }));
 
         Ok(())
     }
