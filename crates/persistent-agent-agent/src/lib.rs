@@ -1,4 +1,4 @@
-use std::{env, process::Command};
+use std::{env, fs, path::Path, process::Command};
 
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
@@ -395,6 +395,62 @@ impl MainAgent {
         ))
     }
 
+    pub async fn inspect_workspace_file(&self, relative_path: &str) -> anyhow::Result<String> {
+        let cwd = env::current_dir()?;
+        let path_text = clean_workspace_path(relative_path);
+        if path_text.is_empty() {
+            anyhow::bail!("workspace file path cannot be empty");
+        }
+
+        let requested_path = Path::new(&path_text);
+        if requested_path.is_absolute() {
+            anyhow::bail!("workspace file path must be relative");
+        }
+
+        let workspace_root = cwd.canonicalize()?;
+        let file_path = cwd.join(requested_path);
+        let canonical_file_path = file_path.canonicalize()?;
+        if !canonical_file_path.starts_with(&workspace_root) {
+            anyhow::bail!("workspace file path must stay inside the current workspace");
+        }
+
+        let metadata = fs::metadata(&canonical_file_path)?;
+        if !metadata.is_file() {
+            anyhow::bail!("workspace path is not a file");
+        }
+
+        const MAX_FILE_PREVIEW_BYTES: usize = 8 * 1024;
+        let bytes = fs::read(&canonical_file_path)?;
+        let truncated = bytes.len() > MAX_FILE_PREVIEW_BYTES;
+        let preview_len = bytes.len().min(MAX_FILE_PREVIEW_BYTES);
+        let preview = String::from_utf8_lossy(&bytes[..preview_len]);
+
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_workspace_file",
+                serde_json::json!({
+                    "path": path_text,
+                    "bytes": bytes.len(),
+                    "preview_bytes": preview_len,
+                    "truncated": truncated,
+                }),
+            )
+            .await?;
+
+        let truncation_note = if truncated { " (truncated)" } else { "" };
+
+        Ok(format!(
+            "File: {}\nBytes shown: {} of {}{}\n{}",
+            path_text,
+            preview_len,
+            bytes.len(),
+            truncation_note,
+            preview
+        ))
+    }
+
     pub async fn approve_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
         self.db
             .set_memory_status(id, MemoryStatus::Approved, "main_agent")
@@ -702,6 +758,9 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::InspectWorkspace => self.inspect_workspace_status().await?,
+            MainAgentIntent::InspectWorkspaceFile { path } => {
+                self.inspect_workspace_file(&path).await?
+            }
             MainAgentIntent::ApproveMemory { selector } => match self.find_memory(&selector).await?
             {
                 Ok(memory) => {
@@ -910,6 +969,9 @@ enum MainAgentIntent {
         selector: String,
     },
     InspectWorkspace,
+    InspectWorkspaceFile {
+        path: String,
+    },
     ApproveMemory {
         selector: String,
     },
@@ -931,6 +993,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(intent) = parse_split_intent(trimmed, &normalized) {
         return intent;
+    }
+
+    if let Some(path) = extract_workspace_file_inspection_path(trimmed, &normalized) {
+        return MainAgentIntent::InspectWorkspaceFile { path };
     }
 
     if is_workspace_inspection_request(&normalized) {
@@ -1297,6 +1363,38 @@ fn is_workspace_inspection_request(normalized: &str) -> bool {
             "\u{68c0}\u{67e5}\u{9879}\u{76ee}",
         ],
     ) && !is_create_request(normalized)
+}
+
+fn extract_workspace_file_inspection_path(content: &str, normalized: &str) -> Option<String> {
+    for marker in [
+        "read file ",
+        "show file ",
+        "inspect file ",
+        "open file ",
+        "cat ",
+        "\u{8bfb}\u{53d6}\u{6587}\u{4ef6}",
+        "\u{67e5}\u{770b}\u{6587}\u{4ef6}",
+        "\u{68c0}\u{67e5}\u{6587}\u{4ef6}",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            let path = clean_workspace_path(&content[index + marker.len()..]);
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_workspace_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches([':', '\u{ff1a}'])
+        .trim()
+        .trim_matches(['`', '"', '\''])
+        .trim()
+        .to_owned()
 }
 
 fn format_task_list(tasks: &[Task]) -> String {
@@ -2363,6 +2461,18 @@ mod tests {
             parse_intent("git status"),
             MainAgentIntent::InspectWorkspace
         );
+        assert_eq!(
+            parse_intent("read file README.md"),
+            MainAgentIntent::InspectWorkspaceFile {
+                path: "README.md".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("\u{67e5}\u{770b}\u{6587}\u{4ef6}\u{ff1a}Cargo.toml"),
+            MainAgentIntent::InspectWorkspaceFile {
+                path: "Cargo.toml".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -3141,6 +3251,38 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "inspect_workspace_status")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_read_workspace_file_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "read file Cargo.toml".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("File: Cargo.toml")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("persistent-agent")
+        );
+        assert_eq!(response.changed_tasks.len(), 0);
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "inspect_workspace_file" && action.details["path"] == "Cargo.toml"
+        }));
 
         Ok(())
     }

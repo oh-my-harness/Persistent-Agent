@@ -217,7 +217,7 @@ It should:
 - mark the task outcome;
 - review memory candidates.
 
-The main agent may inspect local state, such as repository files or git status, when planning or clarifying tasks. The first implemented local operation is read-only workspace inspection: it reports the process working directory and `git status --short --branch`, then records an `inspect_workspace_status` action. Substantial execution, code changes, long-running operations, and risky local actions should be delegated to worker agents.
+The main agent may inspect local state, such as repository files or git status, when planning or clarifying tasks. The first implemented local operations are read-only: workspace status inspection reports the process working directory and `git status --short --branch`, while workspace file inspection previews a relative file inside the current workspace with an output cap. They record `inspect_workspace_status` and `inspect_workspace_file` actions. Substantial execution, code changes, long-running operations, and risky local actions should be delegated to worker agents.
 
 Task mutations should flow through task-management tools. The main agent should not update database records through hidden side effects.
 
@@ -271,6 +271,7 @@ Recommended main-agent tools:
 - `list_tasks`;
 - `summarize_task_pool`;
 - `inspect_workspace_status`;
+- `inspect_workspace_file`;
 - `request_user_clarification`.
 
 These tools should write action records so the UI can explain when a task changed because of user instruction, scheduler policy, or main-agent planning.
