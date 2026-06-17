@@ -1521,7 +1521,13 @@ impl Db {
         let description = input.description.unwrap_or(current.description);
         let trigger_rules = input.trigger_rules.unwrap_or(current.trigger_rules);
         let tool_subset = input.tool_subset.unwrap_or(current.tool_subset);
-        let resource_path = input.resource_path.or(current.resource_path);
+        let resource_path = match input.resource_path {
+            Some(resource_path) => resource_path.and_then(|path| {
+                let path = path.trim().to_owned();
+                (!path.is_empty()).then_some(path)
+            }),
+            None => current.resource_path,
+        };
         let now = Utc::now();
 
         sqlx::query(
@@ -1546,7 +1552,7 @@ impl Db {
             None,
             actor,
             "update_skill",
-            json!({ "skill_id": id, "name": name, "trigger_rules": trigger_rules, "tool_subset": tool_subset }),
+            json!({ "skill_id": id, "name": name, "trigger_rules": trigger_rules, "tool_subset": tool_subset, "resource_path": resource_path }),
         )
         .await?;
         self.refresh_all_task_skill_matches(actor).await?;
@@ -2310,12 +2316,25 @@ mod tests {
                     description: Some("GitHub issue work".to_owned()),
                     trigger_rules: Some(vec!["github".to_owned(), "issue".to_owned()]),
                     tool_subset: Some(vec!["github_search".to_owned()]),
-                    resource_path: Some("skills/github".to_owned()),
+                    resource_path: Some(Some("skills/github".to_owned())),
                 },
                 "test",
             )
             .await?;
         let matched = db.get_task(task.id).await?;
+        let cleared = db
+            .update_skill(
+                skill.id,
+                UpdateSkill {
+                    name: None,
+                    description: None,
+                    trigger_rules: None,
+                    tool_subset: None,
+                    resource_path: Some(None),
+                },
+                "test",
+            )
+            .await?;
         let deleted = db.delete_skill(skill.id, "test").await?;
         let unmatched = db.get_task(task.id).await?;
 
@@ -2323,6 +2342,7 @@ mod tests {
         assert_eq!(updated.trigger_rules, vec!["github", "issue"]);
         assert_eq!(updated.tool_subset, vec!["github_search"]);
         assert_eq!(updated.resource_path.as_deref(), Some("skills/github"));
+        assert_eq!(cleared.resource_path, None);
         assert_eq!(matched.matched_skills, vec!["github"]);
         assert_eq!(deleted.id, skill.id);
         assert!(unmatched.matched_skills.is_empty());

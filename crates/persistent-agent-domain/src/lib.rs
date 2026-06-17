@@ -343,5 +343,40 @@ pub struct UpdateSkill {
     pub description: Option<String>,
     pub trigger_rules: Option<Vec<String>>,
     pub tool_subset: Option<Vec<String>>,
-    pub resource_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub resource_path: Option<Option<String>>,
+}
+
+fn deserialize_explicit_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_skill_resource_path_distinguishes_missing_null_and_string() {
+        let missing: UpdateSkill = serde_json::from_value(serde_json::json!({}))
+            .expect("missing resource path should deserialize");
+        let cleared: UpdateSkill = serde_json::from_value(serde_json::json!({
+            "resource_path": null
+        }))
+        .expect("null resource path should deserialize");
+        let updated: UpdateSkill = serde_json::from_value(serde_json::json!({
+            "resource_path": "skills/github"
+        }))
+        .expect("string resource path should deserialize");
+
+        assert_eq!(missing.resource_path, None);
+        assert_eq!(cleared.resource_path, Some(None));
+        assert_eq!(
+            updated.resource_path,
+            Some(Some("skills/github".to_owned()))
+        );
+    }
 }

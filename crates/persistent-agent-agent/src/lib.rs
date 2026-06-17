@@ -2113,8 +2113,15 @@ fn extract_update_skill_definition(
             &["resource path", "resource_path", "resource"],
         ) {
             let value = value.trim().to_owned();
-            if !value.is_empty() {
-                input.resource_path = Some(value);
+            if value.is_empty()
+                || matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "none" | "null" | "clear" | "remove" | "delete"
+                )
+            {
+                input.resource_path = Some(None);
+            } else {
+                input.resource_path = Some(Some(value));
             }
         }
     }
@@ -3984,7 +3991,20 @@ mod tests {
                     description: None,
                     trigger_rules: Some(vec!["cargo".to_owned(), "clippy".to_owned()]),
                     tool_subset: Some(vec!["shell".to_owned()]),
-                    resource_path: Some("skills/rust-v2".to_owned()),
+                    resource_path: Some(Some("skills/rust-v2".to_owned())),
+                },
+            }
+        );
+        assert_eq!(
+            parse_intent("update skill rust; resource none"),
+            MainAgentIntent::UpdateSkillDefinition {
+                selector: "rust".to_owned(),
+                input: UpdateSkill {
+                    name: None,
+                    description: None,
+                    trigger_rules: None,
+                    tool_subset: None,
+                    resource_path: Some(None),
                 },
             }
         );
@@ -4228,6 +4248,22 @@ mod tests {
         assert_eq!(skills[0].trigger_rules, vec!["cargo", "clippy"]);
         assert_eq!(skills[0].tool_subset, vec!["shell"]);
         assert_eq!(skills[0].resource_path.as_deref(), Some("skills/rust-v2"));
+
+        let cleared = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "update skill rust; resource none".to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert!(
+            cleared
+                .assistant_message
+                .content
+                .contains("Updated skill 'rust'")
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].resource_path, None);
 
         let deleted = agent
             .handle_user_message(MainAgentMessageInput {
