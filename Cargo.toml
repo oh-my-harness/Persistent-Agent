@@ -24,12 +24,14 @@ llm-harness-agent = { git = "https://github.com/oh-my-harness/llm-harness-runtim
 llm-harness-loop = { git = "https://github.com/oh-my-harness/llm-harness-runtime.git", package = "llm-harness-loop" }
 llm-harness-runtime = { git = "https://github.com/oh-my-harness/llm-harness-runtime.git", package = "llm-harness-runtime" }
 llm-harness-runtime-sandbox-os = { git = "https://github.com/oh-my-harness/llm-harness-runtime.git", package = "llm-harness-runtime-sandbox-os" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

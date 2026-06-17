@@ -64,9 +64,12 @@ The first harness-backed product tools are:
 - `remember` (wired)
 - `record_artifact` (wired)
 - `create_follow_up_task` (wired)
+- `read_file` / `write_file` / `append_file` / `list_dir` (wired through runtime `ExecutionEnv`)
+- `shell` (wired through runtime `ExecutionEnv`)
+- `http_fetch` (wired for HTTP(S) lookups)
 
-External tools such as shell, browser, git, and GitHub must be added later through the approved
-runtime tool policy and audit path.
+Specialized tools such as browser automation, first-class GitHub issue/PR operations, and richer git
+workflows should be added later through the approved runtime tool policy and audit path.
 
 ## Verification Gates
 

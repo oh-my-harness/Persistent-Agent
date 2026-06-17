@@ -39,7 +39,7 @@ The repository now contains the first executable skeleton:
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek worker execution now runs through `AgentHarness` from the approved `oh-my-harness` framework. The current code uses the runtime v0.2 workspace packages `llm-harness-agent`, `llm-harness-runtime`, and `llm-harness-runtime-sandbox-os` from `oh-my-harness/llm-harness-runtime` so the agent, runtime registry, and sandbox types stay source-compatible.
-- The worker registers product lifecycle tools through runtime `InMemoryToolRegistry`, runs with runtime `OsEnvSandbox`, and calls DeepSeek through the approved `oh-my-harness/llm-api-adapter`.
+- The worker registers product lifecycle tools and basic execution tools through runtime `InMemoryToolRegistry`, runs with runtime `OsEnvSandbox`, and calls DeepSeek through the approved `oh-my-harness/llm-api-adapter`.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Main-agent global action audit API and Web panel for non-task-specific tool calls.
@@ -68,7 +68,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter`. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call.
+When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter`. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, and `http_fetch`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 
@@ -230,7 +230,7 @@ The main agent should not mutate task state through hidden database writes. It s
 
 For substantial task execution, code changes, long-running operations, or risky local actions, the main agent should delegate to a worker agent. For lightweight planning and inspection, it may use local tools directly.
 
-The first local tools are intentionally read-only. Workspace status inspection reports the current working directory and `git status --short --branch`, then records an auditable `inspect_workspace_status` action. Workspace file inspection previews a relative file path inside the current workspace, caps output size, records `inspect_workspace_file` on success, and records `inspect_workspace_file_failed` when policy or filesystem checks reject the request. Broader shell or filesystem operations should be added behind explicit tool contracts and policy checks.
+The main agent's lightweight local inspection tools remain read-oriented and auditable. Worker agents now have explicit execution tools for file reads/writes, directory listing, shell commands, and HTTP(S) fetches. Skill `tool_subset` values control which execution tools are visible; aliases such as `filesystem`, `shell`, `network`, and `github` map to the corresponding worker tools.
 
 ### Worker Agent
 
@@ -245,7 +245,7 @@ A worker agent executes one task attempt. It should:
 - explain blockers clearly,
 - propose memory candidates.
 
-Workers should be replaceable so future implementations can support local tools, remote sandboxes, browser agents, code agents, or specialized domain agents.
+Workers should be replaceable so future implementations can support richer GitHub tools, browser agents, remote sandboxes, code agents, or specialized domain agents.
 
 ## Skill System
 

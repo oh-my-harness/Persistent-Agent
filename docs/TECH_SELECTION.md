@@ -259,6 +259,16 @@ Rules:
 
 Main-agent task-management tools should be separate from worker execution tools.
 
+Worker execution tools currently include:
+
+- `read_file`, `write_file`, `append_file`, and `list_dir` through runtime `ExecutionEnv`;
+- `shell` through runtime `ExecutionEnv`;
+- `http_fetch` for lightweight HTTP(S) lookups.
+
+Skill `tool_subset` values are the worker tool activation policy. Empty subsets expose the basic
+execution tool set; explicit subsets can use exact tool names or aliases such as `filesystem`,
+`shell`, `network`, and `github`.
+
 Recommended main-agent tools:
 
 - `create_task`;

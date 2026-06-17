@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use llm_adapter::deepseek;
 use llm_harness_agent::prelude::{
-    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock, Tool, ToolContext,
-    ToolError, ToolExecutionMode, ToolResult,
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock, ShellOptions, Tool,
+    ToolContext, ToolError, ToolExecutionMode, ToolResult,
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_runtime::{
@@ -16,7 +16,7 @@ use persistent_agent_domain::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -645,13 +645,14 @@ impl TaskWorker for OhMyHarnessWorker {
             &context.notes,
             &context.conversation_messages,
         );
-        dispatch_task_with_harness(config, prompt).await
+        dispatch_task_with_harness(config, prompt, context.allowed_tools).await
     }
 }
 
 async fn dispatch_task_with_harness(
     config: LlmWorkerConfig,
     prompt: String,
+    allowed_tools: Vec<String>,
 ) -> anyhow::Result<WorkerResult> {
     let client = Arc::new(deepseek::client(config.api_key)) as Arc<dyn LlmClient>;
     let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
@@ -673,13 +674,13 @@ async fn dispatch_task_with_harness(
     let mut opts = AgentHarnessOptions::new(config.model);
     opts.max_tokens = 1200;
     opts.system_prompt = Some(HARNESS_WORKER_SYSTEM_PROMPT.to_owned());
-    opts.tools = tool_registry.subset(&[
-        "remember",
-        "record_artifact",
-        "create_follow_up_task",
-        "complete_task",
-        "block_task",
-    ]);
+    let active_tool_names = active_worker_tool_names(&allowed_tools);
+    opts.tools = tool_registry.subset(
+        &active_tool_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
 
     let harness = AgentHarness::new_in_memory(client, sandbox.env(), opts).await;
     let mut events = harness.subscribe();
@@ -704,7 +705,24 @@ async fn dispatch_task_with_harness(
     Ok(state.merge_into_result(result))
 }
 
-const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, or http_fetch when the task requires workspace or network work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+
+const LIFECYCLE_TOOL_NAMES: &[&str] = &[
+    "remember",
+    "record_artifact",
+    "create_follow_up_task",
+    "complete_task",
+    "block_task",
+];
+
+const EXECUTION_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "append_file",
+    "list_dir",
+    "shell",
+    "http_fetch",
+];
 
 #[derive(Debug, Clone, Default)]
 struct HarnessWorkerState {
@@ -753,7 +771,449 @@ fn worker_tool_registry(state: Arc<Mutex<HarnessWorkerState>>) -> Arc<InMemoryTo
     for tool in product_lifecycle_tools(state) {
         registry.register(tool);
     }
+    for tool in execution_tools() {
+        registry.register(tool);
+    }
     registry
+}
+
+fn execution_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(ReadFileTool::new()),
+        Arc::new(WriteFileTool::new(false)),
+        Arc::new(WriteFileTool::new(true)),
+        Arc::new(ListDirTool::new()),
+        Arc::new(ShellTool::new()),
+        Arc::new(HttpFetchTool::new()),
+    ]
+}
+
+fn active_worker_tool_names(allowed_tools: &[String]) -> Vec<String> {
+    let mut names = LIFECYCLE_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+
+    if allowed_tools.is_empty() {
+        extend_unique(&mut names, EXECUTION_TOOL_NAMES);
+        return names;
+    }
+
+    for tool in allowed_tools {
+        match tool.trim().to_ascii_lowercase().as_str() {
+            "read_file" | "read" => extend_unique(&mut names, &["read_file"]),
+            "write_file" | "write" => extend_unique(&mut names, &["write_file"]),
+            "append_file" | "append" => extend_unique(&mut names, &["append_file"]),
+            "list_dir" | "ls" => extend_unique(&mut names, &["list_dir"]),
+            "file" | "files" | "filesystem" | "fs" => {
+                extend_unique(
+                    &mut names,
+                    &["read_file", "write_file", "append_file", "list_dir"],
+                );
+            }
+            "shell" | "bash" | "powershell" | "cmd" => extend_unique(&mut names, &["shell"]),
+            "network" | "net" | "http" | "https" | "web" | "github" | "github_search" => {
+                extend_unique(&mut names, &["http_fetch"]);
+            }
+            known if EXECUTION_TOOL_NAMES.contains(&known) => extend_unique(&mut names, &[known]),
+            _ => {}
+        }
+    }
+
+    names
+}
+
+fn extend_unique(names: &mut Vec<String>, additions: &[&str]) {
+    for addition in additions {
+        if !names.iter().any(|name| name == addition) {
+            names.push((*addition).to_owned());
+        }
+    }
+}
+
+struct ReadFileTool {
+    schema: serde_json::Value,
+}
+
+impl ReadFileTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 20000 }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+}
+
+impl Tool for ReadFileTool {
+    fn name(&self) -> &str {
+        "read_file"
+    }
+
+    fn description(&self) -> &str {
+        "Read a UTF-8 text file from the task workspace. Use relative paths when possible."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let path = required_string(&args, "path")?;
+            let max_chars = bounded_usize(&args, "max_chars", 20_000, 1, 20_000);
+            let text = ctx
+                .env
+                .read_text_file(Path::new(&path), ctx.abort.clone())
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let truncated = truncate_chars(&text, max_chars);
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: truncated.text,
+                }],
+                details: json!({
+                    "path": path,
+                    "bytes": text.len(),
+                    "truncated": truncated.truncated,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+struct WriteFileTool {
+    append: bool,
+    schema: serde_json::Value,
+}
+
+impl WriteFileTool {
+    fn new(append: bool) -> Self {
+        Self {
+            append,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+}
+
+impl Tool for WriteFileTool {
+    fn name(&self) -> &str {
+        if self.append {
+            "append_file"
+        } else {
+            "write_file"
+        }
+    }
+
+    fn description(&self) -> &str {
+        if self.append {
+            "Append UTF-8 text to a file in the task workspace, creating it if needed."
+        } else {
+            "Write UTF-8 text to a file in the task workspace, replacing existing content."
+        }
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let path = required_string(&args, "path")?;
+            let content = required_raw_string(&args, "content")?;
+            let result = if self.append {
+                ctx.env
+                    .append_file(Path::new(&path), content.as_bytes(), ctx.abort.clone())
+                    .await
+            } else {
+                ctx.env
+                    .write_file(Path::new(&path), content.as_bytes(), ctx.abort.clone())
+                    .await
+            };
+            result.map_err(|error| ToolError::Execution(error.to_string()))?;
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("{} {} bytes to {path}", self.name(), content.len()),
+                }],
+                details: json!({
+                    "path": path,
+                    "bytes": content.len(),
+                    "append": self.append,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+struct ListDirTool {
+    schema: serde_json::Value,
+}
+
+impl ListDirTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_entries": { "type": "integer", "minimum": 1, "maximum": 200 }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+}
+
+impl Tool for ListDirTool {
+    fn name(&self) -> &str {
+        "list_dir"
+    }
+
+    fn description(&self) -> &str {
+        "List files and directories in the task workspace."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let path = required_string(&args, "path")?;
+            let max_entries = bounded_usize(&args, "max_entries", 100, 1, 200);
+            let entries = ctx
+                .env
+                .list_dir(Path::new(&path), ctx.abort.clone())
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let mut lines = Vec::new();
+            for entry in entries.iter().take(max_entries) {
+                let kind = if entry.is_dir { "dir" } else { "file" };
+                lines.push(format!("{kind}\t{}\t{}", entry.size, entry.path.display()));
+            }
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: if lines.is_empty() {
+                        "empty directory".to_owned()
+                    } else {
+                        lines.join("\n")
+                    },
+                }],
+                details: json!({
+                    "path": path,
+                    "count": entries.len(),
+                    "truncated": entries.len() > max_entries,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+struct ShellTool {
+    schema: serde_json::Value,
+}
+
+impl ShellTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000 }
+                },
+                "required": ["cmd"]
+            }),
+        }
+    }
+}
+
+impl Tool for ShellTool {
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Run a shell command in the task workspace. Keep commands focused and non-destructive."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let cmd = required_string(&args, "cmd")?;
+            let cwd = args
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(Path::new);
+            let timeout_ms = bounded_u64(&args, "timeout_ms", 30_000, 1_000, 120_000);
+            let output = ctx
+                .env
+                .execute_shell(
+                    &cmd,
+                    ShellOptions {
+                        cwd,
+                        env: Vec::new(),
+                        timeout: Some(Duration::from_millis(timeout_ms)),
+                        abort: ctx.abort.clone(),
+                        on_stdout: None,
+                        on_stderr: None,
+                    },
+                )
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let text = format!(
+                "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+                output.exit_code, output.stdout, output.stderr
+            );
+            let truncated = truncate_chars(&text, 20_000);
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: truncated.text,
+                }],
+                details: json!({
+                    "cmd": cmd,
+                    "exit_code": output.exit_code,
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "truncated": truncated.truncated,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+struct HttpFetchTool {
+    schema: serde_json::Value,
+}
+
+impl HttpFetchTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 30000 }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+}
+
+impl Tool for HttpFetchTool {
+    fn name(&self) -> &str {
+        "http_fetch"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch text from an http or https URL for lightweight web/API lookups."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let url = required_string(&args, "url")?;
+            let parsed = reqwest::Url::parse(&url)
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(ToolError::InvalidArguments(
+                    "url must use http or https".to_owned(),
+                ));
+            }
+            let max_chars = bounded_usize(&args, "max_chars", 20_000, 1, 30_000);
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent("Persistent-Agent/0.1")
+                .build()
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+                .get(parsed)
+                .send()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let truncated = truncate_chars(&text, max_chars);
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: truncated.text,
+                }],
+                details: json!({
+                    "url": url,
+                    "status": status,
+                    "bytes": text.len(),
+                    "truncated": truncated.truncated,
+                }),
+                terminate: false,
+            })
+        })
+    }
 }
 
 struct CompleteTaskTool {
@@ -1098,6 +1558,56 @@ fn required_string(args: &serde_json::Value, field: &str) -> Result<String, Tool
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
+}
+
+fn required_raw_string(args: &serde_json::Value, field: &str) -> Result<String, ToolError> {
+    args.get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
+}
+
+fn bounded_usize(
+    args: &serde_json::Value,
+    field: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> usize {
+    args.get(field)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn bounded_u64(args: &serde_json::Value, field: &str, default: u64, min: u64, max: u64) -> u64 {
+    args.get(field)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+struct TruncatedText {
+    text: String,
+    truncated: bool,
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> TruncatedText {
+    let mut output = String::new();
+    let mut truncated = false;
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        output.push(ch);
+    }
+    TruncatedText {
+        text: output,
+        truncated,
+    }
 }
 
 fn assistant_text_from_messages(messages: &[llm_harness_agent::prelude::AgentMessage]) -> String {
@@ -1629,7 +2139,28 @@ mod tests {
         },
         time::Duration,
     };
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn test_tool_context(env: Arc<dyn llm_harness_agent::prelude::ExecutionEnv>) -> ToolContext {
+        ToolContext {
+            env,
+            abort: CancellationToken::new(),
+            tool_use_id: "test-tool-use".to_owned(),
+            turn_index: 0,
+            assistant_message: Arc::new(llm_harness_agent::prelude::AssistantMessage {
+                content: Vec::new(),
+                stop_reason: None,
+                timestamp: Utc::now(),
+                provider: None,
+                api: None,
+                model: None,
+                usage: None,
+                error_message: None,
+            }),
+            update_tx: tokio::sync::mpsc::channel(1).0,
+        }
+    }
 
     #[test]
     fn scheduler_policy_clamps_capacity_and_lease() {
@@ -1668,13 +2199,8 @@ mod tests {
     async fn harness_worker_registers_product_lifecycle_tools() {
         let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
         let registry = worker_tool_registry(state);
-        let tools = registry.subset(&[
-            "remember",
-            "record_artifact",
-            "create_follow_up_task",
-            "complete_task",
-            "block_task",
-        ]);
+        let active = active_worker_tool_names(&[]);
+        let tools = registry.subset(&active.iter().map(String::as_str).collect::<Vec<_>>());
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
 
         assert_eq!(
@@ -1684,9 +2210,91 @@ mod tests {
                 "record_artifact",
                 "create_follow_up_task",
                 "complete_task",
-                "block_task"
+                "block_task",
+                "read_file",
+                "write_file",
+                "append_file",
+                "list_dir",
+                "shell",
+                "http_fetch"
             ]
         );
+    }
+
+    #[test]
+    fn skill_tool_subset_filters_worker_execution_tools() {
+        let names = active_worker_tool_names(&["filesystem".to_owned(), "github".to_owned()]);
+
+        assert!(names.contains(&"complete_task".to_owned()));
+        assert!(names.contains(&"read_file".to_owned()));
+        assert!(names.contains(&"write_file".to_owned()));
+        assert!(names.contains(&"append_file".to_owned()));
+        assert!(names.contains(&"list_dir".to_owned()));
+        assert!(names.contains(&"http_fetch".to_owned()));
+        assert!(!names.contains(&"shell".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn worker_file_tools_use_runtime_sandbox_env() -> anyhow::Result<()> {
+        let work_dir =
+            std::env::temp_dir().join(format!("persistent-agent-worker-tools-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir)?;
+        let sandbox = OsEnvSandbox::new(SandboxConfig {
+            fs_allowlist: Vec::new(),
+            fs_denylist: Vec::new(),
+            net_allowlist: Vec::new(),
+            resource_limits: ResourceLimits {
+                max_cpus: None,
+                max_memory_mb: None,
+                max_disk_mb: None,
+                timeout: None,
+            },
+            work_dir: Some(work_dir.clone()),
+        });
+        sandbox.start().await?;
+        let ctx = test_tool_context(sandbox.env());
+        let registry = worker_tool_registry(Arc::new(Mutex::new(HarnessWorkerState::default())));
+
+        registry
+            .get("write_file")
+            .expect("write_file")
+            .execute(json!({ "path": "note.txt", "content": "hello" }), &ctx)
+            .await?;
+        registry
+            .get("append_file")
+            .expect("append_file")
+            .execute(json!({ "path": "note.txt", "content": " world" }), &ctx)
+            .await?;
+        let read = registry
+            .get("read_file")
+            .expect("read_file")
+            .execute(json!({ "path": "note.txt" }), &ctx)
+            .await?;
+        let listed = registry
+            .get("list_dir")
+            .expect("list_dir")
+            .execute(json!({ "path": "." }), &ctx)
+            .await?;
+
+        let ContentBlock::Text { text } = &read.content[0] else {
+            panic!("read_file should return text");
+        };
+        assert_eq!(text, "hello world");
+        assert_eq!(listed.details["count"], json!(1));
+
+        std::fs::remove_dir_all(work_dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_fetch_rejects_non_http_urls() {
+        let ctx = test_tool_context(Arc::new(llm_harness_agent::prelude::UnsupportedEnv::new()));
+        let error = HttpFetchTool::new()
+            .execute(json!({ "url": "file:///etc/passwd" }), &ctx)
+            .await
+            .expect_err("file urls should be rejected");
+
+        assert!(error.to_string().contains("http or https"));
     }
 
     #[test]
