@@ -374,6 +374,47 @@ impl Db {
         self.get_task(task.id).await.map(Some)
     }
 
+    pub async fn peek_next_runnable(&self) -> anyhow::Result<Option<Task>> {
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            SELECT * FROM tasks
+            WHERE status = 'queued'
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM task_dependencies
+                JOIN tasks dependency_tasks ON dependency_tasks.id = task_dependencies.depends_on_task_id
+                WHERE task_dependencies.task_id = tasks.id
+                  AND dependency_tasks.status NOT IN ('completed', 'waiting_for_schedule')
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM task_resource_locks candidate_locks
+                JOIN task_resource_locks running_locks
+                  ON running_locks.resource_key = candidate_locks.resource_key
+                 AND running_locks.lock_mode = 'exclusive'
+                JOIN tasks running_tasks ON running_tasks.id = running_locks.task_id
+                WHERE candidate_locks.task_id = tasks.id
+                  AND candidate_locks.lock_mode = 'exclusive'
+                  AND running_tasks.status = 'running'
+                  AND running_tasks.id <> tasks.id
+                  AND (running_tasks.lease_expires_at IS NULL OR running_tasks.lease_expires_at > ?)
+              )
+            ORDER BY priority DESC, queue_position ASC, created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_task).transpose()
+    }
+
     pub async fn heartbeat_task_lease(
         &self,
         id: TaskId,
@@ -2585,6 +2626,66 @@ mod tests {
 
         let claimed_second = db.claim_next_runnable("worker", 60).await?;
         assert_eq!(claimed_second.map(|task| task.id), Some(dependent.id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_runnable_peek_skips_blocked_queued_tasks_without_claiming() -> anyhow::Result<()>
+    {
+        let db = Db::connect("sqlite::memory:").await?;
+        let dependency = db
+            .create_task(
+                CreateTask {
+                    title: "Build package".to_owned(),
+                    description: "Build first".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let dependent = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Should wait for dependency".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 20,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let runnable = db
+            .create_task(
+                CreateTask {
+                    title: "Write notes".to_owned(),
+                    description: "Can run now".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 10,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.add_task_dependency(dependent.id, dependency.id, "test")
+            .await?;
+
+        let peeked = db.peek_next_runnable().await?;
+        let dependent_after_peek = db.get_task(dependent.id).await?;
+        let runnable_after_peek = db.get_task(runnable.id).await?;
+
+        assert_eq!(peeked.map(|task| task.id), Some(runnable.id));
+        assert_eq!(dependent_after_peek.status, TaskStatus::Queued);
+        assert_eq!(runnable_after_peek.status, TaskStatus::Queued);
 
         Ok(())
     }

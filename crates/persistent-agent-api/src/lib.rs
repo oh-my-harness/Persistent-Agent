@@ -530,6 +530,7 @@ async fn run_scheduler_tick(
 struct SchedulerStateResponse {
     running_tasks: Vec<Task>,
     next_queued_task: Option<Task>,
+    next_runnable_task: Option<Task>,
     queued_count: usize,
     waiting_for_user_tasks: Vec<Task>,
     waiting_for_user_count: usize,
@@ -572,6 +573,7 @@ async fn scheduler_state(
             .cloned()
             .collect(),
         next_queued_task: queued_tasks.first().cloned(),
+        next_runnable_task: state.db.peek_next_runnable().await?,
         queued_count: queued_tasks.len(),
         waiting_for_user_count: waiting_for_user_tasks.len(),
         waiting_for_user_tasks,

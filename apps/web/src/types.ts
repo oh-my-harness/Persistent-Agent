@@ -62,6 +62,7 @@ export interface SchedulerTick {
 export interface SchedulerState {
   running_tasks: Task[];
   next_queued_task?: Task | null;
+  next_runnable_task?: Task | null;
   queued_count: number;
   waiting_for_user_tasks: Task[];
   waiting_for_user_count: number;

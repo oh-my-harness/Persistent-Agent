@@ -779,6 +779,7 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
   const running = state?.running_tasks ?? [];
   const primaryRunning = running[0];
   const nextQueued = state?.next_queued_task;
+  const nextRunnable = state?.next_runnable_task;
   const waitingForUser = state?.waiting_for_user_tasks?.[0];
   const policy = state?.policy;
 
@@ -790,9 +791,15 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
         {running.length > 1 && <small>{running.length} running tasks</small>}
       </div>
       <div className="execution-state-item">
-        <span>Next queued</span>
-        <strong>{nextQueued?.title ?? "None"}</strong>
-        <small>{state ? `${state.queued_count} queued` : "Waiting for state"}</small>
+        <span>Next runnable</span>
+        <strong>{nextRunnable?.title ?? "None"}</strong>
+        <small>
+          {state
+            ? nextQueued && nextQueued.id !== nextRunnable?.id
+              ? `${state.queued_count} queued, head blocked`
+              : `${state.queued_count} queued`
+            : "Waiting for state"}
+        </small>
       </div>
       <div className="execution-state-item">
         <span>Needs user</span>
