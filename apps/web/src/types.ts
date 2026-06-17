@@ -54,7 +54,7 @@ export interface SchedulerTick {
   claimed_task?: Task | null;
   outcome:
     | { type: "idle" }
-    | { type: "completed"; summary: string; follow_up_tasks: Task[] }
+    | { type: "completed"; summary: string; follow_up_tasks: Task[]; memory_candidates: Memory[] }
     | { type: "blocked"; reason: string }
     | { type: "failed"; error: string }
     | { type: "retry_scheduled"; error: string; next_attempt: number; max_attempts: number }
@@ -82,6 +82,7 @@ export interface SchedulerPolicy {
 export type AppEvent =
   | { type: "task_changed"; task: Task }
   | { type: "task_attempt_event"; event: TaskAttemptEvent }
+  | { type: "memory_changed"; memory: Memory; action: string }
   | { type: "main_agent_reply"; message: ConversationMessage }
   | { type: "main_agent_action"; action: TaskAction }
   | { type: "scheduler_tick"; tick: SchedulerTick }

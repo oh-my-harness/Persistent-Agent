@@ -689,6 +689,14 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
         tone: workerEventTone(event.event.event_type),
         timestamp,
       };
+    case "memory_changed":
+      return {
+        id: `${timestamp}-memory-${event.memory.id}-${event.action}`,
+        title: `Memory ${event.action}`,
+        detail: event.memory.content,
+        tone: event.action === "deleted" || event.action === "rejected" ? "warning" : "info",
+        timestamp,
+      };
     case "main_agent_reply":
       return {
         id: `${timestamp}-main-agent-${event.message.id}`,
@@ -739,11 +747,13 @@ function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): Timelin
   const recovered = tick.recovered_tasks.length;
   const requeued = tick.requeued_tasks.length;
   const followUps = tick.outcome.type === "completed" ? tick.outcome.follow_up_tasks.length : 0;
+  const memoryCandidates = tick.outcome.type === "completed" ? tick.outcome.memory_candidates.length : 0;
   const taskTitle = tick.claimed_task?.title ?? "No runnable task";
   const suffixParts = [
     recovered > 0 ? `${recovered} expired running task(s) recovered` : "",
     requeued > 0 ? `${requeued} recurring task(s) requeued` : "",
     followUps > 0 ? `${followUps} follow-up task(s) created` : "",
+    memoryCandidates > 0 ? `${memoryCandidates} memory candidate(s) created` : "",
   ].filter(Boolean);
   const suffix = suffixParts.length > 0 ? ` ${suffixParts.join("; ")}.` : "";
 

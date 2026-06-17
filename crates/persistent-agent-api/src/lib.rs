@@ -87,6 +87,7 @@ impl Default for EventBus {
 pub enum AppEvent {
     TaskChanged { task: Task },
     TaskAttemptEvent { event: TaskAttemptEvent },
+    MemoryChanged { memory: Memory, action: String },
     MainAgentReply { message: ConversationMessage },
     MainAgentAction { action: TaskAction },
     SchedulerTick { tick: SchedulerTick },
@@ -553,7 +554,9 @@ async fn emit_scheduler_tick_events(state: &AppState, tick: &SchedulerTick) -> a
     }
 
     if let SchedulerOutcome::Completed {
-        follow_up_tasks, ..
+        follow_up_tasks,
+        memory_candidates,
+        ..
     } = &tick.outcome
     {
         for task in follow_up_tasks {
@@ -562,6 +565,12 @@ async fn emit_scheduler_tick_events(state: &AppState, tick: &SchedulerTick) -> a
                     .events
                     .send(AppEvent::TaskChanged { task: task.clone() });
             }
+        }
+        for memory in memory_candidates {
+            state.events.send(AppEvent::MemoryChanged {
+                memory: memory.clone(),
+                action: "created".to_owned(),
+            });
         }
     }
 
@@ -655,38 +664,54 @@ async fn update_memory(
     Path(id): Path<MemoryId>,
     Json(input): Json<UpdateMemory>,
 ) -> Result<Json<Memory>, ApiError> {
-    Ok(Json(state.db.update_memory(id, input, "main_agent").await?))
+    let memory = state.db.update_memory(id, input, "main_agent").await?;
+    state.events.send(AppEvent::MemoryChanged {
+        memory: memory.clone(),
+        action: "updated".to_owned(),
+    });
+    Ok(Json(memory))
 }
 
 async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<MemoryId>,
 ) -> Result<Json<Memory>, ApiError> {
-    Ok(Json(state.db.delete_memory(id, "main_agent").await?))
+    let memory = state.db.delete_memory(id, "main_agent").await?;
+    state.events.send(AppEvent::MemoryChanged {
+        memory: memory.clone(),
+        action: "deleted".to_owned(),
+    });
+    Ok(Json(memory))
 }
 
 async fn approve_memory(
     State(state): State<AppState>,
     Path(id): Path<MemoryId>,
 ) -> Result<Json<Memory>, ApiError> {
-    Ok(Json(
-        state
-            .db
-            .set_memory_status(id, MemoryStatus::Approved, "main_agent")
-            .await?,
-    ))
+    let memory = state
+        .db
+        .set_memory_status(id, MemoryStatus::Approved, "main_agent")
+        .await?;
+    state.events.send(AppEvent::MemoryChanged {
+        memory: memory.clone(),
+        action: "approved".to_owned(),
+    });
+    Ok(Json(memory))
 }
 
 async fn reject_memory(
     State(state): State<AppState>,
     Path(id): Path<MemoryId>,
 ) -> Result<Json<Memory>, ApiError> {
-    Ok(Json(
-        state
-            .db
-            .set_memory_status(id, MemoryStatus::Rejected, "main_agent")
-            .await?,
-    ))
+    let memory = state
+        .db
+        .set_memory_status(id, MemoryStatus::Rejected, "main_agent")
+        .await?;
+    state.events.send(AppEvent::MemoryChanged {
+        memory: memory.clone(),
+        action: "rejected".to_owned(),
+    });
+    Ok(Json(memory))
 }
 
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<Skill>>, ApiError> {

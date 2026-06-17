@@ -274,13 +274,15 @@ where
                         )
                         .await?;
                 }
+                let mut created_memory_candidates = Vec::new();
                 for candidate in memory_candidate_contents(&task, &summary, &memory_candidates) {
                     let confidence = 0.6;
                     let status = match self.policy.memory_auto_approve_confidence {
                         Some(threshold) if confidence >= threshold => MemoryStatus::Approved,
                         _ => MemoryStatus::Pending,
                     };
-                    self.db
+                    let memory = self
+                        .db
                         .create_memory(
                             CreateMemory {
                                 scope: "task".to_owned(),
@@ -292,6 +294,7 @@ where
                             "worker",
                         )
                         .await?;
+                    created_memory_candidates.push(memory);
                 }
                 let created_follow_up_tasks = self
                     .create_follow_up_tasks(task.id, attempt.id, &follow_up_tasks)
@@ -304,6 +307,7 @@ where
                     outcome: SchedulerOutcome::Completed {
                         summary,
                         follow_up_tasks: created_follow_up_tasks,
+                        memory_candidates: created_memory_candidates,
                     },
                 })
             }
@@ -1161,6 +1165,7 @@ pub enum SchedulerOutcome {
     Completed {
         summary: String,
         follow_up_tasks: Vec<Task>,
+        memory_candidates: Vec<Memory>,
     },
     Blocked {
         reason: String,
@@ -2167,10 +2172,17 @@ mod tests {
         .await?;
         let scheduler = Scheduler::new(db.clone(), MemoryCandidateWorker);
 
-        scheduler.tick().await?;
+        let tick = scheduler.tick().await?;
         let memories = db.list_memories().await?;
 
         assert_eq!(memories.len(), 2);
+        assert!(matches!(
+            tick.outcome,
+            SchedulerOutcome::Completed {
+                ref memory_candidates,
+                ..
+            } if memory_candidates.len() == 2
+        ));
         assert!(
             memories
                 .iter()
