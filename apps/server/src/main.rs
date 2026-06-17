@@ -65,8 +65,11 @@ fn build_worker(llm_config: Option<MainAgentLlmConfig>) -> WorkerBackend {
 fn build_main_agent(db: Db, llm_config: Option<MainAgentLlmConfig>) -> MainAgent {
     match llm_config {
         Some(config) => {
-            tracing::info!(model = %config.model, "using DeepSeek main agent advisor through oh-my-harness AgentHarness");
-            MainAgent::new_with_advisor(db, Arc::new(OhMyHarnessMainAgentAdvisor::new(config)))
+            tracing::info!(model = %config.model, "using DeepSeek main agent planner/advisor through oh-my-harness AgentHarness");
+            let harness_main_agent = Arc::new(OhMyHarnessMainAgentAdvisor::new(config));
+            MainAgent::new(db)
+                .with_advisor(harness_main_agent.clone())
+                .with_planner(harness_main_agent)
         }
         None => {
             tracing::info!("DEEPSEEK_API_KEY not set; using deterministic main agent only");

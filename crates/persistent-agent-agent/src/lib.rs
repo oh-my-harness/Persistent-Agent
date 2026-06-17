@@ -3,10 +3,13 @@ use std::{env, fs, path::Path, process::Command, sync::Arc};
 use async_trait::async_trait;
 use llm_adapter::deepseek;
 use llm_harness_agent::prelude::{
-    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock,
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock, Tool, ToolContext,
+    ToolError, ToolExecutionMode, ToolResult,
 };
 use llm_harness_loop::LlmClient;
-use llm_harness_runtime::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_runtime::{
+    InMemoryToolRegistry, ResourceLimits, Sandbox, SandboxConfig, ToolRegistry,
+};
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
@@ -77,22 +80,33 @@ const ZH_RESULT: &str = "\u{6210}\u{679c}";
 pub struct MainAgent {
     db: Db,
     advisor: Option<Arc<dyn MainAgentAdvisor>>,
+    planner: Option<Arc<dyn MainAgentPlanner>>,
 }
 
 impl MainAgent {
     pub fn new(db: Db) -> Self {
-        Self { db, advisor: None }
+        Self {
+            db,
+            advisor: None,
+            planner: None,
+        }
     }
 
     pub fn new_with_advisor(db: Db, advisor: Arc<dyn MainAgentAdvisor>) -> Self {
         Self {
             db,
             advisor: Some(advisor),
+            planner: None,
         }
     }
 
     pub fn with_advisor(mut self, advisor: Arc<dyn MainAgentAdvisor>) -> Self {
         self.advisor = Some(advisor);
+        self
+    }
+
+    pub fn with_planner(mut self, planner: Arc<dyn MainAgentPlanner>) -> Self {
+        self.planner = Some(planner);
         self
     }
 
@@ -660,7 +674,7 @@ impl MainAgent {
             .add_conversation_message(conversation.id, None, "user", &input.content)
             .await?;
 
-        let intent = parse_intent(&input.content);
+        let intent = self.resolve_intent(&input.content).await?;
         let scheduler_tick_requested = matches!(intent, MainAgentIntent::RunSchedulerTick);
         let mut changed_tasks = Vec::new();
         let deterministic_reply = match intent {
@@ -1060,6 +1074,67 @@ impl MainAgent {
         })
     }
 
+    async fn resolve_intent(&self, content: &str) -> anyhow::Result<MainAgentIntent> {
+        let deterministic_intent = parse_intent(content);
+        if !matches!(deterministic_intent, MainAgentIntent::Help)
+            || is_explicit_help_request(content)
+        {
+            return Ok(deterministic_intent);
+        }
+
+        let Some(planner) = &self.planner else {
+            return Ok(deterministic_intent);
+        };
+        let conversation = self.db.get_or_create_main_conversation().await?;
+        let context = MainAgentPlanContext {
+            user_message: content.to_owned(),
+            task_pool_summary: self.summarize_task_pool().await?,
+            recent_messages: self
+                .db
+                .list_conversation_messages(conversation.id, 8)
+                .await?,
+        };
+
+        match planner.plan(context).await {
+            Ok(Some(plan)) => {
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_planner_intent",
+                        serde_json::json!({ "plan": plan }),
+                    )
+                    .await?;
+                Ok(plan.into_intent())
+            }
+            Ok(None) => {
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_planner_no_intent",
+                        serde_json::json!({ "fallback": true }),
+                    )
+                    .await?;
+                Ok(deterministic_intent)
+            }
+            Err(error) => {
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_planner_failed",
+                        serde_json::json!({
+                            "error": error.to_string(),
+                            "fallback": true,
+                        }),
+                    )
+                    .await?;
+                Ok(deterministic_intent)
+            }
+        }
+    }
+
     async fn maybe_advise_reply(
         &self,
         user_message: &str,
@@ -1261,6 +1336,63 @@ pub trait MainAgentAdvisor: Send + Sync {
     async fn advise(&self, context: MainAgentAdviceContext) -> anyhow::Result<String>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainAgentPlanContext {
+    pub user_message: String,
+    pub task_pool_summary: TaskPoolSummary,
+    pub recent_messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum MainAgentPlan {
+    CreateTask {
+        title: String,
+        description: String,
+        task_type: TaskType,
+        priority: i64,
+        interval_seconds: Option<i64>,
+        requested_skills: Vec<String>,
+    },
+    SplitTasks {
+        titles: Vec<String>,
+    },
+    ListTasks,
+    Summarize,
+    RunSchedulerTick,
+}
+
+impl MainAgentPlan {
+    fn into_intent(self) -> MainAgentIntent {
+        match self {
+            Self::CreateTask {
+                title,
+                description,
+                task_type,
+                priority,
+                interval_seconds,
+                requested_skills,
+            } => MainAgentIntent::CreateTask {
+                title,
+                description,
+                task_type,
+                priority,
+                interval_seconds,
+                requested_skills,
+            },
+            Self::SplitTasks { titles } => MainAgentIntent::SplitTasks { titles },
+            Self::ListTasks => MainAgentIntent::ListTasks,
+            Self::Summarize => MainAgentIntent::Summarize,
+            Self::RunSchedulerTick => MainAgentIntent::RunSchedulerTick,
+        }
+    }
+}
+
+#[async_trait]
+pub trait MainAgentPlanner: Send + Sync {
+    async fn plan(&self, context: MainAgentPlanContext) -> anyhow::Result<Option<MainAgentPlan>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct MainAgentLlmConfig {
     pub api_key: String,
@@ -1293,6 +1425,13 @@ impl OhMyHarnessMainAgentAdvisor {
 impl MainAgentAdvisor for OhMyHarnessMainAgentAdvisor {
     async fn advise(&self, context: MainAgentAdviceContext) -> anyhow::Result<String> {
         dispatch_main_agent_advisor(self.config.clone(), main_agent_advisor_prompt(&context)).await
+    }
+}
+
+#[async_trait]
+impl MainAgentPlanner for OhMyHarnessMainAgentAdvisor {
+    async fn plan(&self, context: MainAgentPlanContext) -> anyhow::Result<Option<MainAgentPlan>> {
+        dispatch_main_agent_planner(self.config.clone(), main_agent_planner_prompt(&context)).await
     }
 }
 
@@ -1653,6 +1792,14 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     MainAgentIntent::Help
 }
 
+fn is_explicit_help_request(content: &str) -> bool {
+    let normalized = content.trim().to_lowercase();
+    matches!(normalized.as_str(), "help" | "?" | "帮助" | "用法")
+        || normalized.contains("what can you do")
+        || normalized.contains("how can you help")
+        || normalized.contains("你能做什么")
+}
+
 fn enrich_requested_skills_for_task_text(
     mut requested_skills: Vec<String>,
     task_text: &str,
@@ -1751,6 +1898,12 @@ fn dedupe_strings(values: Vec<String>) -> Vec<String> {
 }
 
 const MAIN_AGENT_ADVISOR_SYSTEM_PROMPT: &str = "You are the main agent for Persistent Agent. The deterministic task-state operation has already been performed by product code. Write a concise, helpful user-facing reply in the user's language. Preserve the facts from the deterministic reply. Do not claim that you changed task state unless the deterministic reply says it happened. Mention useful next steps only when they directly follow from the current context.";
+const MAIN_AGENT_PLANNER_SYSTEM_PROMPT: &str = "You are the planning layer for the Persistent Agent main agent. Choose exactly one available planning tool when the user's message clearly asks to manage the task pool. Do not write free-form task state changes. If the request is ambiguous or unsupported, answer briefly without calling a tool.";
+
+#[derive(Debug, Default)]
+struct MainAgentPlannerState {
+    plan: Option<MainAgentPlan>,
+}
 
 async fn dispatch_main_agent_advisor(
     config: MainAgentLlmConfig,
@@ -1793,6 +1946,323 @@ async fn dispatch_main_agent_advisor(
     }
 
     Ok(assistant_text)
+}
+
+async fn dispatch_main_agent_planner(
+    config: MainAgentLlmConfig,
+    prompt: String,
+) -> anyhow::Result<Option<MainAgentPlan>> {
+    let client = Arc::new(deepseek::client(config.api_key)) as Arc<dyn LlmClient>;
+    let sandbox = OsEnvSandbox::new(SandboxConfig {
+        fs_allowlist: Vec::new(),
+        fs_denylist: Vec::new(),
+        net_allowlist: Vec::new(),
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: std::env::current_dir().ok(),
+    });
+    sandbox.start().await?;
+
+    let state = Arc::new(tokio::sync::Mutex::new(MainAgentPlannerState::default()));
+    let registry = main_agent_planner_tool_registry(state.clone());
+    let mut opts = AgentHarnessOptions::new(config.model);
+    opts.max_tokens = 500;
+    opts.system_prompt = Some(MAIN_AGENT_PLANNER_SYSTEM_PROMPT.to_owned());
+    opts.tools = registry.subset(&[
+        "plan_create_task",
+        "plan_split_tasks",
+        "plan_list_tasks",
+        "plan_summarize_task_pool",
+        "plan_scheduler_scan",
+    ]);
+
+    let harness = AgentHarness::new_in_memory(client, sandbox.env(), opts).await;
+    harness.prompt(prompt).await?;
+    let wait = harness.wait_for_idle();
+    tokio::time::timeout(std::time::Duration::from_millis(config.timeout_ms), wait).await?;
+
+    Ok(state.lock().await.plan.clone())
+}
+
+fn main_agent_planner_tool_registry(
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+) -> Arc<InMemoryToolRegistry> {
+    let registry = Arc::new(InMemoryToolRegistry::new());
+    registry.register(Arc::new(PlanCreateTaskTool::new(state.clone())));
+    registry.register(Arc::new(PlanSplitTasksTool::new(state.clone())));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_list_tasks",
+        "Plan to list the current task pool.",
+        MainAgentPlan::ListTasks,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_summarize_task_pool",
+        "Plan to summarize the current task pool.",
+        MainAgentPlan::Summarize,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state,
+        "plan_scheduler_scan",
+        "Plan to request one scheduler scan of the task pool.",
+        MainAgentPlan::RunSchedulerTick,
+    )));
+    registry
+}
+
+struct PlanCreateTaskTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanCreateTaskTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "task_type": { "type": "string", "enum": ["one_off", "recurring"] },
+                    "priority": { "type": "integer" },
+                    "interval_seconds": { "type": "integer", "minimum": 1 },
+                    "requested_skills": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["title"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanCreateTaskTool {
+    fn name(&self) -> &str {
+        "plan_create_task"
+    }
+
+    fn description(&self) -> &str {
+        "Plan one task creation from a natural-language user request."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let title = planner_required_string(&args, "title")?;
+            let description = args
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| title.clone());
+            let task_type = match args
+                .get("task_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("one_off")
+            {
+                "recurring" => TaskType::Recurring,
+                _ => TaskType::OneOff,
+            };
+            let interval_seconds = (task_type == TaskType::Recurring)
+                .then(|| {
+                    args.get("interval_seconds")
+                        .and_then(|value| value.as_i64())
+                })
+                .flatten();
+            let requested_skills = planner_string_array(&args, "requested_skills");
+            let priority = args
+                .get("priority")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            self.state.lock().await.plan = Some(MainAgentPlan::CreateTask {
+                title,
+                description,
+                task_type,
+                priority,
+                interval_seconds,
+                requested_skills,
+            });
+            Ok(planner_tool_result("planned task creation"))
+        })
+    }
+}
+
+struct PlanSplitTasksTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanSplitTasksTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "titles": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 2
+                    }
+                },
+                "required": ["titles"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanSplitTasksTool {
+    fn name(&self) -> &str {
+        "plan_split_tasks"
+    }
+
+    fn description(&self) -> &str {
+        "Plan multiple one-off tasks when the user asks to break a goal into steps."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let titles = planner_string_array(&args, "titles");
+            if titles.len() < 2 {
+                return Err(ToolError::InvalidArguments(
+                    "titles must contain at least two items".to_owned(),
+                ));
+            }
+            self.state.lock().await.plan = Some(MainAgentPlan::SplitTasks { titles });
+            Ok(planner_tool_result("planned split tasks"))
+        })
+    }
+}
+
+struct PlanSimpleIntentTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    plan: MainAgentPlan,
+    schema: serde_json::Value,
+}
+
+impl PlanSimpleIntentTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        plan: MainAgentPlan,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            plan,
+            schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }
+    }
+}
+
+impl Tool for PlanSimpleIntentTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(self.plan.clone());
+            Ok(planner_tool_result("planned main-agent action"))
+        })
+    }
+}
+
+fn planner_required_string(args: &serde_json::Value, field: &str) -> Result<String, ToolError> {
+    args.get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
+}
+
+fn planner_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
+    args.get(field)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn planner_tool_result(message: &str) -> ToolResult {
+    ToolResult {
+        content: vec![ContentBlock::Text {
+            text: message.to_owned(),
+        }],
+        details: serde_json::json!({ "message": message }),
+        terminate: true,
+    }
+}
+
+fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
+    format!(
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        context.user_message,
+        format_advisor_summary(&context.task_pool_summary),
+        format_advisor_recent_messages(&context.recent_messages),
+    )
 }
 
 fn main_agent_advisor_prompt(context: &MainAgentAdviceContext) -> String {
@@ -3600,6 +4070,25 @@ mod tests {
         }
     }
 
+    struct FixedPlanner {
+        plan: Option<MainAgentPlan>,
+        contexts: Arc<StdMutex<Vec<MainAgentPlanContext>>>,
+    }
+
+    #[async_trait]
+    impl MainAgentPlanner for FixedPlanner {
+        async fn plan(
+            &self,
+            context: MainAgentPlanContext,
+        ) -> anyhow::Result<Option<MainAgentPlan>> {
+            self.contexts
+                .lock()
+                .expect("planner contexts lock")
+                .push(context);
+            Ok(self.plan.clone())
+        }
+    }
+
     #[test]
     fn parses_create_task_with_priority() {
         let intent = parse_intent("create task: Check GitHub issues priority 7");
@@ -4317,6 +4806,48 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "llm_advisor_reply")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_unparsed_task_requests() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let contexts = Arc::new(StdMutex::new(Vec::new()));
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::CreateTask {
+                title: "Watch release notes".to_owned(),
+                description: "Monitor upstream release notes every two minutes.".to_owned(),
+                task_type: TaskType::Recurring,
+                priority: 4,
+                interval_seconds: Some(120),
+                requested_skills: vec!["network".to_owned()],
+            }),
+            contexts: contexts.clone(),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you keep an eye on upstream release notes every couple minutes?"
+                    .to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Watch release notes");
+        assert_eq!(tasks[0].task_type, TaskType::Recurring);
+        assert_eq!(tasks[0].priority, 4);
+        assert_eq!(tasks[0].requested_skills, vec!["network".to_owned()]);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Created task"));
+        assert_eq!(contexts.lock().expect("planner contexts lock").len(), 1);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "llm_planner_intent")
         );
 
         Ok(())

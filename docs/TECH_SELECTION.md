@@ -214,6 +214,7 @@ It should:
 - show recent global audit actions for non-task-specific tool calls;
 - create, update, pause, resume, cancel, reorder, and reprioritize tasks through explicit tools;
 - split vague user requests into concrete task proposals;
+- use a harness-backed planner for unsupported free-form requests, where the LLM can only call bounded planning tools and product code performs the final state mutation;
 - summarize the task pool and explain why work is or is not running;
 - perform lightweight local inspection when that helps task planning;
 - scan runnable tasks through scheduled ticks, manual API calls, or main-agent conversation requests;
