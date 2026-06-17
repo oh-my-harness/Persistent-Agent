@@ -478,7 +478,7 @@ async fn main_agent_actions(
 async fn send_main_agent_message(
     State(state): State<AppState>,
     Json(input): Json<MainAgentMessageInput>,
-) -> Result<Json<persistent_agent_agent::MainAgentMessageResponse>, ApiError> {
+) -> Result<Json<MainAgentHttpResponse>, ApiError> {
     let previous_global_action_ids = state
         .db
         .list_global_actions()
@@ -500,11 +500,31 @@ async fn send_main_agent_message(
             state.events.send(AppEvent::MainAgentAction { action });
         }
     }
-    if response.scheduler_tick_requested {
+    let scheduler_tick = if response.scheduler_tick_requested {
         let tick = state.scheduler.tick().await?;
         emit_scheduler_tick_events(&state, &tick).await?;
-    }
-    Ok(Json(response))
+        Some(tick)
+    } else {
+        None
+    };
+    Ok(Json(MainAgentHttpResponse {
+        conversation_id: response.conversation_id,
+        user_message: response.user_message,
+        assistant_message: response.assistant_message,
+        changed_tasks: response.changed_tasks,
+        scheduler_tick_requested: response.scheduler_tick_requested,
+        scheduler_tick,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct MainAgentHttpResponse {
+    conversation_id: persistent_agent_domain::ConversationId,
+    user_message: ConversationMessage,
+    assistant_message: ConversationMessage,
+    changed_tasks: Vec<Task>,
+    scheduler_tick_requested: bool,
+    scheduler_tick: Option<SchedulerTick>,
 }
 
 async fn run_scheduler_tick(
