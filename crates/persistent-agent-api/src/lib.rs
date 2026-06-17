@@ -531,6 +531,7 @@ struct SchedulerStateResponse {
     running_tasks: Vec<Task>,
     next_queued_task: Option<Task>,
     queued_count: usize,
+    waiting_for_user_tasks: Vec<Task>,
     waiting_for_user_count: usize,
     waiting_for_schedule_count: usize,
     policy: SchedulerPolicy,
@@ -553,6 +554,17 @@ async fn scheduler_state(
             .then_with(|| left.created_at.cmp(&right.created_at))
     });
 
+    let mut waiting_for_user_tasks = tasks
+        .iter()
+        .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForUser)
+        .cloned()
+        .collect::<Vec<_>>();
+    waiting_for_user_tasks.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.queue_position.cmp(&right.queue_position))
+    });
+
     Ok(Json(SchedulerStateResponse {
         running_tasks: tasks
             .iter()
@@ -561,10 +573,8 @@ async fn scheduler_state(
             .collect(),
         next_queued_task: queued_tasks.first().cloned(),
         queued_count: queued_tasks.len(),
-        waiting_for_user_count: tasks
-            .iter()
-            .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForUser)
-            .count(),
+        waiting_for_user_count: waiting_for_user_tasks.len(),
+        waiting_for_user_tasks,
         waiting_for_schedule_count: tasks
             .iter()
             .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForSchedule)

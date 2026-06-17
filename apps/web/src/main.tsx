@@ -779,6 +779,7 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
   const running = state?.running_tasks ?? [];
   const primaryRunning = running[0];
   const nextQueued = state?.next_queued_task;
+  const waitingForUser = state?.waiting_for_user_tasks?.[0];
   const policy = state?.policy;
 
   return (
@@ -795,7 +796,12 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
       </div>
       <div className="execution-state-item">
         <span>Needs user</span>
-        <strong>{state?.waiting_for_user_count ?? 0}</strong>
+        <strong>{waitingForUser?.title ?? state?.waiting_for_user_count ?? 0}</strong>
+        {waitingForUser ? (
+          <small>{waitingForUser.blocked_reason ?? `${state?.waiting_for_user_count ?? 1} task needs input`}</small>
+        ) : (
+          <small>{state ? "No blocked tasks" : "Waiting for state"}</small>
+        )}
       </div>
       <div className="execution-state-item">
         <span>Scheduled</span>

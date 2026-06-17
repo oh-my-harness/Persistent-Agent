@@ -63,6 +63,7 @@ export interface SchedulerState {
   running_tasks: Task[];
   next_queued_task?: Task | null;
   queued_count: number;
+  waiting_for_user_tasks: Task[];
   waiting_for_user_count: number;
   waiting_for_schedule_count: number;
   policy: SchedulerPolicy;
