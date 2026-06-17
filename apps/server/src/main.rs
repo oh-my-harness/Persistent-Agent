@@ -69,8 +69,12 @@ fn scheduler_policy_from_env(get_env: impl Fn(&str) -> Option<String>) -> Schedu
     let worker_capacity = env_usize(&get_env, "SCHEDULER_WORKER_CAPACITY", 1);
     let lease_seconds = env_i64(&get_env, "SCHEDULER_LEASE_SECONDS", 300);
     let max_attempts = env_i64(&get_env, "SCHEDULER_MAX_ATTEMPTS", 1);
+    let memory_auto_approve_confidence =
+        env_f64(&get_env, "MEMORY_AUTO_APPROVE_CONFIDENCE").filter(|value| value.is_finite());
 
-    SchedulerPolicy::new(worker_capacity, lease_seconds).with_max_attempts(max_attempts)
+    SchedulerPolicy::new(worker_capacity, lease_seconds)
+        .with_max_attempts(max_attempts)
+        .with_memory_auto_approve_confidence(memory_auto_approve_confidence)
 }
 
 fn env_usize(get_env: impl Fn(&str) -> Option<String>, name: &str, default: usize) -> usize {
@@ -83,6 +87,10 @@ fn env_i64(get_env: impl Fn(&str) -> Option<String>, name: &str, default: i64) -
     get_env(name)
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(default)
+}
+
+fn env_f64(get_env: impl Fn(&str) -> Option<String>, name: &str) -> Option<f64> {
+    get_env(name).and_then(|value| value.parse::<f64>().ok())
 }
 
 async fn shutdown_signal() {
@@ -107,6 +115,7 @@ mod tests {
             ("SCHEDULER_WORKER_CAPACITY", "4"),
             ("SCHEDULER_LEASE_SECONDS", "45"),
             ("SCHEDULER_MAX_ATTEMPTS", "3"),
+            ("MEMORY_AUTO_APPROVE_CONFIDENCE", "0.75"),
         ]);
         let policy =
             scheduler_policy_from_env(|name| values.get(name).map(|value| value.to_string()));
@@ -117,6 +126,7 @@ mod tests {
                 worker_capacity: 4,
                 lease_seconds: 45,
                 max_attempts: 3,
+                memory_auto_approve_confidence: Some(0.75),
             }
         );
     }
@@ -127,6 +137,7 @@ mod tests {
             ("SCHEDULER_WORKER_CAPACITY", "many"),
             ("SCHEDULER_LEASE_SECONDS", "soon"),
             ("SCHEDULER_MAX_ATTEMPTS", "often"),
+            ("MEMORY_AUTO_APPROVE_CONFIDENCE", "confident"),
         ]);
         let policy =
             scheduler_policy_from_env(|name| values.get(name).map(|value| value.to_string()));

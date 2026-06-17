@@ -28,11 +28,12 @@ pub struct Scheduler<W> {
     serial_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SchedulerPolicy {
     pub worker_capacity: usize,
     pub lease_seconds: i64,
     pub max_attempts: i64,
+    pub memory_auto_approve_confidence: Option<f64>,
 }
 
 impl SchedulerPolicy {
@@ -41,6 +42,7 @@ impl SchedulerPolicy {
             worker_capacity: 1,
             lease_seconds: 300,
             max_attempts: 1,
+            memory_auto_approve_confidence: None,
         }
     }
 
@@ -49,11 +51,18 @@ impl SchedulerPolicy {
             worker_capacity: worker_capacity.max(1),
             lease_seconds: lease_seconds.max(1),
             max_attempts: 1,
+            memory_auto_approve_confidence: None,
         }
     }
 
     pub fn with_max_attempts(mut self, max_attempts: i64) -> Self {
         self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_memory_auto_approve_confidence(mut self, confidence: Option<f64>) -> Self {
+        self.memory_auto_approve_confidence =
+            confidence.map(|confidence| confidence.clamp(0.0, 1.0));
         self
     }
 }
@@ -266,14 +275,19 @@ where
                         .await?;
                 }
                 for candidate in memory_candidate_contents(&task, &summary, &memory_candidates) {
+                    let confidence = 0.6;
+                    let status = match self.policy.memory_auto_approve_confidence {
+                        Some(threshold) if confidence >= threshold => MemoryStatus::Approved,
+                        _ => MemoryStatus::Pending,
+                    };
                     self.db
                         .create_memory(
                             CreateMemory {
                                 scope: "task".to_owned(),
                                 content: candidate,
                                 source_task_id: Some(task.id),
-                                status: MemoryStatus::Pending,
-                                confidence: 0.6,
+                                status,
+                                confidence,
                             },
                             "worker",
                         )
@@ -1190,6 +1204,7 @@ mod tests {
                 worker_capacity: 1,
                 lease_seconds: 1,
                 max_attempts: 1,
+                memory_auto_approve_confidence: None,
             }
         );
     }
@@ -1205,6 +1220,7 @@ mod tests {
                 worker_capacity: 3,
                 lease_seconds: 45,
                 max_attempts: 1,
+                memory_auto_approve_confidence: None,
             }
         );
 
@@ -2159,6 +2175,41 @@ mod tests {
             memories
                 .iter()
                 .any(|memory| memory.content.contains("broad UI selectors"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_can_auto_approve_high_confidence_memory_candidates() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_task(
+            CreateTask {
+                title: "Capture approved memories".to_owned(),
+                description: "Worker should suggest memories".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            },
+            "test",
+        )
+        .await?;
+        let scheduler = Scheduler::with_policy(
+            db.clone(),
+            MemoryCandidateWorker,
+            SchedulerPolicy::serial().with_memory_auto_approve_confidence(Some(0.6)),
+        );
+
+        scheduler.tick().await?;
+        let memories = db.list_memories().await?;
+
+        assert_eq!(memories.len(), 2);
+        assert!(
+            memories
+                .iter()
+                .all(|memory| memory.status == MemoryStatus::Approved)
         );
 
         Ok(())

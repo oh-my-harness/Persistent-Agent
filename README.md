@@ -36,7 +36,7 @@ The repository now contains the first executable skeleton:
 - Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
-- Long-term memory candidate listing and review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
+- Long-term memory candidate listing and review through Web controls or main-agent conversation, optional confidence-based auto-approval, edit/delete controls, and approved-memory injection into worker context.
 - Task detail history shows memory candidates proposed by that task.
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.
@@ -59,6 +59,8 @@ The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTER
 `SCHEDULER_LEASE_SECONDS` defines how long a running task lease lasts before heartbeat refresh or recovery, and defaults to `300`.
 
 `SCHEDULER_MAX_ATTEMPTS` defines how many worker failures are allowed before a task is marked `failed`, and defaults to `1`.
+
+`MEMORY_AUTO_APPROVE_CONFIDENCE` optionally auto-approves worker memory candidates at or above the configured confidence threshold, from `0.0` to `1.0`. Leave it unset to keep manual review as the default.
 
 Run the Web UI:
 

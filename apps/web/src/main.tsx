@@ -843,6 +843,9 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
         {policy && (
           <small>
             lease {policy.lease_seconds}s, retry {policy.max_attempts}
+            {policy.memory_auto_approve_confidence != null
+              ? `, memory auto ${policy.memory_auto_approve_confidence.toFixed(2)}`
+              : ""}
           </small>
         )}
       </div>

@@ -74,6 +74,7 @@ export interface SchedulerPolicy {
   worker_capacity: number;
   lease_seconds: number;
   max_attempts: number;
+  memory_auto_approve_confidence?: number | null;
 }
 
 export type AppEvent =
