@@ -72,6 +72,15 @@ Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local envir
 
 When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, `git_status`, `git_diff`, `http_fetch`, `github_list_issues`, `github_get_issue`, `github_comment_issue`, `github_update_issue_state`, and `github_create_pull_request`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
 
+Run the real LLM scheduler smoke test only when you intentionally want to call DeepSeek:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "..."
+cargo test -p persistent-agent-scheduler llm_harness_scheduler_smoke_completes_task -- --ignored --nocapture
+```
+
+That smoke creates an in-memory task, runs the scheduler with `OhMyHarnessWorker`, verifies the worker calls `complete_task` through `AgentHarness`, and checks the persisted task attempt/events.
+
 Active skill `resource_path` values must be relative to the workspace. If the path points to a directory, the scheduler loads `SKILL.md` from that directory; if it points to a file, the scheduler loads that file. Loaded content is injected into the worker prompt with a bounded size, while missing or invalid resources are recorded in worker context events without stopping task execution.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.

@@ -4995,4 +4995,73 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "requires DEEPSEEK_API_KEY and calls the real LLM through oh-my-harness AgentHarness"]
+    async fn llm_harness_scheduler_smoke_completes_task() -> anyhow::Result<()> {
+        let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") else {
+            eprintln!("Skipping smoke: DEEPSEEK_API_KEY is not set.");
+            return Ok(());
+        };
+        if api_key.trim().is_empty() {
+            eprintln!("Skipping smoke: DEEPSEEK_API_KEY is empty.");
+            return Ok(());
+        }
+
+        let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "LLM harness smoke".to_owned(),
+                    description: "This is an end-to-end smoke test. Call the complete_task tool exactly once with summary 'llm harness smoke complete'. Do not call shell or modify files.".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(
+            db.clone(),
+            OhMyHarnessWorker::new(LlmWorkerConfig::deepseek(api_key, model)),
+        );
+
+        let tick = scheduler.tick().await?;
+        let updated = db.get_task(task.id).await?;
+        let attempts = db.list_task_attempts(task.id).await?;
+        let events = db.list_task_attempt_events(task.id).await?;
+
+        assert!(matches!(tick.outcome, SchedulerOutcome::Completed { .. }));
+        assert_eq!(updated.status, TaskStatus::Completed);
+        assert!(
+            updated
+                .result_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("llm harness smoke complete")
+        );
+        assert!(attempts.iter().any(|attempt| {
+            attempt.status == TaskStatus::Completed
+                && attempt
+                    .summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("llm harness smoke complete")
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_context_prepared")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worker_completed")
+        );
+
+        Ok(())
+    }
 }
