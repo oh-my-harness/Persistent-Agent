@@ -263,7 +263,7 @@ function SkillManager() {
         <input
           value={rules}
           onChange={(event) => setRules(event.target.value)}
-          placeholder="Triggers, comma separated"
+          placeholder="Triggers, e.g. github, issue, type:recurring"
         />
         <textarea
           value={description}
@@ -285,7 +285,9 @@ function SkillManager() {
             }
           />
         ))}
-        {visibleSkills.length === 0 && <p className="empty">Add a skill to enable automatic task matching.</p>}
+        {visibleSkills.length === 0 && (
+          <p className="empty">Add keyword or task-type rules such as github, issue, or type:recurring.</p>
+        )}
       </div>
     </section>
   );
@@ -331,7 +333,11 @@ function SkillRow({
             </label>
             <label>
               Triggers
-              <input value={rules} onChange={(event) => setRules(event.target.value)} />
+              <input
+                value={rules}
+                onChange={(event) => setRules(event.target.value)}
+                placeholder="github, issue, type:recurring"
+              />
             </label>
             <label>
               Tool subset
