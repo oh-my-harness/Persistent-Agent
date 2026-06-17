@@ -526,14 +526,14 @@ function MainAgentChat() {
     <section className="panel chat-panel">
       <div className="panel-heading">
         <h2>Main Agent Conversation</h2>
-        <span>task tools</span>
+        <span>task and workspace tools</span>
       </div>
       <div className="message-list">
         {visibleMessages.map((message) => (
           <MessageBubble key={message.id} message={message} />
         ))}
         {visibleMessages.length === 0 && (
-          <p className="empty">Try: create task: Check whether the Persistent-Agent README needs updates</p>
+          <p className="empty">Try: create task: Check README updates, check project status, or read file Cargo.toml</p>
         )}
       </div>
       <form
@@ -547,7 +547,7 @@ function MainAgentChat() {
         <input
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          placeholder="Ask the main agent to create, pause, resume, reprioritize, or summarize tasks"
+          placeholder="Ask the main agent to manage tasks, inspect status, read files, or run the scheduler"
         />
         <button className="primary icon-button" type="submit" disabled={mutation.isPending}>
           <Send size={16} />
