@@ -134,13 +134,20 @@ where
             .list_skills_by_names(&active_skill_names(&task))
             .await?;
         let allowed_tools = allowed_tools_for_skills(&skills);
+        let skill_resources = load_skill_resources(&skills);
         let context = WorkerContext {
             memories: select_relevant_memories(&task, self.db.list_approved_memories(20).await?, 5),
             skills,
+            skill_resources,
             allowed_tools,
             notes: self.db.list_task_notes(task.id).await?,
             conversation_messages: self.db.list_task_conversation_messages(task.id, 20).await?,
         };
+        let skill_resource_error_count = context
+            .skill_resources
+            .iter()
+            .filter(|resource| resource.error.is_some())
+            .count();
         self.db
             .record_attempt_event(
                 attempt.id,
@@ -150,6 +157,9 @@ where
                 json!({
                     "memory_count": context.memories.len(),
                     "skill_count": context.skills.len(),
+                    "skill_resource_count": context.skill_resources.len(),
+                    "skill_resource_error_count": skill_resource_error_count,
+                    "skill_resources": skill_resource_event_summaries(&context.skill_resources),
                     "allowed_tools": &context.allowed_tools,
                     "note_count": context.notes.len(),
                     "conversation_message_count": context.conversation_messages.len(),
@@ -528,9 +538,20 @@ pub trait TaskWorker: Clone + Send + Sync + 'static {
 pub struct WorkerContext {
     pub memories: Vec<Memory>,
     pub skills: Vec<Skill>,
+    pub skill_resources: Vec<SkillResource>,
     pub allowed_tools: Vec<String>,
     pub notes: Vec<TaskNote>,
     pub conversation_messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillResource {
+    pub skill_name: String,
+    pub source_path: String,
+    pub loaded_path: Option<String>,
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub truncated: bool,
 }
 
 fn heartbeat_interval(lease_seconds: i64) -> std::time::Duration {
@@ -641,6 +662,7 @@ impl TaskWorker for OhMyHarnessWorker {
             &task,
             &context.memories,
             &context.skills,
+            &context.skill_resources,
             &context.allowed_tools,
             &context.notes,
             &context.conversation_messages,
@@ -1629,12 +1651,13 @@ fn task_prompt(
     task: &Task,
     memories: &[Memory],
     skills: &[Skill],
+    skill_resources: &[SkillResource],
     allowed_tools: &[String],
     notes: &[TaskNote],
     conversation_messages: &[ConversationMessage],
 ) -> String {
     format!(
-        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\nAllowed tools: {}\n\nActive skill resources:\n{}\n\nRelevant approved memories:\n{}\n\nTask notes:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
+        "Task title: {}\nTask type: {}\nPriority: {}\nRequested skills: {}\nMatched skills: {}\nActive skills: {}\nAllowed tools: {}\n\nActive skill metadata:\n{}\n\nLoaded skill resources:\n{}\n\nRelevant approved memories:\n{}\n\nTask notes:\n{}\n\nRecent task conversation:\n{}\n\nTask description:\n{}",
         task.title,
         task.task_type,
         task.priority,
@@ -1651,11 +1674,151 @@ fn task_prompt(
         format_active_skill_names(task),
         format_allowed_tools(allowed_tools),
         format_skills(skills),
+        format_skill_resources(skill_resources),
         format_memories(memories),
         format_notes(notes),
         format_conversation(conversation_messages),
         task.description
     )
+}
+
+const MAX_SKILL_RESOURCE_CHARS: usize = 12_000;
+
+fn load_skill_resources(skills: &[Skill]) -> Vec<SkillResource> {
+    skills
+        .iter()
+        .filter_map(|skill| {
+            let source_path = skill.resource_path.as_deref()?.trim();
+            if source_path.is_empty() {
+                return None;
+            }
+
+            Some(load_skill_resource(&skill.name, source_path))
+        })
+        .collect()
+}
+
+fn load_skill_resource(skill_name: &str, source_path: &str) -> SkillResource {
+    let mut resource = SkillResource {
+        skill_name: skill_name.to_owned(),
+        source_path: source_path.to_owned(),
+        ..SkillResource::default()
+    };
+
+    let relative_path = Path::new(source_path);
+    if relative_path.is_absolute() {
+        resource.error = Some("resource_path must be relative to the workspace".to_owned());
+        return resource;
+    }
+
+    let workspace = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            resource.error = Some(format!("failed to resolve workspace: {error}"));
+            return resource;
+        }
+    };
+    let workspace = match workspace.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            resource.error = Some(format!("failed to canonicalize workspace: {error}"));
+            return resource;
+        }
+    };
+
+    let candidate = workspace.join(relative_path);
+    let loaded_candidate = if candidate.is_dir() {
+        candidate.join("SKILL.md")
+    } else {
+        candidate
+    };
+    let loaded_path = match loaded_candidate.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            resource.error = Some(format!("failed to resolve skill resource: {error}"));
+            return resource;
+        }
+    };
+
+    if !loaded_path.starts_with(&workspace) {
+        resource.error = Some("resource_path escapes the workspace".to_owned());
+        return resource;
+    }
+    if !loaded_path.is_file() {
+        resource.error = Some("resource_path did not resolve to a readable file".to_owned());
+        return resource;
+    }
+
+    resource.loaded_path = Some(display_path(&loaded_path));
+    match std::fs::read_to_string(&loaded_path) {
+        Ok(content) => {
+            let truncated = truncate_chars(&content, MAX_SKILL_RESOURCE_CHARS);
+            resource.content = Some(truncated.text);
+            resource.truncated = truncated.truncated;
+        }
+        Err(error) => {
+            resource.error = Some(format!("failed to read skill resource: {error}"));
+        }
+    }
+
+    resource
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn format_skill_resources(resources: &[SkillResource]) -> String {
+    if resources.is_empty() {
+        return "none".to_owned();
+    }
+
+    resources
+        .iter()
+        .map(|resource| {
+            let mut parts = vec![
+                format!("- skill: {}", resource.skill_name),
+                format!("  source_path: {}", resource.source_path),
+            ];
+            if let Some(loaded_path) = &resource.loaded_path {
+                parts.push(format!("  loaded_path: {loaded_path}"));
+            }
+            if let Some(error) = &resource.error {
+                parts.push(format!("  error: {error}"));
+            }
+            if let Some(content) = &resource.content {
+                parts.push(format!("  truncated: {}", resource.truncated));
+                parts.push(format!("  content:\n{}", indent_multiline(content, "    ")));
+            }
+            parts.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn indent_multiline(content: &str, prefix: &str) -> String {
+    content
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn skill_resource_event_summaries(resources: &[SkillResource]) -> Vec<serde_json::Value> {
+    resources
+        .iter()
+        .map(|resource| {
+            json!({
+                "skill_name": resource.skill_name,
+                "source_path": resource.source_path,
+                "loaded_path": resource.loaded_path,
+                "loaded": resource.content.is_some(),
+                "error": resource.error,
+                "truncated": resource.truncated,
+                "content_chars": resource.content.as_ref().map(|content| content.chars().count()).unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 fn format_skills(skills: &[Skill]) -> String {
@@ -2521,6 +2684,14 @@ mod tests {
             &task,
             &[],
             &[skill],
+            &[SkillResource {
+                skill_name: "github".to_owned(),
+                source_path: "skills/github".to_owned(),
+                loaded_path: Some("skills/github/SKILL.md".to_owned()),
+                content: Some("Use the GitHub issue workflow and inspect open issues.".to_owned()),
+                error: None,
+                truncated: false,
+            }],
             &["github_search".to_owned(), "shell".to_owned()],
             &[],
             &[],
@@ -2532,10 +2703,12 @@ mod tests {
         assert!(prompt.contains("Matched skills: rust, github"));
         assert!(prompt.contains("Active skills: github, rust"));
         assert!(prompt.contains("Allowed tools: github_search, shell"));
-        assert!(prompt.contains("Active skill resources"));
+        assert!(prompt.contains("Active skill metadata"));
+        assert!(prompt.contains("Loaded skill resources"));
         assert!(prompt.contains("Inspect GitHub repositories"));
         assert!(prompt.contains("tools: github_search, shell"));
         assert!(prompt.contains("resource_path: skills/github"));
+        assert!(prompt.contains("Use the GitHub issue workflow"));
     }
 
     #[test]
@@ -2584,7 +2757,7 @@ mod tests {
         };
 
         let memories = select_relevant_memories(&task, vec![unrelated, relevant], 5);
-        let prompt = task_prompt(&task, &memories, &[], &[], &[], &[]);
+        let prompt = task_prompt(&task, &memories, &[], &[], &[], &[], &[]);
 
         assert_eq!(memories.len(), 1);
         assert!(prompt.contains("Prefer cargo test --workspace"));
@@ -2628,7 +2801,7 @@ mod tests {
             created_at: now,
         }];
 
-        let prompt = task_prompt(&task, &[], &[], &[], &[], &messages);
+        let prompt = task_prompt(&task, &[], &[], &[], &[], &[], &messages);
 
         assert!(prompt.contains("Recent task conversation"));
         assert!(prompt.contains("user: The target repository"));
@@ -2668,7 +2841,7 @@ mod tests {
             created_at: now,
         }];
 
-        let prompt = task_prompt(&task, &[], &[], &[], &notes, &[]);
+        let prompt = task_prompt(&task, &[], &[], &[], &[], &notes, &[]);
 
         assert!(prompt.contains("Task notes"));
         assert!(prompt.contains("main_agent: Wait for staging approval."));
@@ -3052,6 +3225,7 @@ mod tests {
     struct ContextRecordingWorker {
         memory_counts: Arc<StdMutex<Vec<usize>>>,
         skill_names: Arc<StdMutex<Vec<Vec<String>>>>,
+        skill_resource_contents: Arc<StdMutex<Vec<Vec<String>>>>,
         allowed_tools: Arc<StdMutex<Vec<Vec<String>>>>,
     }
 
@@ -3073,6 +3247,16 @@ mod tests {
                     .map(|skill| skill.name.clone())
                     .collect(),
             );
+            self.skill_resource_contents
+                .lock()
+                .expect("skill resource contents lock")
+                .push(
+                    context
+                        .skill_resources
+                        .iter()
+                        .filter_map(|resource| resource.content.clone())
+                        .collect(),
+                );
             self.allowed_tools
                 .lock()
                 .expect("allowed tools lock")
@@ -3133,6 +3317,7 @@ mod tests {
             ContextRecordingWorker {
                 memory_counts: memory_counts.clone(),
                 skill_names,
+                skill_resource_contents: Arc::new(StdMutex::new(Vec::new())),
                 allowed_tools,
             },
         );
@@ -3147,13 +3332,28 @@ mod tests {
     #[tokio::test]
     async fn scheduler_passes_active_skill_resources_to_worker() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
+        let resource_dir = std::env::current_dir()?
+            .join("target")
+            .join("test-skill-resources")
+            .join(Uuid::now_v7().to_string());
+        let rust_skill_dir = resource_dir.join("skills").join("rust");
+        std::fs::create_dir_all(&rust_skill_dir)?;
+        std::fs::write(
+            rust_skill_dir.join("SKILL.md"),
+            "# Rust Skill\n\nRun cargo test before marking work complete.",
+        )?;
+        let rust_resource_path = resource_dir.join("skills").join("rust");
+        let rust_resource_path = rust_resource_path
+            .strip_prefix(std::env::current_dir()?)?
+            .to_string_lossy()
+            .replace('\\', "/");
         db.create_skill(
             CreateSkill {
                 name: "rust".to_owned(),
                 description: "Rust workspace maintenance.".to_owned(),
                 trigger_rules: vec!["cargo".to_owned()],
                 tool_subset: vec!["shell".to_owned()],
-                resource_path: Some("skills/rust".to_owned()),
+                resource_path: Some(rust_resource_path),
             },
             "test",
         )
@@ -3184,12 +3384,14 @@ mod tests {
         .await?;
         let memory_counts = Arc::new(StdMutex::new(Vec::new()));
         let skill_names = Arc::new(StdMutex::new(Vec::new()));
+        let skill_resource_contents = Arc::new(StdMutex::new(Vec::new()));
         let allowed_tools = Arc::new(StdMutex::new(Vec::new()));
         let scheduler = Scheduler::new(
             db.clone(),
             ContextRecordingWorker {
                 memory_counts,
                 skill_names: skill_names.clone(),
+                skill_resource_contents: skill_resource_contents.clone(),
                 allowed_tools: allowed_tools.clone(),
             },
         );
@@ -3210,10 +3412,30 @@ mod tests {
             *allowed_tools.lock().expect("allowed tools lock"),
             vec![vec!["github".to_owned(), "shell".to_owned()]]
         );
-        assert!(events.iter().any(|event| {
-            event.event_type == "worker_context_prepared"
-                && event.details["allowed_tools"] == json!(["github", "shell"])
-        }));
+        assert_eq!(
+            *skill_resource_contents
+                .lock()
+                .expect("skill resource contents lock"),
+            vec![vec![
+                "# Rust Skill\n\nRun cargo test before marking work complete.".to_owned()
+            ]]
+        );
+        let context_event = events
+            .iter()
+            .find(|event| event.event_type == "worker_context_prepared")
+            .expect("worker context event");
+        assert_eq!(context_event.details["allowed_tools"], json!(["github", "shell"]));
+        assert_eq!(context_event.details["skill_resource_count"], json!(2));
+        assert_eq!(context_event.details["skill_resource_error_count"], json!(1));
+        let resources = context_event.details["skill_resources"]
+            .as_array()
+            .expect("skill resource summaries");
+        assert!(resources
+            .iter()
+            .any(|resource| resource["loaded"] == json!(true)));
+        assert!(resources
+            .iter()
+            .any(|resource| resource["loaded"] == json!(false)));
 
         Ok(())
     }

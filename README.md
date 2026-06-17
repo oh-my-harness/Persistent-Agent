@@ -49,7 +49,7 @@ The repository now contains the first executable skeleton:
 - Running workers are stopped when their task lease is lost because the task was cancelled, paused, or otherwise moved out of `running`.
 - Worker execution failures can be retried according to scheduler policy before being marked permanently failed.
 - Worker execution failures are persisted as failed tasks with attempt events.
-- Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata/resource-path injection for workers.
+- Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata plus `resource_path` content injection for workers.
 - Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate listing and review through Web controls or main-agent conversation, optional confidence-based auto-approval, edit/delete controls, and approved-memory injection into worker context.
@@ -69,6 +69,8 @@ cargo run -p persistent-agent-server
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
 When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter`. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, and `http_fetch`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call.
+
+Active skill `resource_path` values must be relative to the workspace. If the path points to a directory, the scheduler loads `SKILL.md` from that directory; if it points to a file, the scheduler loads that file. Loaded content is injected into the worker prompt with a bounded size, while missing or invalid resources are recorded in worker context events without stopping task execution.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 
@@ -254,7 +256,7 @@ Skills are user-defined capability packages. A skill can include:
 - name and description,
 - trigger rules,
 - required tools,
-- prompts or instructions,
+- prompts or instructions loaded from a workspace-relative `resource_path`,
 - scripts or templates,
 - examples,
 - safety constraints.
@@ -266,6 +268,8 @@ Skill activation should support these paths:
 3. Task-type defaults: rules such as `type:recurring` or `task_type:one_off` activate a skill for recurring or one-off tasks.
 
 When both exist, explicit user selection should take precedence.
+
+For file-backed skills, set `resource_path` to a workspace-relative file or directory. Directory paths resolve to `SKILL.md`, matching the convention used by `oh-my-harness/llm-harness-skills`. Absolute paths and paths that escape the workspace are rejected and surfaced as resource-load errors in the worker attempt event.
 
 ## Long-Term Memory
 

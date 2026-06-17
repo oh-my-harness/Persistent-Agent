@@ -52,8 +52,13 @@ The harness worker must receive:
 - approved memories selected for the task
 - task notes
 - recent task conversation
-- active product skill metadata and resource paths
+- active product skill metadata, resource paths, and loaded workspace-relative skill instructions
 - allowed product tools derived from active skills
+
+Skill `resource_path` values are loaded by the scheduler before worker execution. A directory path
+resolves to `SKILL.md`; a file path is loaded directly. Paths must stay inside the workspace. Load
+errors are injected into context and attempt events so the worker can proceed while operators can
+see why a skill resource was unavailable.
 
 ## Product Tools To Register First
 
