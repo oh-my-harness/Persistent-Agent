@@ -13,9 +13,9 @@ use llm_harness_runtime::{
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus,
-    Skill, Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskId, TaskNote,
-    TaskResourceLock, TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
+    ConversationId, ConversationMessage, CreateMemory, CreateSkill, CreateTask, Memory, MemoryId,
+    MemoryStatus, Skill, Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskId,
+    TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -752,6 +752,21 @@ impl MainAgent {
         Ok(())
     }
 
+    pub async fn create_memory(&self, scope: String, content: String) -> anyhow::Result<Memory> {
+        self.db
+            .create_memory(
+                CreateMemory {
+                    scope,
+                    content,
+                    source_task_id: None,
+                    status: MemoryStatus::Approved,
+                    confidence: 1.0,
+                },
+                "main_agent",
+            )
+            .await
+    }
+
     pub async fn approve_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
         self.db
             .set_memory_status(id, MemoryStatus::Approved, "main_agent")
@@ -1245,6 +1260,14 @@ impl MainAgent {
                     }
                 }
             }
+            MainAgentIntent::CreateMemory { scope, content } => {
+                let memory = self.create_memory(scope, content).await?;
+                format!(
+                    "Remembered [{}]: {}",
+                    memory.scope,
+                    bounded_preview(&memory.content, 240)
+                )
+            }
             MainAgentIntent::ApproveMemory { selector } => match self.find_memory(&selector).await?
             {
                 Ok(memory) => {
@@ -1328,7 +1351,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1751,6 +1774,10 @@ pub enum MainAgentPlan {
     InspectWorkspaceFile {
         path: String,
     },
+    CreateMemory {
+        scope: String,
+        content: String,
+    },
     ApproveMemory {
         selector: String,
     },
@@ -1894,6 +1921,9 @@ impl MainAgentPlan {
             }
             Self::InspectWorkspace => MainAgentIntent::InspectWorkspace,
             Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
+            Self::CreateMemory { scope, content } => {
+                MainAgentIntent::CreateMemory { scope, content }
+            }
             Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
             Self::RejectMemory { selector } => MainAgentIntent::RejectMemory { selector },
             Self::UpdateMemory { selector, input } => {
@@ -2081,6 +2111,10 @@ enum MainAgentIntent {
     InspectWorkspaceFile {
         path: String,
     },
+    CreateMemory {
+        scope: String,
+        content: String,
+    },
     ApproveMemory {
         selector: String,
     },
@@ -2161,6 +2195,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         ],
     ) {
         return MainAgentIntent::Summarize;
+    }
+
+    if let Some(intent) = parse_create_memory_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if let Some(intent) = parse_memory_review_intent(trimmed, &normalized) {
@@ -2568,6 +2606,7 @@ async fn dispatch_main_agent_planner(
         "plan_list_task_conversation",
         "plan_inspect_workspace",
         "plan_inspect_workspace_file",
+        "plan_create_memory",
         "plan_approve_memory",
         "plan_reject_memory",
         "plan_update_memory",
@@ -2701,6 +2740,7 @@ fn main_agent_planner_tool_registry(
         MainAgentPlan::InspectWorkspace,
     )));
     registry.register(Arc::new(PlanInspectWorkspaceFileTool::new(state.clone())));
+    registry.register(Arc::new(PlanCreateMemoryTool::new(state.clone())));
     registry.register(Arc::new(PlanMemoryReviewTool::new(
         state.clone(),
         "plan_approve_memory",
@@ -4073,6 +4113,72 @@ impl Tool for PlanInspectWorkspaceFileTool {
     }
 }
 
+struct PlanCreateMemoryTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanCreateMemoryTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Short memory scope such as repo, project, skill:rust, or github."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "User preference, pitfall, or convention to remember for future tasks."
+                    }
+                },
+                "required": ["content"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanCreateMemoryTool {
+    fn name(&self) -> &str {
+        "plan_create_memory"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to store a user-provided long-term memory for future task context."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let content = planner_required_string(&args, "content")?;
+            let scope = args
+                .get("scope")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("repo")
+                .to_owned();
+            self.state.lock().await.plan = Some(MainAgentPlan::CreateMemory { scope, content });
+            Ok(planner_tool_result("planned memory creation"))
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PlannedMemoryReviewAction {
     Approve,
@@ -4427,7 +4533,7 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     )
     .replace(
         "- plan_list_memories: list memory candidates by status.",
-        "- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.\n- plan_show_scheduler_state: show current scheduler execution state without running a scan.",
+        "- plan_create_memory: store a user-provided long-term memory for future tasks.\n- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.\n- plan_show_scheduler_state: show current scheduler execution state without running a scan.",
     )
     .replace(
         "- plan_list_task_artifacts: list artifacts for one task.",
@@ -6078,6 +6184,70 @@ fn parse_task_detail_update_intent(content: &str, normalized: &str) -> Option<Ma
     })
 }
 
+fn parse_create_memory_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "remember",
+            "record memory",
+            "save memory",
+            "store memory",
+            "add memory",
+            "\u{8bb0}\u{4f4f}",
+            "\u{8bb0}\u{5fc6}",
+        ],
+    ) || contains_any(
+        normalized,
+        &[
+            "list memory",
+            "show memory",
+            "approve memory",
+            "reject memory",
+            "update memory",
+            "delete memory",
+            "remembered",
+            "remembering",
+            "memory candidate",
+            "memory candidates",
+            ZH_LIST,
+            ZH_APPROVE,
+            ZH_REJECT,
+        ],
+    ) {
+        return None;
+    }
+
+    let mut content_part = content;
+    for marker in [
+        "remember",
+        "record memory",
+        "save memory",
+        "store memory",
+        "add memory",
+        "\u{8bb0}\u{4f4f}",
+        "\u{8bb0}\u{5fc6}",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            content_part = &content[index + marker.len()..];
+            break;
+        }
+    }
+
+    let content_part = content_part
+        .trim()
+        .trim_start_matches([':', '\u{ff1a}', '-', '\u{2014}'])
+        .trim();
+    let (scope, memory_content) = split_memory_scope_and_content(content_part);
+    if memory_content.is_empty() {
+        return None;
+    }
+
+    Some(MainAgentIntent::CreateMemory {
+        scope,
+        content: memory_content,
+    })
+}
+
 fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -6207,6 +6377,27 @@ fn split_memory_update(content: &str) -> Option<(String, UpdateMemory)> {
     }
 
     None
+}
+
+fn split_memory_scope_and_content(content: &str) -> (String, String) {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let scope = head.trim().trim_matches(['"', '\'']).trim().to_lowercase();
+            let memory_content = tail.trim().trim_matches(['"', '\'']).trim();
+            if !scope.is_empty()
+                && !memory_content.is_empty()
+                && scope.chars().count() <= 40
+                && !scope.contains(' ')
+            {
+                return (scope, memory_content.to_owned());
+            }
+        }
+    }
+
+    (
+        "repo".to_owned(),
+        content.trim().trim_matches(['"', '\'']).trim().to_owned(),
+    )
 }
 
 fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
@@ -7604,6 +7795,20 @@ mod tests {
     #[test]
     fn parses_memory_review_intents() {
         assert_eq!(
+            parse_intent("remember repo: prefer cargo test before push"),
+            MainAgentIntent::CreateMemory {
+                scope: "repo".to_owned(),
+                content: "prefer cargo test before push".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("\u{8bb0}\u{4f4f}\u{ff1a}\u{4f18}\u{5148}\u{8fd0}\u{884c} cargo test"),
+            MainAgentIntent::CreateMemory {
+                scope: "repo".to_owned(),
+                content: "\u{4f18}\u{5148}\u{8fd0}\u{884c} cargo test".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent("show memory candidates"),
             MainAgentIntent::ListMemories {
                 filter: MemoryListFilter::Pending,
@@ -8738,6 +8943,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_memory_creation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::CreateMemory {
+                scope: "repo".to_owned(),
+                content: "Prefer cargo test before pushing.".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please remember that testing preference for future work.".to_owned(),
+            })
+            .await?;
+        let memories = db.list_memories().await?;
+
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].scope, "repo");
+        assert_eq!(memories[0].status, MemoryStatus::Approved);
+        assert_eq!(memories[0].confidence, 1.0);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Remembered [repo]")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_agent_uses_llm_planner_for_skill_listing() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         db.create_skill(
@@ -9119,6 +9356,37 @@ mod tests {
                 .content
                 .contains("Deleted memory")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_create_memory_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "remember repo: prefer cargo test before push".to_owned(),
+            })
+            .await?;
+        let memories = db.list_memories().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].scope, "repo");
+        assert_eq!(memories[0].content, "prefer cargo test before push");
+        assert_eq!(memories[0].status, MemoryStatus::Approved);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Remembered [repo]")
+        );
+        assert!(actions.iter().any(|action| {
+            action.action_type == "create_memory"
+                && action.details["memory_id"] == memories[0].id.to_string()
+        }));
 
         Ok(())
     }

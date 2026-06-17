@@ -293,7 +293,8 @@ Recommended main-agent tools:
 - `summarize_task_pool`;
 - `inspect_workspace_status`;
 - `inspect_workspace_file`;
-- `request_user_clarification`.
+- `request_user_clarification`;
+- `create_memory`.
 
 These tools should write action records so the UI can explain when a task changed because of user instruction, scheduler policy, or main-agent planning.
 

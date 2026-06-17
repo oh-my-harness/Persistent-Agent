@@ -48,7 +48,7 @@ only call bounded planning tools for create-task, split-tasks, pause/resume/canc
 task title/description update, reprioritize-task, queue-reorder, task-type conversion, dependency add/remove, task-note add,
 resource-lock add/remove, clarification-request, requested-skill add/remove,
 reply-to-task, create/list/update/delete skill-definition, task/artifact inspection,
-workspace/file inspection, memory list/approve/reject, audit listing, list-tasks, summarize, and
+workspace/file inspection, memory create/list/approve/reject, audit listing, list-tasks, summarize, and
 scheduler scan intents; product code validates and executes the resulting plan. The
 advisor does not receive state-changing tools; it composes the final user-facing response from the
 verified action context and falls back to the deterministic reply on empty output or LLM failure.
