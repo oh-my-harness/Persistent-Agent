@@ -90,8 +90,9 @@ The first harness-backed product tools are:
 - `http_fetch` (wired for HTTP(S) lookups)
 - `github_list_issues` (wired for read-only GitHub issue discovery; uses optional `GITHUB_TOKEN`)
 - `github_get_issue` (wired for read-only GitHub issue detail retrieval; uses optional `GITHUB_TOKEN`)
+- `github_comment_issue` / `github_update_issue_state` (wired for GitHub issue result reporting and open/closed state updates; require `GITHUB_TOKEN` and reject pull request targets)
 
-Specialized tools such as browser automation, first-class GitHub issue/PR write operations, and richer git
+Specialized tools such as browser automation, first-class GitHub PR operations, and richer git
 workflows should be added later through the approved runtime tool policy and audit path.
 
 ## Verification Gates

@@ -69,7 +69,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, `git_status`, `git_diff`, `http_fetch`, `github_list_issues`, and `github_get_issue`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
+When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, `git_status`, `git_diff`, `http_fetch`, `github_list_issues`, `github_get_issue`, `github_comment_issue`, and `github_update_issue_state`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
 
 Active skill `resource_path` values must be relative to the workspace. If the path points to a directory, the scheduler loads `SKILL.md` from that directory; if it points to a file, the scheduler loads that file. Loaded content is injected into the worker prompt with a bounded size, while missing or invalid resources are recorded in worker context events without stopping task execution.
 
@@ -83,7 +83,7 @@ The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTER
 
 `MEMORY_AUTO_APPROVE_CONFIDENCE` optionally auto-approves worker memory candidates at or above the configured confidence threshold, from `0.0` to `1.0`. Leave it unset to keep manual review as the default.
 
-`GITHUB_TOKEN` is optional. When set, the worker's GitHub tools use it as a bearer token for GitHub API requests, which helps with private repositories and rate limits. `github_list_issues` returns number, state, title, URL, and a bounded body preview; `github_get_issue` retrieves one issue with author, labels, timestamps, comment count, and bounded full body context.
+`GITHUB_TOKEN` is optional for read-only GitHub tools and required for write tools. When set, the worker's GitHub tools use it as a bearer token for GitHub API requests, which helps with private repositories and rate limits. `github_list_issues` returns number, state, title, URL, and a bounded body preview; `github_get_issue` retrieves one issue with author, labels, timestamps, comment count, and bounded full body context. `github_comment_issue` and `github_update_issue_state` let a worker report results back to an issue or reopen/close it after confirming the target is not a pull request.
 
 Run the Web UI:
 
@@ -235,7 +235,7 @@ The main agent should not mutate task state through hidden database writes. It s
 
 For substantial task execution, code changes, long-running operations, or risky local actions, the main agent should delegate to a worker agent. For lightweight planning and inspection, it may use local tools directly.
 
-The main agent's lightweight local inspection tools remain read-oriented and auditable. Worker agents now have explicit execution tools for file reads/writes, directory listing, shell commands, read-only git status/diff checks, HTTP(S) fetches, and GitHub issue listing/detail retrieval. Skill `tool_subset` values control which execution tools are visible; aliases such as `filesystem`, `shell`, `git`, `network`, and `github` map to the corresponding worker tools. The `github` and `github_search` aliases expose generic HTTP fetches, `github_list_issues`, and `github_get_issue`.
+The main agent's lightweight local inspection tools remain read-oriented and auditable. Worker agents now have explicit execution tools for file reads/writes, directory listing, shell commands, read-only git status/diff checks, HTTP(S) fetches, and GitHub issue listing/detail/comment/state operations. Skill `tool_subset` values control which execution tools are visible; aliases such as `filesystem`, `shell`, `git`, `network`, and `github` map to the corresponding worker tools. The `github` and `github_search` aliases expose generic HTTP fetches, `github_list_issues`, `github_get_issue`, `github_comment_issue`, and `github_update_issue_state`.
 
 ### Worker Agent
 
