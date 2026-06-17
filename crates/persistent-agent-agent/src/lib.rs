@@ -757,9 +757,17 @@ impl MainAgent {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
             },
-            MainAgentIntent::InspectWorkspace => self.inspect_workspace_status().await?,
+            MainAgentIntent::InspectWorkspace => match self.inspect_workspace_status().await {
+                Ok(reply) => reply,
+                Err(error) => format!("I could not inspect the workspace status: {error}"),
+            },
             MainAgentIntent::InspectWorkspaceFile { path } => {
-                self.inspect_workspace_file(&path).await?
+                match self.inspect_workspace_file(&path).await {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        format!("I could not inspect workspace file '{}': {error}", path)
+                    }
+                }
             }
             MainAgentIntent::ApproveMemory { selector } => match self.find_memory(&selector).await?
             {
@@ -789,7 +797,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -3283,6 +3291,34 @@ mod tests {
         assert!(global_actions.iter().any(|action| {
             action.action_type == "inspect_workspace_file" && action.details["path"] == "Cargo.toml"
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_reports_workspace_file_read_errors_in_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db);
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "read file C:\\Windows\\win.ini".to_owned(),
+            })
+            .await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("I could not inspect workspace file")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("must be relative")
+        );
+        assert_eq!(response.changed_tasks.len(), 0);
 
         Ok(())
     }
