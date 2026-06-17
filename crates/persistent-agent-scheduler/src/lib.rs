@@ -727,7 +727,7 @@ async fn dispatch_task_with_harness(
     Ok(state.merge_into_result(result))
 }
 
-const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, http_fetch, or github_list_issues when the task requires workspace, network, or GitHub issue work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, git_status, git_diff, http_fetch, or github_list_issues when the task requires workspace, code, network, or GitHub issue work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
 
 const LIFECYCLE_TOOL_NAMES: &[&str] = &[
     "remember",
@@ -743,6 +743,8 @@ const EXECUTION_TOOL_NAMES: &[&str] = &[
     "append_file",
     "list_dir",
     "shell",
+    "git_status",
+    "git_diff",
     "http_fetch",
     "github_list_issues",
 ];
@@ -807,6 +809,8 @@ fn execution_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(WriteFileTool::new(true)),
         Arc::new(ListDirTool::new()),
         Arc::new(ShellTool::new()),
+        Arc::new(GitStatusTool::new()),
+        Arc::new(GitDiffTool::new()),
         Arc::new(HttpFetchTool::new()),
         Arc::new(GitHubListIssuesTool::new()),
     ]
@@ -836,6 +840,9 @@ fn active_worker_tool_names(allowed_tools: &[String]) -> Vec<String> {
                 );
             }
             "shell" | "bash" | "powershell" | "cmd" => extend_unique(&mut names, &["shell"]),
+            "git" | "code" | "repo" | "repository" => {
+                extend_unique(&mut names, &["git_status", "git_diff"]);
+            }
             "network" | "net" | "http" | "https" | "web" => {
                 extend_unique(&mut names, &["http_fetch"]);
             }
@@ -1161,6 +1168,175 @@ impl Tool for ShellTool {
             })
         })
     }
+}
+
+struct GitStatusTool {
+    schema: serde_json::Value,
+}
+
+impl GitStatusTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string" }
+                }
+            }),
+        }
+    }
+}
+
+impl Tool for GitStatusTool {
+    fn name(&self) -> &str {
+        "git_status"
+    }
+
+    fn description(&self) -> &str {
+        "Show concise git branch and worktree status for the task workspace."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let cwd = optional_cwd(&args);
+            let output =
+                execute_worker_shell(ctx, "git status --short --branch", cwd, 30_000).await?;
+            let text = format_shell_tool_text(&output);
+            let truncated = truncate_chars(&text, 12_000);
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: truncated.text,
+                }],
+                details: json!({
+                    "cmd": "git status --short --branch",
+                    "exit_code": output.exit_code,
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "truncated": truncated.truncated,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+struct GitDiffTool {
+    schema: serde_json::Value,
+}
+
+impl GitDiffTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string" },
+                    "staged": { "type": "boolean" },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 30000 }
+                }
+            }),
+        }
+    }
+}
+
+impl Tool for GitDiffTool {
+    fn name(&self) -> &str {
+        "git_diff"
+    }
+
+    fn description(&self) -> &str {
+        "Show git diff for the task workspace. Set staged=true to inspect staged changes."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let cwd = optional_cwd(&args);
+            let staged = args
+                .get("staged")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let max_chars = bounded_usize(&args, "max_chars", 20_000, 1, 30_000);
+            let cmd = if staged {
+                "git diff --cached"
+            } else {
+                "git diff"
+            };
+            let output = execute_worker_shell(ctx, cmd, cwd, 30_000).await?;
+            let text = format_shell_tool_text(&output);
+            let truncated = truncate_chars(&text, max_chars);
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: truncated.text,
+                }],
+                details: json!({
+                    "cmd": cmd,
+                    "exit_code": output.exit_code,
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "staged": staged,
+                    "truncated": truncated.truncated,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+fn optional_cwd(args: &serde_json::Value) -> Option<&Path> {
+    args.get("cwd")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Path::new)
+}
+
+async fn execute_worker_shell(
+    ctx: &ToolContext,
+    cmd: &str,
+    cwd: Option<&Path>,
+    timeout_ms: u64,
+) -> Result<llm_harness_agent::prelude::ShellOutput, ToolError> {
+    ctx.env
+        .execute_shell(
+            cmd,
+            ShellOptions {
+                cwd,
+                env: Vec::new(),
+                timeout: Some(Duration::from_millis(timeout_ms)),
+                abort: ctx.abort.clone(),
+                on_stdout: None,
+                on_stderr: None,
+            },
+        )
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))
+}
+
+fn format_shell_tool_text(output: &llm_harness_agent::prelude::ShellOutput) -> String {
+    format!(
+        "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+        output.exit_code, output.stdout, output.stderr
+    )
 }
 
 struct HttpFetchTool {
@@ -2577,6 +2753,8 @@ mod tests {
                 "append_file",
                 "list_dir",
                 "shell",
+                "git_status",
+                "git_diff",
                 "http_fetch",
                 "github_list_issues"
             ]
@@ -2585,13 +2763,19 @@ mod tests {
 
     #[test]
     fn skill_tool_subset_filters_worker_execution_tools() {
-        let names = active_worker_tool_names(&["filesystem".to_owned(), "github".to_owned()]);
+        let names = active_worker_tool_names(&[
+            "filesystem".to_owned(),
+            "github".to_owned(),
+            "git".to_owned(),
+        ]);
 
         assert!(names.contains(&"complete_task".to_owned()));
         assert!(names.contains(&"read_file".to_owned()));
         assert!(names.contains(&"write_file".to_owned()));
         assert!(names.contains(&"append_file".to_owned()));
         assert!(names.contains(&"list_dir".to_owned()));
+        assert!(names.contains(&"git_status".to_owned()));
+        assert!(names.contains(&"git_diff".to_owned()));
         assert!(names.contains(&"http_fetch".to_owned()));
         assert!(names.contains(&"github_list_issues".to_owned()));
         assert!(!names.contains(&"shell".to_owned()));

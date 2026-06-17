@@ -86,6 +86,7 @@ The first harness-backed product tools are:
 - `create_follow_up_task` (wired)
 - `read_file` / `write_file` / `append_file` / `list_dir` (wired through runtime `ExecutionEnv`)
 - `shell` (wired through runtime `ExecutionEnv`)
+- `git_status` / `git_diff` (wired as read-only git inspection helpers through runtime `ExecutionEnv`)
 - `http_fetch` (wired for HTTP(S) lookups)
 - `github_list_issues` (wired for read-only GitHub issue discovery; uses optional `GITHUB_TOKEN`)
 
