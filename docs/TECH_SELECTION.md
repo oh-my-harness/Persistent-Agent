@@ -289,7 +289,7 @@ Product skill records can point to skill directories, prompt resources, tool sub
 Activation order:
 
 1. user-requested skills;
-2. task-type default skills;
+2. task-type default skills, expressed initially as deterministic rules such as `type:recurring` or `task_type:one_off`;
 3. automatic matcher results;
 4. main-agent adjustments.
 

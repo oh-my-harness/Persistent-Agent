@@ -37,7 +37,9 @@ impl Db {
         let conversation_id = Uuid::now_v7();
         let queue_position = self.next_queue_position().await?;
         let requested_skills = serde_json::to_string(&input.requested_skills)?;
-        let matched_skill_names = self.match_skills(&input.title, &input.description).await?;
+        let matched_skill_names = self
+            .match_skills(&input.title, &input.description, input.task_type)
+            .await?;
         let matched_skills = serde_json::to_string(&matched_skill_names)?;
         let schedule = input
             .schedule
@@ -136,7 +138,9 @@ impl Db {
         let description = input.description.unwrap_or(current.description);
         let priority = input.priority.unwrap_or(current.priority);
         let requested_skills = input.requested_skills.unwrap_or(current.requested_skills);
-        let matched_skills = self.match_skills(&title, &description).await?;
+        let matched_skills = self
+            .match_skills(&title, &description, current.task_type)
+            .await?;
         let schedule = input.schedule.or(current.schedule);
         let now = Utc::now();
 
@@ -259,16 +263,20 @@ impl Db {
             (TaskType::Recurring, TaskStatus::Completed) => TaskStatus::WaitingForSchedule,
             (_, status) => status,
         };
+        let matched_skills = self
+            .match_skills(&current.title, &current.description, task_type)
+            .await?;
 
         sqlx::query(
             r#"
             UPDATE tasks
-            SET task_type = ?, status = ?, schedule = ?, next_run_at = ?, updated_at = ?
+            SET task_type = ?, status = ?, matched_skills = ?, schedule = ?, next_run_at = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(task_type.to_string())
         .bind(status.to_string())
+        .bind(serde_json::to_string(&matched_skills)?)
         .bind(schedule.as_ref().map(serde_json::to_string).transpose()?)
         .bind(next_run_at)
         .bind(now)
@@ -280,7 +288,7 @@ impl Db {
             Some(id),
             actor,
             "convert_task_type",
-            json!({ "task_type": task_type, "schedule": schedule }),
+            json!({ "task_type": task_type, "schedule": schedule, "matched_skills": matched_skills }),
         )
         .await?;
 
@@ -1507,17 +1515,17 @@ impl Db {
         Ok(skill)
     }
 
-    async fn match_skills(&self, title: &str, description: &str) -> anyhow::Result<Vec<String>> {
+    async fn match_skills(
+        &self,
+        title: &str,
+        description: &str,
+        task_type: TaskType,
+    ) -> anyhow::Result<Vec<String>> {
         let skills = self.list_skills().await?;
         let haystack = format!("{title}\n{description}").to_lowercase();
         let matched = skills
             .into_iter()
-            .filter(|skill| {
-                skill.trigger_rules.iter().any(|rule| {
-                    let rule = rule.trim().to_lowercase();
-                    !rule.is_empty() && haystack.contains(&rule)
-                })
-            })
+            .filter(|skill| skill_matches_task(skill, &haystack, task_type))
             .map(|skill| skill.name)
             .collect();
 
@@ -1530,7 +1538,9 @@ impl Db {
             .await?;
         for row in rows {
             let task = row_to_task(row)?;
-            let matched_skills = self.match_skills(&task.title, &task.description).await?;
+            let matched_skills = self
+                .match_skills(&task.title, &task.description, task.task_type)
+                .await?;
             if matched_skills == task.matched_skills {
                 continue;
             }
@@ -1605,6 +1615,46 @@ fn recurring_interval_seconds(schedule: Option<&Value>) -> i64 {
         .unwrap_or(300);
 
     seconds.max(0)
+}
+
+fn skill_matches_task(skill: &Skill, haystack: &str, task_type: TaskType) -> bool {
+    skill.trigger_rules.iter().any(|rule| {
+        let rule = rule.trim().to_lowercase();
+        if rule.is_empty() {
+            return false;
+        }
+
+        if let Some(expected_task_type) = parse_task_type_rule(&rule) {
+            return expected_task_type == task_type;
+        }
+
+        haystack.contains(&rule)
+    })
+}
+
+fn parse_task_type_rule(rule: &str) -> Option<TaskType> {
+    for prefix in [
+        "type:",
+        "type=",
+        "task_type:",
+        "task_type=",
+        "task-type:",
+        "task-type=",
+    ] {
+        if let Some(value) = rule.strip_prefix(prefix) {
+            return parse_task_type_rule_value(value);
+        }
+    }
+
+    None
+}
+
+fn parse_task_type_rule_value(value: &str) -> Option<TaskType> {
+    match value.trim().replace('-', "_").as_str() {
+        "one_off" | "oneoff" | "once" => Some(TaskType::OneOff),
+        "recurring" | "repeat" | "scheduled" => Some(TaskType::Recurring),
+        _ => None,
+    }
 }
 
 fn row_to_memory(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Memory> {
@@ -2052,6 +2102,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_creation_matches_skills_by_task_type_rules() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "recurring-monitor".to_owned(),
+                description: "Default recurring monitor skill".to_owned(),
+                trigger_rules: vec!["type:recurring".to_owned()],
+                tool_subset: vec!["scheduler".to_owned()],
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+        db.create_skill(
+            CreateSkill {
+                name: "one-off-review".to_owned(),
+                description: "Default one-off review skill".to_owned(),
+                trigger_rules: vec!["task_type:one_off".to_owned()],
+                tool_subset: Vec::new(),
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+
+        let recurring = db
+            .create_task(
+                CreateTask {
+                    title: "Check repository issues".to_owned(),
+                    description: "Poll for updates".to_owned(),
+                    task_type: TaskType::Recurring,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: Some(json!({ "interval_seconds": 60 })),
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let one_off = db
+            .create_task(
+                CreateTask {
+                    title: "Write release notes".to_owned(),
+                    description: "One time writing task".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        assert_eq!(recurring.matched_skills, vec!["recurring-monitor"]);
+        assert_eq!(one_off.matched_skills, vec!["one-off-review"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn task_update_refreshes_matched_skills() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         db.create_skill(
@@ -2377,6 +2488,17 @@ mod tests {
     #[tokio::test]
     async fn task_type_can_be_converted_with_audit_action() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "recurring-monitor".to_owned(),
+                description: "Default recurring monitor skill".to_owned(),
+                trigger_rules: vec!["type:recurring".to_owned()],
+                tool_subset: Vec::new(),
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
         let task = db
             .create_task(
                 CreateTask {
@@ -2407,7 +2529,9 @@ mod tests {
 
         assert_eq!(recurring.task_type, TaskType::Recurring);
         assert_eq!(recurring.schedule, Some(json!({ "interval_seconds": 12 })));
+        assert_eq!(recurring.matched_skills, vec!["recurring-monitor"]);
         assert_eq!(one_off.task_type, TaskType::OneOff);
+        assert!(one_off.matched_skills.is_empty());
         assert!(one_off.schedule.is_none());
         assert!(one_off.next_run_at.is_none());
         assert!(

@@ -33,7 +33,7 @@ The repository now contains the first executable skeleton:
 - Running workers are stopped when their task lease is lost because the task was cancelled, paused, or otherwise moved out of `running`.
 - Worker execution failures can be retried according to scheduler policy before being marked permanently failed.
 - Worker execution failures are persisted as failed tasks with attempt events.
-- Skill management with automatic matching, explicit task selection, and active-skill metadata/resource-path injection for workers.
+- Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
 - Long-term memory candidate review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
@@ -237,10 +237,11 @@ Skills are user-defined capability packages. A skill can include:
 - examples,
 - safety constraints.
 
-Skill activation should support two paths:
+Skill activation should support these paths:
 
 1. Explicit activation: the user attaches skills when creating a task.
 2. Automatic activation: the system matches skills against task title, description, metadata, and historical usage.
+3. Task-type defaults: rules such as `type:recurring` or `task_type:one_off` activate a skill for recurring or one-off tasks.
 
 When both exist, explicit user selection should take precedence.
 
