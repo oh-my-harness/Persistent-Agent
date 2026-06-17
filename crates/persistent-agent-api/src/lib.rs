@@ -17,7 +17,9 @@ use persistent_agent_domain::{
     Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskDependency, TaskId,
     TaskNote, TaskResourceLock, UpdateMemory, UpdateSkill, UpdateTask,
 };
-use persistent_agent_scheduler::{Scheduler, SchedulerPolicy, SchedulerTick, WorkerBackend};
+use persistent_agent_scheduler::{
+    Scheduler, SchedulerOutcome, SchedulerPolicy, SchedulerTick, WorkerBackend,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
@@ -509,9 +511,7 @@ async fn send_main_agent_message(
     }
     if response.scheduler_tick_requested {
         let tick = state.scheduler.tick().await?;
-        state
-            .events
-            .send(AppEvent::SchedulerTick { tick: tick.clone() });
+        emit_scheduler_tick_events(&state, &tick).await?;
     }
     Ok(Json(response))
 }
@@ -520,10 +520,50 @@ async fn run_scheduler_tick(
     State(state): State<AppState>,
 ) -> Result<Json<SchedulerTick>, ApiError> {
     let tick = state.scheduler.tick().await?;
+    emit_scheduler_tick_events(&state, &tick).await?;
+    Ok(Json(tick))
+}
+
+async fn emit_scheduler_tick_events(state: &AppState, tick: &SchedulerTick) -> anyhow::Result<()> {
+    let mut emitted_task_ids = HashSet::new();
+
+    for task in tick
+        .recovered_tasks
+        .iter()
+        .chain(tick.requeued_tasks.iter())
+    {
+        if emitted_task_ids.insert(task.id) {
+            state
+                .events
+                .send(AppEvent::TaskChanged { task: task.clone() });
+        }
+    }
+
+    if let Some(task) = &tick.claimed_task {
+        if emitted_task_ids.insert(task.id) {
+            state.events.send(AppEvent::TaskChanged {
+                task: state.db.get_task(task.id).await?,
+            });
+        }
+    }
+
+    if let SchedulerOutcome::Completed {
+        follow_up_tasks, ..
+    } = &tick.outcome
+    {
+        for task in follow_up_tasks {
+            if emitted_task_ids.insert(task.id) {
+                state
+                    .events
+                    .send(AppEvent::TaskChanged { task: task.clone() });
+            }
+        }
+    }
+
     state
         .events
         .send(AppEvent::SchedulerTick { tick: tick.clone() });
-    Ok(Json(tick))
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -692,7 +732,11 @@ pub async fn spawn_scheduler_loop(state: AppState, interval_duration: Duration) 
     loop {
         interval.tick().await;
         match state.scheduler.tick().await {
-            Ok(tick) => state.events.send(AppEvent::SchedulerTick { tick }),
+            Ok(tick) => {
+                if let Err(error) = emit_scheduler_tick_events(&state, &tick).await {
+                    tracing::error!(?error, "scheduler loop event emission failed");
+                }
+            }
             Err(error) => tracing::error!(?error, "scheduler loop tick failed"),
         }
     }
