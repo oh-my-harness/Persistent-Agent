@@ -83,6 +83,8 @@ The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTER
 
 `MEMORY_AUTO_APPROVE_CONFIDENCE` optionally auto-approves worker memory candidates at or above the configured confidence threshold, from `0.0` to `1.0`. Leave it unset to keep manual review as the default.
 
+`GITHUB_TOKEN` is optional. When set, the worker's `github_list_issues` tool uses it as a bearer token for GitHub API requests, which helps with private repositories and rate limits. Issue results include number, state, title, URL, and a bounded body preview.
+
 Run the Web UI:
 
 ```powershell

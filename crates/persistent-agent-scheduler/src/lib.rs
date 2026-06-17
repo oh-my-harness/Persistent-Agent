@@ -1291,14 +1291,12 @@ impl Tool for GitHubListIssuesTool {
                 .unwrap_or("open");
             let limit = bounded_usize(&args, "limit", 10, 1, 30);
             let url = github_issues_url(&repository, state, limit)?;
-            let response = reqwest::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .user_agent("Persistent-Agent/0.1")
                 .build()
-                .map_err(|error| ToolError::Execution(error.to_string()))?
-                .get(url)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let response = github_request_builder(&client, url)
                 .send()
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
@@ -1385,6 +1383,21 @@ fn github_issues_url(
     .map_err(|error| ToolError::InvalidArguments(error.to_string()))
 }
 
+fn github_request_builder(client: &reqwest::Client, url: reqwest::Url) -> reqwest::RequestBuilder {
+    let mut builder = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            builder = builder.bearer_auth(token);
+        }
+    }
+
+    builder
+}
+
 fn is_safe_github_path_part(value: &str) -> bool {
     value
         .chars()
@@ -1409,7 +1422,18 @@ fn format_github_issue_summary(issue: serde_json::Value) -> String {
         .get("html_url")
         .and_then(|value| value.as_str())
         .unwrap_or("no url");
-    format!("#{number} [{state}] {title} - {url}")
+    let body_preview = issue
+        .get("body")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .map(|body| truncate_chars(body, 500).text);
+    match body_preview {
+        Some(body_preview) => {
+            format!("#{number} [{state}] {title} - {url}\n  body: {body_preview}")
+        }
+        None => format!("#{number} [{state}] {title} - {url}"),
+    }
 }
 
 struct CompleteTaskTool {
@@ -2653,6 +2677,20 @@ mod tests {
             github_issues_url("owner/repo", "triaged", 10),
             Err(ToolError::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn github_issue_summary_includes_body_preview() {
+        let summary = format_github_issue_summary(json!({
+            "number": 42,
+            "state": "open",
+            "title": "Fix recurring task issue checks",
+            "html_url": "https://github.com/oh-my-harness/Persistent-Agent/issues/42",
+            "body": "The worker should inspect issue details before deciding whether to edit files."
+        }));
+
+        assert!(summary.contains("#42 [open] Fix recurring task issue checks"));
+        assert!(summary.contains("body: The worker should inspect issue details"));
     }
 
     #[test]
