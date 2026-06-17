@@ -1,3 +1,5 @@
+use std::{env, process::Command};
+
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task, TaskId,
@@ -349,6 +351,50 @@ impl MainAgent {
         Ok(format_task_explanation(&task, &dependency_states))
     }
 
+    pub async fn inspect_workspace_status(&self) -> anyhow::Result<String> {
+        let cwd = env::current_dir()?;
+        let git_status = Command::new("git")
+            .args(["status", "--short", "--branch"])
+            .current_dir(&cwd)
+            .output();
+
+        let (status_text, success) = match git_status {
+            Ok(output) if output.status.success() => (
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                true,
+            ),
+            Ok(output) => (
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                false,
+            ),
+            Err(error) => (error.to_string(), false),
+        };
+
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_workspace_status",
+                serde_json::json!({
+                    "cwd": cwd.display().to_string(),
+                    "git_status_success": success,
+                }),
+            )
+            .await?;
+
+        let status_text = if status_text.is_empty() {
+            "no output".to_owned()
+        } else {
+            status_text
+        };
+
+        Ok(format!(
+            "Workspace: {}\nGit status:\n{}",
+            cwd.display(),
+            status_text
+        ))
+    }
+
     pub async fn approve_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
         self.db
             .set_memory_status(id, MemoryStatus::Approved, "main_agent")
@@ -655,6 +701,7 @@ impl MainAgent {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
             },
+            MainAgentIntent::InspectWorkspace => self.inspect_workspace_status().await?,
             MainAgentIntent::ApproveMemory { selector } => match self.find_memory(&selector).await?
             {
                 Ok(memory) => {
@@ -862,6 +909,7 @@ enum MainAgentIntent {
     ExplainTask {
         selector: String,
     },
+    InspectWorkspace,
     ApproveMemory {
         selector: String,
     },
@@ -883,6 +931,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(intent) = parse_split_intent(trimmed, &normalized) {
         return intent;
+    }
+
+    if is_workspace_inspection_request(&normalized) {
+        return MainAgentIntent::InspectWorkspace;
     }
 
     if is_scheduler_scan_request(&normalized) {
@@ -1224,6 +1276,25 @@ fn is_scheduler_scan_request(normalized: &str) -> bool {
             ZH_SCHEDULER,
             ZH_TASK_POOL,
             ZH_TASK,
+        ],
+    ) && !is_create_request(normalized)
+}
+
+fn is_workspace_inspection_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "workspace status",
+            "project status",
+            "repo status",
+            "repository status",
+            "git status",
+            "inspect workspace",
+            "inspect project",
+            "\u{9879}\u{76ee}\u{72b6}\u{6001}",
+            "\u{4ed3}\u{5e93}\u{72b6}\u{6001}",
+            "\u{67e5}\u{770b}\u{9879}\u{76ee}",
+            "\u{68c0}\u{67e5}\u{9879}\u{76ee}",
         ],
     ) && !is_create_request(normalized)
 }
@@ -2283,6 +2354,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_inspection_intents() {
+        assert_eq!(
+            parse_intent("check project status"),
+            MainAgentIntent::InspectWorkspace
+        );
+        assert_eq!(
+            parse_intent("git status"),
+            MainAgentIntent::InspectWorkspace
+        );
+    }
+
+    #[test]
     fn parses_split_tasks_intents() {
         assert_eq!(
             parse_intent("split goal: investigate issue; write fix; run tests"),
@@ -3033,6 +3116,30 @@ mod tests {
                 .assistant_message
                 .content
                 .contains("Scheduler scan requested")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_inspect_workspace_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "check project status".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(response.assistant_message.content.contains("Workspace:"));
+        assert!(response.assistant_message.content.contains("Git status:"));
+        assert_eq!(response.changed_tasks.len(), 0);
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "inspect_workspace_status")
         );
 
         Ok(())
