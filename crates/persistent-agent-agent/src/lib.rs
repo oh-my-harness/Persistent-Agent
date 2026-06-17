@@ -553,6 +553,30 @@ impl MainAgent {
             .await
     }
 
+    pub async fn list_memories_for_review(
+        &self,
+        filter: MemoryListFilter,
+    ) -> anyhow::Result<String> {
+        let memories = self.db.list_memories().await?;
+        let filtered = memories
+            .into_iter()
+            .filter(|memory| filter.matches(memory.status))
+            .collect::<Vec<_>>();
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_memories",
+                serde_json::json!({
+                    "filter": filter.as_str(),
+                    "count": filtered.len(),
+                }),
+            )
+            .await?;
+
+        Ok(format_memory_list(filter, &filtered))
+    }
+
     pub async fn main_conversation_messages(
         &self,
         limit: i64,
@@ -889,12 +913,13 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::ListMemories { filter } => self.list_memories_for_review(filter).await?,
             MainAgentIntent::RunSchedulerTick => {
                 "Scheduler scan requested. I will ask the scheduler to check the task pool now."
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, show task artifacts, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1001,6 +1026,34 @@ pub struct MainAgentMessageResponse {
     pub scheduler_tick_requested: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryListFilter {
+    Pending,
+    Approved,
+    Rejected,
+    All,
+}
+
+impl MemoryListFilter {
+    fn matches(self, status: MemoryStatus) -> bool {
+        match self {
+            Self::Pending => status == MemoryStatus::Pending,
+            Self::Approved => status == MemoryStatus::Approved,
+            Self::Rejected => status == MemoryStatus::Rejected,
+            Self::All => true,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MainAgentIntent {
     SplitTasks {
@@ -1087,6 +1140,9 @@ enum MainAgentIntent {
     RejectMemory {
         selector: String,
     },
+    ListMemories {
+        filter: MemoryListFilter,
+    },
     RunSchedulerTick,
     Summarize,
     Help,
@@ -1129,6 +1185,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         return MainAgentIntent::Summarize;
     }
 
+    if let Some(intent) = parse_memory_review_intent(trimmed, &normalized) {
+        return intent;
+    }
+
     if is_list_tasks_request(&normalized) {
         return MainAgentIntent::ListTasks;
     }
@@ -1158,10 +1218,6 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_clarification_intent(trimmed, &normalized) {
-        return intent;
-    }
-
-    if let Some(intent) = parse_memory_review_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -1662,6 +1718,51 @@ fn format_task_artifacts(task: &Task, artifacts: &[TaskArtifact]) -> String {
     lines.join("\n")
 }
 
+fn format_memory_list(filter: MemoryListFilter, memories: &[Memory]) -> String {
+    if memories.is_empty() {
+        return format!("No {} memories found.", filter.as_str());
+    }
+
+    let mut lines = vec![format!(
+        "{} memories ({} shown):",
+        capitalize_ascii(filter.as_str()),
+        memories.len().min(10)
+    )];
+    for memory in memories.iter().take(10) {
+        let source = memory
+            .source_task_id
+            .map(|id| {
+                format!(
+                    " source {}",
+                    id.to_string().chars().take(8).collect::<String>()
+                )
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {} [{} {} confidence {:.2}{}] {}",
+            memory.id.to_string().chars().take(8).collect::<String>(),
+            memory.status,
+            memory.scope,
+            memory.confidence,
+            source,
+            memory.content
+        ));
+    }
+    if memories.len() > 10 {
+        lines.push(format!("- ... and {} more", memories.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn capitalize_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 fn parse_explain_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -2063,13 +2164,44 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
         normalized,
         &[
             "memory",
+            "memories",
             "memory candidate",
+            "memory candidates",
             "long-term memory",
+            "long-term memories",
             ZH_MEMORY,
             ZH_LONG_TERM_MEMORY,
         ],
     ) {
         return None;
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "list memory",
+            "list memories",
+            "show memory",
+            "show memories",
+            "memory list",
+            "memory candidates",
+            "pending memories",
+            "approved memories",
+            "rejected memories",
+            ZH_LIST,
+            "\u{67e5}\u{770b}",
+        ],
+    ) {
+        let filter = if contains_any(normalized, &["approved", ZH_APPROVE, ZH_ACCEPT]) {
+            MemoryListFilter::Approved
+        } else if contains_any(normalized, &["rejected", "discarded", ZH_REJECT]) {
+            MemoryListFilter::Rejected
+        } else if contains_any(normalized, &["all", "every", "\u{5168}\u{90e8}"]) {
+            MemoryListFilter::All
+        } else {
+            MemoryListFilter::Pending
+        };
+        return Some(MainAgentIntent::ListMemories { filter });
     }
 
     if contains_any(
@@ -2661,6 +2793,7 @@ fn extract_number_after_last_any(normalized: &str, markers: &[&str]) -> Option<i
 mod tests {
     use super::*;
     use persistent_agent_db::Db;
+    use persistent_agent_domain::CreateMemory;
 
     #[test]
     fn parses_create_task_with_priority() {
@@ -3074,6 +3207,24 @@ mod tests {
     #[test]
     fn parses_memory_review_intents() {
         assert_eq!(
+            parse_intent("show memory candidates"),
+            MainAgentIntent::ListMemories {
+                filter: MemoryListFilter::Pending,
+            }
+        );
+        assert_eq!(
+            parse_intent("list approved memories"),
+            MainAgentIntent::ListMemories {
+                filter: MemoryListFilter::Approved,
+            }
+        );
+        assert_eq!(
+            parse_intent("\u{5217}\u{51fa}\u{957f}\u{671f}\u{8bb0}\u{5fc6}\u{5168}\u{90e8}"),
+            MainAgentIntent::ListMemories {
+                filter: MemoryListFilter::All,
+            }
+        );
+        assert_eq!(
             parse_intent("approve memory candidate: prefer cargo test before push"),
             MainAgentIntent::ApproveMemory {
                 selector: "prefer cargo test before push".to_owned(),
@@ -3251,6 +3402,74 @@ mod tests {
         let updated = db.get_task(task.id).await?;
 
         assert_eq!(updated.requested_skills, vec!["github"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_memories_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "Prefer cargo test before pushing.".to_owned(),
+                source_task_id: None,
+                status: MemoryStatus::Pending,
+                confidence: 0.8,
+            },
+            "worker",
+        )
+        .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "Use browser screenshots for UI changes.".to_owned(),
+                source_task_id: None,
+                status: MemoryStatus::Approved,
+                confidence: 0.9,
+            },
+            "worker",
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show memory candidates".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Prefer cargo test")
+        );
+        assert!(
+            !response
+                .assistant_message
+                .content
+                .contains("browser screenshots")
+        );
+        assert!(actions.iter().any(|action| {
+            action.action_type == "list_memories"
+                && action.details["filter"] == "pending"
+                && action.details["count"] == 1
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "list approved memories".to_owned(),
+            })
+            .await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("browser screenshots")
+        );
 
         Ok(())
     }

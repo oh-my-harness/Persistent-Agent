@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, show task artifacts, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
+- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, and execution history.
@@ -36,7 +36,7 @@ The repository now contains the first executable skeleton:
 - Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata/resource-path injection for workers.
 - Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
-- Long-term memory candidate review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
+- Long-term memory candidate listing and review through Web controls or main-agent conversation, edit/delete controls, and approved-memory injection into worker context.
 - Task detail history shows memory candidates proposed by that task.
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.
@@ -120,7 +120,7 @@ Tasks can enter the system through three channels:
 2. Structured creation through Web UI forms and queue controls.
 3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
 
-The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add requested skills, add resource locks, inspect local workspace status, show task artifacts, show recent audit actions, run a scheduler scan, or summarize the queue.
+The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add requested skills, add resource locks, inspect local workspace status, show task artifacts, list memory candidates, show recent audit actions, run a scheduler scan, or summarize the queue.
 
 Structured UI controls remain important for exact edits, batch operations, and reviewable state changes.
 
