@@ -86,6 +86,7 @@ impl Default for EventBus {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AppEvent {
     TaskChanged { task: Task },
+    TaskAttemptEvent { event: TaskAttemptEvent },
     MainAgentReply { message: ConversationMessage },
     MainAgentAction { action: TaskAction },
     SchedulerTick { tick: SchedulerTick },
@@ -545,6 +546,9 @@ async fn emit_scheduler_tick_events(state: &AppState, tick: &SchedulerTick) -> a
                 task: state.db.get_task(task.id).await?,
             });
         }
+        for event in latest_attempt_events_for_task(state, task.id).await? {
+            state.events.send(AppEvent::TaskAttemptEvent { event });
+        }
     }
 
     if let SchedulerOutcome::Completed {
@@ -564,6 +568,22 @@ async fn emit_scheduler_tick_events(state: &AppState, tick: &SchedulerTick) -> a
         .events
         .send(AppEvent::SchedulerTick { tick: tick.clone() });
     Ok(())
+}
+
+async fn latest_attempt_events_for_task(
+    state: &AppState,
+    task_id: TaskId,
+) -> anyhow::Result<Vec<TaskAttemptEvent>> {
+    let mut attempts = state.db.list_task_attempts(task_id).await?;
+    attempts.reverse();
+    for attempt in attempts {
+        let events = state.db.list_attempt_events(attempt.id).await?;
+        if !events.is_empty() {
+            return Ok(events);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 #[derive(Debug, Serialize)]

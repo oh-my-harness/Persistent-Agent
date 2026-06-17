@@ -78,6 +78,7 @@ export interface SchedulerPolicy {
 
 export type AppEvent =
   | { type: "task_changed"; task: Task }
+  | { type: "task_attempt_event"; event: TaskAttemptEvent }
   | { type: "main_agent_reply"; message: ConversationMessage }
   | { type: "main_agent_action"; action: TaskAction }
   | { type: "scheduler_tick"; tick: SchedulerTick }

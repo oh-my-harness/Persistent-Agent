@@ -680,6 +680,14 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
         tone: taskEventTone(event.task.status),
         timestamp,
       };
+    case "task_attempt_event":
+      return {
+        id: `${timestamp}-attempt-event-${event.event.id}`,
+        title: `Worker event: ${event.event.event_type}`,
+        detail: event.event.message,
+        tone: workerEventTone(event.event.event_type),
+        timestamp,
+      };
     case "main_agent_reply":
       return {
         id: `${timestamp}-main-agent-${event.message.id}`,
@@ -709,6 +717,13 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
     default:
       return fallback;
   }
+}
+
+function workerEventTone(eventType: string): TimelineEvent["tone"] {
+  if (eventType.includes("failed") || eventType.includes("lease_lost")) return "danger";
+  if (eventType.includes("blocked") || eventType.includes("retry")) return "warning";
+  if (eventType.includes("completed")) return "success";
+  return "info";
 }
 
 function schedulerTimelineEvent(tick: SchedulerTick, timestamp: string): TimelineEvent {

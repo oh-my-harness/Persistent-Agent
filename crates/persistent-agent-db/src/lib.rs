@@ -758,6 +758,24 @@ impl Db {
         rows.into_iter().map(row_to_task_attempt_event).collect()
     }
 
+    pub async fn list_attempt_events(
+        &self,
+        attempt_id: TaskAttemptId,
+    ) -> anyhow::Result<Vec<TaskAttemptEvent>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM task_attempt_events
+            WHERE attempt_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(attempt_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_task_attempt_event).collect()
+    }
+
     pub async fn record_task_artifact(
         &self,
         task_id: TaskId,
@@ -2327,8 +2345,17 @@ mod tests {
                 "test",
             )
             .await?;
-        db.create_attempt(task.id, TaskStatus::Running, Some("started"))
+        let first_attempt = db
+            .create_attempt(task.id, TaskStatus::Running, Some("started"))
             .await?;
+        db.record_attempt_event(
+            first_attempt.id,
+            task.id,
+            "worker_context_prepared",
+            "Prepared worker context.",
+            json!({ "memory_count": 0 }),
+        )
+        .await?;
         let attempt = db
             .create_attempt(task.id, TaskStatus::Completed, Some("finished"))
             .await?;
@@ -2345,13 +2372,16 @@ mod tests {
 
         let attempts = db.list_task_attempts(task.id).await?;
         let events = db.list_task_attempt_events(task.id).await?;
+        let second_attempt_events = db.list_attempt_events(attempt.id).await?;
         let actions = db.list_task_actions(task.id).await?;
 
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].summary.as_deref(), Some("started"));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "worker_completed");
-        assert_eq!(events[0].details["summary"], "finished");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "worker_completed");
+        assert_eq!(events[1].details["summary"], "finished");
+        assert_eq!(second_attempt_events.len(), 1);
+        assert_eq!(second_attempt_events[0].event_type, "worker_completed");
         assert!(
             actions
                 .iter()
