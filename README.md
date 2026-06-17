@@ -33,6 +33,7 @@ The repository now contains the first executable skeleton:
 - Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, create/list/update/delete skill definitions, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
 - Optional main-agent LLM advisor through the approved `oh-my-harness` `AgentHarness`; deterministic task-state changes still run through product code, and the advisor composes the user-facing reply from the completed action context.
 - Main-agent task type conversion between one-off and recurring tasks.
+- Main-agent creation of GitHub repository tasks auto-adds the `github` requested skill and a `repo:owner/repo` resource lock when the request names a repository.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, notes, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
@@ -146,6 +147,8 @@ Tasks can enter the system through three channels:
 3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
 
 The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add requested skills, add resource locks, inspect local workspace status, show task artifacts, list memory candidates, show recent audit actions, run a scheduler scan, or summarize the queue.
+
+When a created task clearly references a GitHub repository, for example `oh-my-harness/Persistent-Agent` or a `github.com/owner/repo` URL, the main agent automatically requests the `github` skill and adds a `repo:owner/repo` resource lock so serial execution avoids conflicting repository work.
 
 Structured UI controls remain important for exact edits, batch operations, and reviewable state changes.
 

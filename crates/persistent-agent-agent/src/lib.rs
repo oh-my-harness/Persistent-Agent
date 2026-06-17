@@ -689,6 +689,10 @@ impl MainAgent {
                 interval_seconds,
                 requested_skills,
             } => {
+                let requested_skills =
+                    enrich_requested_skills_for_task_text(requested_skills, &description);
+                let requested_skills_for_reply = requested_skills.clone();
+                let inferred_resource_locks = infer_resource_locks_for_task_text(&description);
                 let schedule = match task_type {
                     TaskType::OneOff => None,
                     TaskType::Recurring => Some(
@@ -706,10 +710,25 @@ impl MainAgent {
                         created_by: "user".to_owned(),
                     })
                     .await?;
-                let reply = format!(
+                for resource_key in &inferred_resource_locks {
+                    self.add_task_resource_lock(task.id, resource_key).await?;
+                }
+                let mut reply = format!(
                     "Created task '{}'. Status: {}, priority: {}.",
                     task.title, task.status, task.priority
                 );
+                if !requested_skills_for_reply.is_empty() {
+                    reply.push_str(&format!(
+                        " Requested skills: {}.",
+                        format_skill_list(&requested_skills_for_reply)
+                    ));
+                }
+                if !inferred_resource_locks.is_empty() {
+                    reply.push_str(&format!(
+                        " Resource locks: {}.",
+                        inferred_resource_locks.join(", ")
+                    ));
+                }
                 changed_tasks.push(task);
                 reply
             }
@@ -1632,6 +1651,103 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     MainAgentIntent::Help
+}
+
+fn enrich_requested_skills_for_task_text(
+    mut requested_skills: Vec<String>,
+    task_text: &str,
+) -> Vec<String> {
+    if is_github_task_text(task_text)
+        && !requested_skills
+            .iter()
+            .any(|skill| skill.eq_ignore_ascii_case("github"))
+    {
+        requested_skills.push("github".to_owned());
+    }
+
+    requested_skills
+}
+
+fn infer_resource_locks_for_task_text(task_text: &str) -> Vec<String> {
+    if !is_github_task_text(task_text) {
+        return Vec::new();
+    }
+
+    dedupe_strings(
+        extract_github_repository_refs(task_text)
+            .into_iter()
+            .map(|repository| format!("repo:{repository}"))
+            .collect(),
+    )
+}
+
+fn is_github_task_text(task_text: &str) -> bool {
+    let normalized = task_text.to_ascii_lowercase();
+    normalized.contains("github")
+        || normalized.contains("github.com/")
+        || normalized.contains("仓库")
+        || normalized.contains("代码仓")
+        || !extract_github_repository_refs(task_text).is_empty()
+}
+
+fn extract_github_repository_refs(task_text: &str) -> Vec<String> {
+    let tokens = task_text
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | ';' | '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']'
+                )
+        })
+        .filter_map(normalize_github_repository_token)
+        .collect::<Vec<_>>();
+    dedupe_strings(tokens)
+}
+
+fn normalize_github_repository_token(token: &str) -> Option<String> {
+    let mut token = token
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | ':' | '/' | '#'));
+    if token.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = token.strip_prefix("https://github.com/") {
+        token = rest;
+    } else if let Some(rest) = token.strip_prefix("http://github.com/") {
+        token = rest;
+    } else if let Some(rest) = token.strip_prefix("github.com/") {
+        token = rest;
+    }
+
+    let mut parts = token.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    if !is_safe_github_repo_part(owner) || !is_safe_github_repo_part(repo) {
+        return None;
+    }
+
+    Some(format!("{owner}/{repo}"))
+}
+
+fn is_safe_github_repo_part(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.iter().any(|existing| existing == &value) {
+            deduped.push(value);
+        }
+    }
+
+    deduped
 }
 
 const MAIN_AGENT_ADVISOR_SYSTEM_PROMPT: &str = "You are the main agent for Persistent Agent. The deterministic task-state operation has already been performed by product code. Write a concise, helpful user-facing reply in the user's language. Preserve the facts from the deterministic reply. Do not claim that you changed task state unless the deterministic reply says it happened. Mention useful next steps only when they directly follow from the current context.";
@@ -4000,6 +4116,55 @@ mod tests {
         assert!(response.assistant_message.content.contains("Created task"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_enriches_github_issue_tasks_with_skill_and_resource_lock()
+    -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "create recurring task: check GitHub repo oh-my-harness/Persistent-Agent issues every 60 seconds".to_owned(),
+            })
+            .await?;
+        let task = response.changed_tasks.first().expect("created task");
+        let locks = db.list_task_resource_locks(task.id).await?;
+
+        assert_eq!(task.requested_skills, vec!["github"]);
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].resource_key, "repo:oh-my-harness/Persistent-Agent");
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Requested skills: github")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("repo:oh-my-harness/Persistent-Agent")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn infers_github_repository_refs_from_urls_and_chinese_text() {
+        assert_eq!(
+            extract_github_repository_refs(
+                "\u{67e5}\u{770b} https://github.com/oh-my-harness/Persistent-Agent/issues \u{4ed3}\u{5e93} issue"
+            ),
+            vec!["oh-my-harness/Persistent-Agent"]
+        );
+        assert_eq!(
+            infer_resource_locks_for_task_text(
+                "\u{521b}\u{5efa}\u{5faa}\u{73af}\u{4efb}\u{52a1}\u{ff1a}\u{68c0}\u{67e5} oh-my-harness/Persistent-Agent \u{4ed3}\u{5e93} issue"
+            ),
+            vec!["repo:oh-my-harness/Persistent-Agent"]
+        );
     }
 
     #[tokio::test]
