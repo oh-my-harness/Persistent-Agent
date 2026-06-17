@@ -18,7 +18,7 @@ The repository now contains the first executable skeleton:
 - Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
-- Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, and execution history.
+- Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, notes, and execution history.
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.

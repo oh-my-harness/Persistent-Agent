@@ -777,6 +777,25 @@ textarea {
   grid-template-columns: minmax(0, 1fr) 34px;
 }
 
+.note-form {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) 34px;
+}
+
+.note-form textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.note-form button {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0;
+}
+
 .resource-lock-form input {
   min-width: 0;
 }

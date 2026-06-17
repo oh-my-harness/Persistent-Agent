@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, Check, CirclePause, History, ListTodo, Pencil, Play, Plus, RotateCw, Send, SquareX, X, Zap } from "lucide-react";
 import {
+  addTaskNote,
   addTaskDependency,
   approveMemory,
   addTaskResourceLock,
@@ -1186,6 +1187,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const queryClient = useQueryClient();
   const [dependencyTaskId, setDependencyTaskId] = useState("");
   const [resourceKey, setResourceKey] = useState("");
+  const [noteContent, setNoteContent] = useState("");
   const history = useQuery({
     queryKey: ["task-history", taskId],
     queryFn: () => getTaskHistory(taskId),
@@ -1224,6 +1226,14 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
     mutationFn: (value: string) => removeTaskResourceLock(taskId, value),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+    },
+  });
+  const addNote = useMutation({
+    mutationFn: (value: string) => addTaskNote(taskId, value),
+    onSuccess: async () => {
+      setNoteContent("");
+      await queryClient.invalidateQueries({ queryKey: ["task-history", taskId] });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
   });
 
@@ -1363,6 +1373,25 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
       </div>
       <div className="history-column">
         <h4>Notes</h4>
+        <form
+          className="note-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const value = noteContent.trim();
+            if (value) {
+              addNote.mutate(value);
+            }
+          }}
+        >
+          <textarea
+            placeholder="Add durable context for this task"
+            value={noteContent}
+            onChange={(event) => setNoteContent(event.target.value)}
+          />
+          <button disabled={addNote.isPending || !noteContent.trim()} title="Add note">
+            <Plus size={14} />
+          </button>
+        </form>
         {notes.map((note) => (
           <div className="history-item" key={note.id}>
             <div>
