@@ -1374,6 +1374,11 @@ pub enum MainAgentPlan {
         selector: String,
         queue_position: i64,
     },
+    ConvertTaskType {
+        selector: String,
+        task_type: TaskType,
+        interval_seconds: Option<i64>,
+    },
     AddTaskDependency {
         selector: String,
         depends_on_selector: String,
@@ -1416,6 +1421,28 @@ pub enum MainAgentPlan {
         selector: String,
         question: String,
     },
+    ListGlobalActions,
+    ExplainTaskPool,
+    ExplainTask {
+        selector: String,
+    },
+    ListTaskArtifacts {
+        selector: String,
+    },
+    InspectWorkspace,
+    InspectWorkspaceFile {
+        path: String,
+    },
+    ApproveMemory {
+        selector: String,
+    },
+    RejectMemory {
+        selector: String,
+    },
+    ListMemories {
+        filter: MemoryListFilter,
+    },
+    ListSkillDefinitions,
     ListTasks,
     Summarize,
     RunSchedulerTick,
@@ -1452,6 +1479,15 @@ impl MainAgentPlan {
             } => MainAgentIntent::ReorderTask {
                 selector,
                 queue_position,
+            },
+            Self::ConvertTaskType {
+                selector,
+                task_type,
+                interval_seconds,
+            } => MainAgentIntent::ConvertTaskType {
+                selector,
+                task_type,
+                interval_seconds,
             },
             Self::AddTaskDependency {
                 selector,
@@ -1510,6 +1546,16 @@ impl MainAgentPlan {
             Self::RequestClarification { selector, question } => {
                 MainAgentIntent::RequestClarification { selector, question }
             }
+            Self::ListGlobalActions => MainAgentIntent::ListGlobalActions,
+            Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
+            Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
+            Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
+            Self::InspectWorkspace => MainAgentIntent::InspectWorkspace,
+            Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
+            Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
+            Self::RejectMemory { selector } => MainAgentIntent::RejectMemory { selector },
+            Self::ListMemories { filter } => MainAgentIntent::ListMemories { filter },
+            Self::ListSkillDefinitions => MainAgentIntent::ListSkillDefinitions,
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
             Self::RunSchedulerTick => MainAgentIntent::RunSchedulerTick,
@@ -1564,7 +1610,8 @@ impl MainAgentPlanner for OhMyHarnessMainAgentAdvisor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryListFilter {
     Pending,
     Approved,
@@ -2109,6 +2156,7 @@ async fn dispatch_main_agent_planner(
         "plan_cancel_task",
         "plan_reprioritize_task",
         "plan_reorder_task",
+        "plan_convert_task_type",
         "plan_add_task_dependency",
         "plan_remove_task_dependency",
         "plan_add_task_note",
@@ -2120,6 +2168,16 @@ async fn dispatch_main_agent_planner(
         "plan_add_resource_lock",
         "plan_remove_resource_lock",
         "plan_request_clarification",
+        "plan_list_main_agent_actions",
+        "plan_explain_task_pool",
+        "plan_explain_task",
+        "plan_list_task_artifacts",
+        "plan_inspect_workspace",
+        "plan_inspect_workspace_file",
+        "plan_approve_memory",
+        "plan_reject_memory",
+        "plan_list_memories",
+        "plan_list_skill_definitions",
         "plan_list_tasks",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
@@ -2159,6 +2217,7 @@ fn main_agent_planner_tool_registry(
     )));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanReorderTaskTool::new(state.clone())));
+    registry.register(Arc::new(PlanConvertTaskTypeTool::new(state.clone())));
     registry.register(Arc::new(PlanTaskDependencyTool::new(
         state.clone(),
         "plan_add_task_dependency",
@@ -2200,6 +2259,56 @@ fn main_agent_planner_tool_registry(
         PlannedResourceLockAction::Remove,
     )));
     registry.register(Arc::new(PlanRequestClarificationTool::new(state.clone())));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_list_main_agent_actions",
+        "Plan to list recent main-agent audit actions.",
+        MainAgentPlan::ListGlobalActions,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_explain_task_pool",
+        "Plan to explain why the task pool is in its current state.",
+        MainAgentPlan::ExplainTaskPool,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_explain_task",
+        "Plan to explain one task's current state.",
+        PlannedTaskReadAction::Explain,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_artifacts",
+        "Plan to list artifacts reported for one task.",
+        PlannedTaskReadAction::ListArtifacts,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_inspect_workspace",
+        "Plan to inspect the current workspace status.",
+        MainAgentPlan::InspectWorkspace,
+    )));
+    registry.register(Arc::new(PlanInspectWorkspaceFileTool::new(state.clone())));
+    registry.register(Arc::new(PlanMemoryReviewTool::new(
+        state.clone(),
+        "plan_approve_memory",
+        "Plan to approve a memory candidate selected by id, scope, or content fragment.",
+        PlannedMemoryReviewAction::Approve,
+    )));
+    registry.register(Arc::new(PlanMemoryReviewTool::new(
+        state.clone(),
+        "plan_reject_memory",
+        "Plan to reject a memory candidate selected by id, scope, or content fragment.",
+        PlannedMemoryReviewAction::Reject,
+    )));
+    registry.register(Arc::new(PlanListMemoriesTool::new(state.clone())));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_list_skill_definitions",
+        "Plan to list existing skill definitions.",
+        MainAgentPlan::ListSkillDefinitions,
+    )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_tasks",
@@ -2279,14 +2388,7 @@ impl Tool for PlanCreateTaskTool {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| title.clone());
-            let task_type = match args
-                .get("task_type")
-                .and_then(|value| value.as_str())
-                .unwrap_or("one_off")
-            {
-                "recurring" => TaskType::Recurring,
-                _ => TaskType::OneOff,
-            };
+            let task_type = planner_task_type(&args)?;
             let interval_seconds = (task_type == TaskType::Recurring)
                 .then(|| {
                     args.get("interval_seconds")
@@ -3190,6 +3292,344 @@ impl Tool for PlanRequestClarificationTool {
     }
 }
 
+struct PlanConvertTaskTypeTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanConvertTaskTypeTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["one_off", "recurring"]
+                    },
+                    "interval_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Required when converting to recurring unless the user left the cadence implicit."
+                    }
+                },
+                "required": ["selector", "task_type"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanConvertTaskTypeTool {
+    fn name(&self) -> &str {
+        "plan_convert_task_type"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to convert an existing task between one-off and recurring."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let task_type = planner_task_type(&args)?;
+            let interval_seconds = args
+                .get("interval_seconds")
+                .and_then(|value| value.as_i64());
+            self.state.lock().await.plan = Some(MainAgentPlan::ConvertTaskType {
+                selector,
+                task_type,
+                interval_seconds,
+            });
+            Ok(planner_tool_result("planned task type conversion"))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlannedTaskReadAction {
+    Explain,
+    ListArtifacts,
+}
+
+struct PlanTaskReadTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedTaskReadAction,
+    schema: serde_json::Value,
+}
+
+impl PlanTaskReadTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedTaskReadAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanTaskReadTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let plan = match self.action {
+                PlannedTaskReadAction::Explain => MainAgentPlan::ExplainTask { selector },
+                PlannedTaskReadAction::ListArtifacts => {
+                    MainAgentPlan::ListTaskArtifacts { selector }
+                }
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned task read action"))
+        })
+    }
+}
+
+struct PlanInspectWorkspaceFileTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanInspectWorkspaceFileTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative file path to preview."
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanInspectWorkspaceFileTool {
+    fn name(&self) -> &str {
+        "plan_inspect_workspace_file"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to preview a workspace-relative file."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::InspectWorkspaceFile {
+                path: planner_required_string(&args, "path")?,
+            });
+            Ok(planner_tool_result("planned workspace file inspection"))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlannedMemoryReviewAction {
+    Approve,
+    Reject,
+}
+
+struct PlanMemoryReviewTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedMemoryReviewAction,
+    schema: serde_json::Value,
+}
+
+impl PlanMemoryReviewTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedMemoryReviewAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Memory id, scope, or content fragment identifying the memory candidate."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanMemoryReviewTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let plan = match self.action {
+                PlannedMemoryReviewAction::Approve => MainAgentPlan::ApproveMemory { selector },
+                PlannedMemoryReviewAction::Reject => MainAgentPlan::RejectMemory { selector },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned memory review action"))
+        })
+    }
+}
+
+struct PlanListMemoriesTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanListMemoriesTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "enum": ["pending", "approved", "rejected", "all"],
+                        "description": "Memory status filter; defaults to pending."
+                    }
+                }
+            }),
+        }
+    }
+}
+
+impl Tool for PlanListMemoriesTool {
+    fn name(&self) -> &str {
+        "plan_list_memories"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to list memory candidates for review."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::ListMemories {
+                filter: planner_memory_filter(&args)?,
+            });
+            Ok(planner_tool_result("planned memory list"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -3263,6 +3703,36 @@ fn planner_optional_string(args: &serde_json::Value, field: &str) -> Option<Stri
         .map(ToOwned::to_owned)
 }
 
+fn planner_task_type(args: &serde_json::Value) -> Result<TaskType, ToolError> {
+    match args
+        .get("task_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("one_off")
+    {
+        "one_off" => Ok(TaskType::OneOff),
+        "recurring" => Ok(TaskType::Recurring),
+        value => Err(ToolError::InvalidArguments(format!(
+            "unsupported task_type: {value}"
+        ))),
+    }
+}
+
+fn planner_memory_filter(args: &serde_json::Value) -> Result<MemoryListFilter, ToolError> {
+    match args
+        .get("filter")
+        .and_then(|value| value.as_str())
+        .unwrap_or("pending")
+    {
+        "pending" => Ok(MemoryListFilter::Pending),
+        "approved" => Ok(MemoryListFilter::Approved),
+        "rejected" => Ok(MemoryListFilter::Rejected),
+        "all" => Ok(MemoryListFilter::All),
+        value => Err(ToolError::InvalidArguments(format!(
+            "unsupported memory filter: {value}"
+        ))),
+    }
+}
+
 fn planner_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
     args.get(field)
         .and_then(|value| value.as_array())
@@ -3294,7 +3764,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -6013,6 +6483,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_type_conversion() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Check release feed".to_owned(),
+                    description: "Check the release feed".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ConvertTaskType {
+                selector: "Check release feed".to_owned(),
+                task_type: TaskType::Recurring,
+                interval_seconds: Some(180),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please make that release feed work happen repeatedly.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.task_type, TaskType::Recurring);
+        assert_eq!(
+            updated.schedule,
+            Some(serde_json::json!({ "interval_seconds": 180 }))
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Converted task")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_agent_uses_llm_planner_for_task_dependencies() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         db.create_task(
@@ -6195,6 +6714,196 @@ mod tests {
         assert!(messages.iter().any(|message| message.role == "assistant"
             && message.content == "Which environment should receive the deployment?"));
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_read_oriented_actions() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.record_task_artifact(
+            task.id,
+            None,
+            "release-notes",
+            "markdown",
+            "artifact://release-notes",
+            Some("Generated release notes"),
+        )
+        .await?;
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskArtifacts {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Can you show me the deliverables for that deployment work?".to_owned(),
+            })
+            .await?;
+
+        assert!(response.assistant_message.content.contains("release-notes"));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("artifact://release-notes")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::InspectWorkspaceFile {
+                path: "Cargo.toml".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please look at the root manifest for context.".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(response.assistant_message.content.contains("Cargo.toml"));
+        assert!(actions.iter().any(|action| {
+            action.action_type == "inspect_workspace_file" && action.details["path"] == "Cargo.toml"
+        }));
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ExplainTaskPool),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Can you explain what is going on overall?".to_owned(),
+            })
+            .await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Execution state")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_memory_review() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let memory = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "repo".to_owned(),
+                    content: "Prefer cargo test before pushing.".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.91,
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ApproveMemory {
+                selector: "cargo test before pushing".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "That remembered testing preference looks good.".to_owned(),
+            })
+            .await?;
+        let approved = db.get_memory(memory.id).await?;
+
+        assert_eq!(approved.status, MemoryStatus::Approved);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Approved memory")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListMemories {
+                filter: MemoryListFilter::Approved,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Show me the useful remembered preferences.".to_owned(),
+            })
+            .await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Approved memories")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Prefer cargo test before pushing.")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_skill_listing() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "rust".to_owned(),
+                description: "Rust workspace maintenance".to_owned(),
+                trigger_rules: vec!["cargo".to_owned()],
+                tool_subset: vec!["shell".to_owned()],
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListSkillDefinitions),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Which reusable capabilities are available?".to_owned(),
+            })
+            .await?;
+
+        assert!(response.assistant_message.content.contains("rust"));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Rust workspace maintenance")
+        );
 
         Ok(())
     }
