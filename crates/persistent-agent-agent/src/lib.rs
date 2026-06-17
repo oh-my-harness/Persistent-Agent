@@ -412,28 +412,69 @@ impl MainAgent {
         let cwd = env::current_dir()?;
         let path_text = clean_workspace_path(relative_path);
         if path_text.is_empty() {
+            self.record_workspace_file_inspection_failure(
+                &path_text,
+                "workspace file path cannot be empty",
+            )
+            .await?;
             anyhow::bail!("workspace file path cannot be empty");
         }
 
         let requested_path = Path::new(&path_text);
         if requested_path.is_absolute() {
+            self.record_workspace_file_inspection_failure(
+                &path_text,
+                "workspace file path must be relative",
+            )
+            .await?;
             anyhow::bail!("workspace file path must be relative");
         }
 
         let workspace_root = cwd.canonicalize()?;
         let file_path = cwd.join(requested_path);
-        let canonical_file_path = file_path.canonicalize()?;
+        let canonical_file_path = match file_path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.record_workspace_file_inspection_failure(&path_text, &error.to_string())
+                    .await?;
+                return Err(error.into());
+            }
+        };
         if !canonical_file_path.starts_with(&workspace_root) {
+            self.record_workspace_file_inspection_failure(
+                &path_text,
+                "workspace file path must stay inside the current workspace",
+            )
+            .await?;
             anyhow::bail!("workspace file path must stay inside the current workspace");
         }
 
-        let metadata = fs::metadata(&canonical_file_path)?;
+        let metadata = match fs::metadata(&canonical_file_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.record_workspace_file_inspection_failure(&path_text, &error.to_string())
+                    .await?;
+                return Err(error.into());
+            }
+        };
         if !metadata.is_file() {
+            self.record_workspace_file_inspection_failure(
+                &path_text,
+                "workspace path is not a file",
+            )
+            .await?;
             anyhow::bail!("workspace path is not a file");
         }
 
         const MAX_FILE_PREVIEW_BYTES: usize = 8 * 1024;
-        let bytes = fs::read(&canonical_file_path)?;
+        let bytes = match fs::read(&canonical_file_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.record_workspace_file_inspection_failure(&path_text, &error.to_string())
+                    .await?;
+                return Err(error.into());
+            }
+        };
         let truncated = bytes.len() > MAX_FILE_PREVIEW_BYTES;
         let preview_len = bytes.len().min(MAX_FILE_PREVIEW_BYTES);
         let preview = String::from_utf8_lossy(&bytes[..preview_len]);
@@ -462,6 +503,25 @@ impl MainAgent {
             truncation_note,
             preview
         ))
+    }
+
+    async fn record_workspace_file_inspection_failure(
+        &self,
+        path: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_workspace_file_failed",
+                serde_json::json!({
+                    "path": path,
+                    "error": error,
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn approve_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
@@ -3402,13 +3462,14 @@ mod tests {
     #[tokio::test]
     async fn main_agent_reports_workspace_file_read_errors_in_conversation() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
-        let agent = MainAgent::new(db);
+        let agent = MainAgent::new(db.clone());
 
         let response = agent
             .handle_user_message(MainAgentMessageInput {
                 content: "read file C:\\Windows\\win.ini".to_owned(),
             })
             .await?;
+        let global_actions = db.list_global_actions().await?;
 
         assert!(
             response
@@ -3423,6 +3484,11 @@ mod tests {
                 .contains("must be relative")
         );
         assert_eq!(response.changed_tasks.len(), 0);
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "inspect_workspace_file_failed"
+                && action.details["path"] == "C:\\Windows\\win.ini"
+                && action.details["error"] == "workspace file path must be relative"
+        }));
 
         Ok(())
     }

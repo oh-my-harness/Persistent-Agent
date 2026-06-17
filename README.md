@@ -208,7 +208,7 @@ The main agent should not mutate task state through hidden database writes. It s
 
 For substantial task execution, code changes, long-running operations, or risky local actions, the main agent should delegate to a worker agent. For lightweight planning and inspection, it may use local tools directly.
 
-The first local tools are intentionally read-only. Workspace status inspection reports the current working directory and `git status --short --branch`, then records an auditable `inspect_workspace_status` action. Workspace file inspection previews a relative file path inside the current workspace, caps output size, and records `inspect_workspace_file`. Broader shell or filesystem operations should be added behind explicit tool contracts and policy checks.
+The first local tools are intentionally read-only. Workspace status inspection reports the current working directory and `git status --short --branch`, then records an auditable `inspect_workspace_status` action. Workspace file inspection previews a relative file path inside the current workspace, caps output size, records `inspect_workspace_file` on success, and records `inspect_workspace_file_failed` when policy or filesystem checks reject the request. Broader shell or filesystem operations should be added behind explicit tool contracts and policy checks.
 
 ### Worker Agent
 
