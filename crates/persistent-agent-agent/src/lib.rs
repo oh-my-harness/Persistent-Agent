@@ -1370,6 +1370,14 @@ pub enum MainAgentPlan {
         selector: String,
         priority: i64,
     },
+    AddRequestedSkills {
+        selector: String,
+        skill_names: Vec<String>,
+    },
+    RemoveRequestedSkills {
+        selector: String,
+        skill_names: Vec<String>,
+    },
     ListTasks,
     Summarize,
     RunSchedulerTick,
@@ -1400,6 +1408,20 @@ impl MainAgentPlan {
             Self::ReprioritizeTask { selector, priority } => {
                 MainAgentIntent::ReprioritizeTask { selector, priority }
             }
+            Self::AddRequestedSkills {
+                selector,
+                skill_names,
+            } => MainAgentIntent::AddRequestedSkills {
+                selector,
+                skill_names,
+            },
+            Self::RemoveRequestedSkills {
+                selector,
+                skill_names,
+            } => MainAgentIntent::RemoveRequestedSkills {
+                selector,
+                skill_names,
+            },
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
             Self::RunSchedulerTick => MainAgentIntent::RunSchedulerTick,
@@ -1998,6 +2020,8 @@ async fn dispatch_main_agent_planner(
         "plan_resume_task",
         "plan_cancel_task",
         "plan_reprioritize_task",
+        "plan_add_requested_skills",
+        "plan_remove_requested_skills",
         "plan_list_tasks",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
@@ -2036,6 +2060,18 @@ fn main_agent_planner_tool_registry(
         PlannedTaskSelectorAction::Cancel,
     )));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
+    registry.register(Arc::new(PlanRequestedSkillsTool::new(
+        state.clone(),
+        "plan_add_requested_skills",
+        "Plan to add requested skills to an existing task.",
+        PlannedRequestedSkillsAction::Add,
+    )));
+    registry.register(Arc::new(PlanRequestedSkillsTool::new(
+        state.clone(),
+        "plan_remove_requested_skills",
+        "Plan to remove requested skills from an existing task.",
+        PlannedRequestedSkillsAction::Remove,
+    )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_tasks",
@@ -2347,6 +2383,99 @@ impl Tool for PlanReprioritizeTaskTool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PlannedRequestedSkillsAction {
+    Add,
+    Remove,
+}
+
+struct PlanRequestedSkillsTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedRequestedSkillsAction,
+    schema: serde_json::Value,
+}
+
+impl PlanRequestedSkillsTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedRequestedSkillsAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "skill_names": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                    }
+                },
+                "required": ["selector", "skill_names"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanRequestedSkillsTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let skill_names = planner_string_array(&args, "skill_names");
+            if skill_names.is_empty() {
+                return Err(ToolError::InvalidArguments(
+                    "skill_names must contain at least one item".to_owned(),
+                ));
+            }
+            let plan = match self.action {
+                PlannedRequestedSkillsAction::Add => MainAgentPlan::AddRequestedSkills {
+                    selector,
+                    skill_names,
+                },
+                PlannedRequestedSkillsAction::Remove => MainAgentPlan::RemoveRequestedSkills {
+                    selector,
+                    skill_names,
+                },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned requested skill change"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -2439,7 +2568,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -5109,6 +5238,54 @@ mod tests {
         assert_eq!(updated.priority, 9);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("priority to 9"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_requested_skill_changes() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Investigate GitHub bug".to_owned(),
+                    description: "Inspect a repository issue".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::AddRequestedSkills {
+                selector: "Investigate GitHub bug".to_owned(),
+                skill_names: vec!["github".to_owned(), "shell".to_owned()],
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Make sure the bug investigation can use GitHub and shell skills."
+                    .to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(
+            updated.requested_skills,
+            vec!["github".to_owned(), "shell".to_owned()]
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Updated requested skills")
+        );
 
         Ok(())
     }
