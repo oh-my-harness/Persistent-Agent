@@ -1357,6 +1357,19 @@ pub enum MainAgentPlan {
     SplitTasks {
         titles: Vec<String>,
     },
+    PauseTask {
+        selector: String,
+    },
+    ResumeTask {
+        selector: String,
+    },
+    CancelTask {
+        selector: String,
+    },
+    ReprioritizeTask {
+        selector: String,
+        priority: i64,
+    },
     ListTasks,
     Summarize,
     RunSchedulerTick,
@@ -1381,6 +1394,12 @@ impl MainAgentPlan {
                 requested_skills,
             },
             Self::SplitTasks { titles } => MainAgentIntent::SplitTasks { titles },
+            Self::PauseTask { selector } => MainAgentIntent::PauseTask { selector },
+            Self::ResumeTask { selector } => MainAgentIntent::ResumeTask { selector },
+            Self::CancelTask { selector } => MainAgentIntent::CancelTask { selector },
+            Self::ReprioritizeTask { selector, priority } => {
+                MainAgentIntent::ReprioritizeTask { selector, priority }
+            }
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
             Self::RunSchedulerTick => MainAgentIntent::RunSchedulerTick,
@@ -1975,6 +1994,10 @@ async fn dispatch_main_agent_planner(
     opts.tools = registry.subset(&[
         "plan_create_task",
         "plan_split_tasks",
+        "plan_pause_task",
+        "plan_resume_task",
+        "plan_cancel_task",
+        "plan_reprioritize_task",
         "plan_list_tasks",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
@@ -1994,6 +2017,25 @@ fn main_agent_planner_tool_registry(
     let registry = Arc::new(InMemoryToolRegistry::new());
     registry.register(Arc::new(PlanCreateTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanSplitTasksTool::new(state.clone())));
+    registry.register(Arc::new(PlanTaskSelectorTool::new(
+        state.clone(),
+        "plan_pause_task",
+        "Plan to pause a task selected by id or title fragment.",
+        PlannedTaskSelectorAction::Pause,
+    )));
+    registry.register(Arc::new(PlanTaskSelectorTool::new(
+        state.clone(),
+        "plan_resume_task",
+        "Plan to resume a paused, blocked, or waiting task selected by id or title fragment.",
+        PlannedTaskSelectorAction::Resume,
+    )));
+    registry.register(Arc::new(PlanTaskSelectorTool::new(
+        state.clone(),
+        "plan_cancel_task",
+        "Plan to cancel a task selected by id or title fragment.",
+        PlannedTaskSelectorAction::Cancel,
+    )));
+    registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_tasks",
@@ -2166,6 +2208,145 @@ impl Tool for PlanSplitTasksTool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PlannedTaskSelectorAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+struct PlanTaskSelectorTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedTaskSelectorAction,
+    schema: serde_json::Value,
+}
+
+impl PlanTaskSelectorTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedTaskSelectorAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanTaskSelectorTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let plan = match self.action {
+                PlannedTaskSelectorAction::Pause => MainAgentPlan::PauseTask { selector },
+                PlannedTaskSelectorAction::Resume => MainAgentPlan::ResumeTask { selector },
+                PlannedTaskSelectorAction::Cancel => MainAgentPlan::CancelTask { selector },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned task state change"))
+        })
+    }
+}
+
+struct PlanReprioritizeTaskTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanReprioritizeTaskTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "priority": { "type": "integer" }
+                },
+                "required": ["selector", "priority"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanReprioritizeTaskTool {
+    fn name(&self) -> &str {
+        "plan_reprioritize_task"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to change the priority of a task selected by id or title fragment."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let priority = args
+                .get("priority")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| ToolError::InvalidArguments("priority is required".to_owned()))?;
+            self.state.lock().await.plan =
+                Some(MainAgentPlan::ReprioritizeTask { selector, priority });
+            Ok(planner_tool_result("planned task priority change"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -2258,7 +2439,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -4849,6 +5030,85 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "llm_planner_intent")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_state_changes() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Watch GitHub issues".to_owned(),
+                    description: "Monitor repository issues".to_owned(),
+                    task_type: TaskType::Recurring,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: Some(serde_json::json!({ "interval_seconds": 300 })),
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let contexts = Arc::new(StdMutex::new(Vec::new()));
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::PauseTask {
+                selector: "Watch GitHub issues".to_owned(),
+            }),
+            contexts: contexts.clone(),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you put the GitHub issue watcher on hold for now?".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Paused);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Paused task"));
+        assert_eq!(contexts.lock().expect("planner contexts lock").len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_priority_changes() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Prepare release notes".to_owned(),
+                    description: "Draft release notes".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ReprioritizeTask {
+                selector: "Prepare release notes".to_owned(),
+                priority: 9,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please make the release notes work much more urgent.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.priority, 9);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("priority to 9"));
 
         Ok(())
     }

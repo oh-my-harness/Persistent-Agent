@@ -44,10 +44,11 @@ User message -> deterministic parser or OhMyHarnessMainAgentPlanner -> bounded p
 ```
 
 The deterministic product operation remains the authority for task state changes. The planner can
-only call bounded planning tools for create-task, split-tasks, list-tasks, summarize, and scheduler
-scan intents; product code validates and executes the resulting plan. The advisor does not receive
-state-changing tools; it composes the final user-facing response from the verified action context
-and falls back to the deterministic reply on empty output or LLM failure.
+only call bounded planning tools for create-task, split-tasks, pause/resume/cancel task,
+reprioritize-task, list-tasks, summarize, and scheduler scan intents; product code validates and
+executes the resulting plan. The advisor does not receive state-changing tools; it composes the
+final user-facing response from the verified action context and falls back to the deterministic
+reply on empty output or LLM failure.
 
 The deterministic main-agent operation layer includes skill definition management, so users can
 create, list, update, and delete skills through the main conversation while worker execution still
