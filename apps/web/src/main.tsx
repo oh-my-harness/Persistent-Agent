@@ -805,13 +805,22 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
   const nextRunnable = state?.next_runnable_task;
   const waitingForUser = state?.waiting_for_user_tasks?.[0];
   const policy = state?.policy;
+  const runningDetail = primaryRunning
+    ? [
+        primaryRunning.lease_owner ? `owner ${primaryRunning.lease_owner}` : undefined,
+        primaryRunning.lease_expires_at ? `lease until ${new Date(primaryRunning.lease_expires_at).toLocaleTimeString()}` : undefined,
+        running.length > 1 ? `${running.length} running tasks` : undefined,
+      ]
+        .filter(Boolean)
+        .join(", ")
+    : undefined;
 
   return (
     <div className="execution-state">
       <div className="execution-state-item">
         <span>Current run</span>
         <strong>{loading ? "Loading" : primaryRunning?.title ?? "Idle"}</strong>
-        {running.length > 1 && <small>{running.length} running tasks</small>}
+        {runningDetail && <small>{runningDetail}</small>}
       </div>
       <div className="execution-state-item">
         <span>Next runnable</span>

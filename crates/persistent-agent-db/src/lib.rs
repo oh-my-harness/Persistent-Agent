@@ -1873,6 +1873,8 @@ fn row_to_task(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
             .map(|value| serde_json::from_str(&value))
             .transpose()?,
         attempt_count: row.try_get("attempt_count")?,
+        lease_owner: row.try_get("lease_owner")?,
+        lease_expires_at: row.try_get("lease_expires_at")?,
         last_run_at: row.try_get("last_run_at")?,
         next_run_at: row.try_get("next_run_at")?,
         blocked_reason: row.try_get("blocked_reason")?,

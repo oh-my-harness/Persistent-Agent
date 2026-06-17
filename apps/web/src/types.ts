@@ -25,6 +25,8 @@ export interface Task {
   matched_skills: string[];
   schedule?: unknown;
   attempt_count: number;
+  lease_owner?: string | null;
+  lease_expires_at?: string | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   blocked_reason?: string | null;

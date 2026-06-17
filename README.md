@@ -289,7 +289,7 @@ Core views:
 - main conversation: talk to the main agent to create, update, reorder, explain, inspect workspace state, show audit actions, or discuss tasks;
 - main-agent audit: inspect recent global tool calls and non-task-specific actions;
 - task conversation: user-agent discussion for blocked or active tasks;
-- execution monitor: current running task, next queued task, logs, state transitions;
+- execution monitor: current running task with lease owner/expiry, next queued task, logs, state transitions;
 - skills: manage user-defined skills and see activation rules;
 - memory: inspect and edit approved long-term memories.
 

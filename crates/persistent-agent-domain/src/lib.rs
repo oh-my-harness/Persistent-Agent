@@ -159,6 +159,8 @@ pub struct Task {
     pub matched_skills: Vec<String>,
     pub schedule: Option<serde_json::Value>,
     pub attempt_count: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub next_run_at: Option<DateTime<Utc>>,
     pub blocked_reason: Option<String>,
