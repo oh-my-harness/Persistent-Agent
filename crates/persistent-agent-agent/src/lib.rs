@@ -358,6 +358,53 @@ impl MainAgent {
             .await
     }
 
+    pub async fn reply_to_task(
+        &self,
+        task_id: TaskId,
+        content: &str,
+    ) -> anyhow::Result<(Task, ConversationMessage, Option<ConversationMessage>)> {
+        let task = self.db.get_task(task_id).await?;
+        let content = content.trim();
+        if content.is_empty() {
+            anyhow::bail!("task reply cannot be empty");
+        }
+        let Some(conversation_id) = task.conversation_id else {
+            anyhow::bail!("task has no conversation");
+        };
+
+        let user_message = self
+            .db
+            .add_conversation_message(conversation_id, Some(task_id), "user", content)
+            .await?;
+        self.db
+            .record_action(
+                Some(task_id),
+                "main_agent",
+                "reply_to_task",
+                serde_json::json!({
+                    "content_preview": bounded_preview(content, 200),
+                    "resumed": task.status == TaskStatus::WaitingForUser,
+                }),
+            )
+            .await?;
+
+        if task.status == TaskStatus::WaitingForUser {
+            let resumed = self.resume_task(task_id).await?;
+            let assistant_message = self
+                .db
+                .add_conversation_message(
+                    conversation_id,
+                    Some(task_id),
+                    "assistant",
+                    "Thanks, I have the extra context and moved this task back to the queue.",
+                )
+                .await?;
+            Ok((resumed, user_message, Some(assistant_message)))
+        } else {
+            Ok((task, user_message, None))
+        }
+    }
+
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
         let tasks = self.db.list_tasks().await?;
         let mut summary = TaskPoolSummary {
@@ -944,6 +991,24 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::ReplyToTask { selector, content } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => {
+                        let (task, _, resumed) = self.reply_to_task(task.id, &content).await?;
+                        let reply = if resumed.is_some() {
+                            format!(
+                                "Sent your reply to '{}' and moved it back to the queue.",
+                                task.title
+                            )
+                        } else {
+                            format!("Sent your reply to '{}'.", task.title)
+                        };
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -1047,7 +1112,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1421,6 +1486,10 @@ pub enum MainAgentPlan {
         selector: String,
         question: String,
     },
+    ReplyToTask {
+        selector: String,
+        content: String,
+    },
     ListGlobalActions,
     ExplainTaskPool,
     ExplainTask {
@@ -1545,6 +1614,9 @@ impl MainAgentPlan {
             },
             Self::RequestClarification { selector, question } => {
                 MainAgentIntent::RequestClarification { selector, question }
+            }
+            Self::ReplyToTask { selector, content } => {
+                MainAgentIntent::ReplyToTask { selector, content }
             }
             Self::ListGlobalActions => MainAgentIntent::ListGlobalActions,
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
@@ -1706,6 +1778,10 @@ enum MainAgentIntent {
         selector: String,
         question: String,
     },
+    ReplyToTask {
+        selector: String,
+        content: String,
+    },
     ListTasks,
     ListGlobalActions,
     ExplainTaskPool,
@@ -1814,6 +1890,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_resource_lock_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_reply_to_task_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -2168,6 +2248,7 @@ async fn dispatch_main_agent_planner(
         "plan_add_resource_lock",
         "plan_remove_resource_lock",
         "plan_request_clarification",
+        "plan_reply_to_task",
         "plan_list_main_agent_actions",
         "plan_explain_task_pool",
         "plan_explain_task",
@@ -2259,6 +2340,7 @@ fn main_agent_planner_tool_registry(
         PlannedResourceLockAction::Remove,
     )));
     registry.register(Arc::new(PlanRequestClarificationTool::new(state.clone())));
+    registry.register(Arc::new(PlanReplyToTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_main_agent_actions",
@@ -3292,6 +3374,67 @@ impl Tool for PlanRequestClarificationTool {
     }
 }
 
+struct PlanReplyToTaskTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanReplyToTaskTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "User reply to append to the task conversation."
+                    }
+                },
+                "required": ["selector", "content"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanReplyToTaskTool {
+    fn name(&self) -> &str {
+        "plan_reply_to_task"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to append a user reply to a task conversation and resume it if it is waiting for user input."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::ReplyToTask {
+                selector: planner_required_string(&args, "selector")?,
+                content: planner_required_string(&args, "content")?,
+            });
+            Ok(planner_tool_result("planned task conversation reply"))
+        })
+    }
+}
+
 struct PlanConvertTaskTypeTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     schema: serde_json::Value,
@@ -3764,7 +3907,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -3860,6 +4003,14 @@ fn replace_case_insensitive(value: &str, needle: &str, replacement: &str) -> Str
 
 fn normalized_slice(value: &str) -> String {
     value.to_lowercase()
+}
+
+fn bounded_preview(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
 }
 
 fn is_create_request(normalized: &str) -> bool {
@@ -4898,6 +5049,26 @@ fn parse_clarification_intent(content: &str, normalized: &str) -> Option<MainAge
         .map(|(selector, question)| MainAgentIntent::RequestClarification { selector, question })
 }
 
+fn parse_reply_to_task_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if !contains_any(
+        normalized,
+        &[
+            "reply to task",
+            "reply for task",
+            "answer task",
+            "answer for task",
+            "respond to task",
+            "respond for task",
+            "task reply",
+        ],
+    ) {
+        return None;
+    }
+
+    split_reply_selector_and_content(content)
+        .map(|(selector, content)| MainAgentIntent::ReplyToTask { selector, content })
+}
+
 fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -4970,6 +5141,25 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
     ) {
         let selector = extract_memory_selector(content);
         return (!selector.is_empty()).then_some(MainAgentIntent::RejectMemory { selector });
+    }
+
+    None
+}
+
+fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector = extract_task_selector(
+                head,
+                &[
+                    "reply", "answer", "respond", "task", "to", "for", "with", "message",
+                ],
+            );
+            let content = tail.trim();
+            if !selector.is_empty() && !content.is_empty() {
+                return Some((selector, content.to_owned()));
+            }
+        }
     }
 
     None
@@ -6068,6 +6258,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_reply_intents() {
+        assert_eq!(
+            parse_intent("reply to task Deploy release: use production"),
+            MainAgentIntent::ReplyToTask {
+                selector: "Deploy release".to_owned(),
+                content: "use production".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "answer for task Check release: the repo is oh-my-harness/Persistent-Agent"
+            ),
+            MainAgentIntent::ReplyToTask {
+                selector: "Check release".to_owned(),
+                content: "the repo is oh-my-harness/Persistent-Agent".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_memory_review_intents() {
         assert_eq!(
             parse_intent("show memory candidates"),
@@ -6760,6 +6970,76 @@ mod tests {
         assert!(messages.iter().any(|message| message.role == "assistant"
             && message.content == "Which environment should receive the deployment?"));
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_replies() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.set_task_status(
+            task.id,
+            TaskStatus::WaitingForUser,
+            "test",
+            Some("Which environment?"),
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ReplyToTask {
+                selector: "Deploy release".to_owned(),
+                content: "Use production.".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please send the answer back to the deployment work.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 20).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert!(updated.blocked_reason.is_none());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("moved it back to the queue")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "user" && message.content == "Use production.")
+        );
+        assert!(messages.iter().any(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .contains("moved this task back to the queue")
+        }));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "reply_to_task")
+        );
 
         Ok(())
     }
@@ -7898,6 +8178,57 @@ mod tests {
                 .any(|action| action.action_type == "request_user_clarification")
         );
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_reply_to_blocked_task_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .request_user_clarification(task.id, "Which environment?")
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "reply to task Deploy release: use production".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 20).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert!(updated.blocked_reason.is_none());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("moved it back to the queue")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "user" && message.content == "use production")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "reply_to_task")
+        );
 
         Ok(())
     }

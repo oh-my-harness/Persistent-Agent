@@ -270,34 +270,9 @@ async fn send_task_message(
         return Err(ApiError::bad_request("message content cannot be empty"));
     }
 
-    let task = state.db.get_task(id).await?;
-    let Some(conversation_id) = task.conversation_id else {
-        return Err(ApiError::bad_request("task has no conversation"));
-    };
-
-    let user_message = state
-        .db
-        .add_conversation_message(conversation_id, Some(id), "user", content)
-        .await?;
-
-    let mut assistant_message = None;
-    let task = if task.status == persistent_agent_domain::TaskStatus::WaitingForUser {
-        let resumed = state.main_agent.resume_task(id).await?;
-        assistant_message = Some(
-            state
-                .db
-                .add_conversation_message(
-                    conversation_id,
-                    Some(id),
-                    "assistant",
-                    "Thanks, I have the extra context and moved this task back to the queue.",
-                )
-                .await?,
-        );
-        resumed
-    } else {
-        task
-    };
+    state.db.get_task(id).await?;
+    let (task, user_message, assistant_message) =
+        state.main_agent.reply_to_task(id, content).await?;
 
     state
         .events
