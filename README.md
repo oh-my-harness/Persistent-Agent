@@ -157,7 +157,7 @@ Tasks can enter the system through three channels:
 2. Structured creation through Web UI forms and queue controls.
 3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
 
-The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, reply to blocked task questions, add requested skills, add resource locks, inspect local workspace status, show task artifacts, list memory candidates, show recent audit actions, run a scheduler scan, or summarize the queue.
+The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, reply to blocked task questions, add requested skills, add resource locks, inspect local workspace status, show task artifacts, list memory candidates, show recent audit actions, run a scheduler scan, or summarize the queue. When the main agent runs a scheduler scan from chat, it appends the scan result summary back into the main-agent conversation so the user can see the closed-loop outcome without switching views.
 
 When a created task clearly references a GitHub repository, for example `oh-my-harness/Persistent-Agent` or a `github.com/owner/repo` URL, the main agent automatically requests the `github` skill and adds a `repo:owner/repo` resource lock so serial execution avoids conflicting repository work.
 

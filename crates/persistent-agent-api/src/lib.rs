@@ -507,6 +507,24 @@ async fn send_main_agent_message(
     } else {
         None
     };
+    let scheduler_message = if let Some(tick) = scheduler_tick.as_ref() {
+        let conversation = state.db.get_or_create_main_conversation().await?;
+        let message = state
+            .db
+            .add_conversation_message(
+                conversation.id,
+                None,
+                "assistant",
+                &format_scheduler_tick_summary(tick),
+            )
+            .await?;
+        state.events.send(AppEvent::MainAgentReply {
+            message: message.clone(),
+        });
+        Some(message)
+    } else {
+        None
+    };
     Ok(Json(MainAgentHttpResponse {
         conversation_id: response.conversation_id,
         user_message: response.user_message,
@@ -514,6 +532,7 @@ async fn send_main_agent_message(
         changed_tasks: response.changed_tasks,
         scheduler_tick_requested: response.scheduler_tick_requested,
         scheduler_tick,
+        scheduler_message,
     }))
 }
 
@@ -525,6 +544,48 @@ struct MainAgentHttpResponse {
     changed_tasks: Vec<Task>,
     scheduler_tick_requested: bool,
     scheduler_tick: Option<SchedulerTick>,
+    scheduler_message: Option<ConversationMessage>,
+}
+
+fn format_scheduler_tick_summary(tick: &SchedulerTick) -> String {
+    let mut lines = vec![format!(
+        "Scheduler scan completed. Recovered: {}, requeued recurring: {}, claimed: {}.",
+        tick.recovered_tasks.len(),
+        tick.requeued_tasks.len(),
+        tick.claimed_task
+            .as_ref()
+            .map(|task| task.title.as_str())
+            .unwrap_or("none")
+    )];
+
+    let outcome = match &tick.outcome {
+        SchedulerOutcome::Idle => "No runnable task was available.".to_owned(),
+        SchedulerOutcome::Completed {
+            summary,
+            follow_up_tasks,
+            memory_candidates,
+        } => format!(
+            "Completed claimed task: {}. Follow-up tasks: {}. Memory candidates: {}.",
+            summary,
+            follow_up_tasks.len(),
+            memory_candidates.len()
+        ),
+        SchedulerOutcome::Blocked { reason } => format!("Claimed task is blocked: {reason}"),
+        SchedulerOutcome::Failed { error } => format!("Claimed task failed: {error}"),
+        SchedulerOutcome::RetryScheduled {
+            error,
+            next_attempt,
+            max_attempts,
+        } => format!(
+            "Claimed task will retry after error: {error}. Next attempt {next_attempt} of {max_attempts}."
+        ),
+        SchedulerOutcome::Superseded { status, reason } => {
+            format!("Claimed task was superseded with status {status:?}: {reason}")
+        }
+    };
+    lines.push(outcome);
+
+    lines.join("\n")
 }
 
 async fn run_scheduler_tick(

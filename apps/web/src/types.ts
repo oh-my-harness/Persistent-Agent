@@ -105,6 +105,7 @@ export interface MainAgentMessageResponse {
   changed_tasks: Task[];
   scheduler_tick_requested: boolean;
   scheduler_tick?: SchedulerTick | null;
+  scheduler_message?: ConversationMessage | null;
 }
 
 export interface TaskMessageResponse {
