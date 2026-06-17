@@ -779,6 +779,7 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
   const running = state?.running_tasks ?? [];
   const primaryRunning = running[0];
   const nextQueued = state?.next_queued_task;
+  const policy = state?.policy;
 
   return (
     <div className="execution-state">
@@ -799,6 +800,15 @@ function ExecutionStatePanel({ loading, state }: { loading: boolean; state?: Sch
       <div className="execution-state-item">
         <span>Scheduled</span>
         <strong>{state?.waiting_for_schedule_count ?? 0}</strong>
+      </div>
+      <div className="execution-state-item">
+        <span>Policy</span>
+        <strong>{policy ? `${policy.worker_capacity} worker` : "Unknown"}</strong>
+        {policy && (
+          <small>
+            lease {policy.lease_seconds}s, retry {policy.max_attempts}
+          </small>
+        )}
       </div>
     </div>
   );

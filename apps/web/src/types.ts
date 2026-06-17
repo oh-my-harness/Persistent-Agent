@@ -65,6 +65,13 @@ export interface SchedulerState {
   queued_count: number;
   waiting_for_user_count: number;
   waiting_for_schedule_count: number;
+  policy: SchedulerPolicy;
+}
+
+export interface SchedulerPolicy {
+  worker_capacity: number;
+  lease_seconds: number;
+  max_attempts: number;
 }
 
 export type AppEvent =

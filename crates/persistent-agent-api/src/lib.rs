@@ -533,6 +533,7 @@ struct SchedulerStateResponse {
     queued_count: usize,
     waiting_for_user_count: usize,
     waiting_for_schedule_count: usize,
+    policy: SchedulerPolicy,
 }
 
 async fn scheduler_state(
@@ -568,6 +569,7 @@ async fn scheduler_state(
             .iter()
             .filter(|task| task.status == persistent_agent_domain::TaskStatus::WaitingForSchedule)
             .count(),
+        policy: state.scheduler.policy(),
     }))
 }
 
