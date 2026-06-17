@@ -727,7 +727,7 @@ async fn dispatch_task_with_harness(
     Ok(state.merge_into_result(result))
 }
 
-const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, git_status, git_diff, http_fetch, github_list_issues, github_get_issue, github_comment_issue, or github_update_issue_state when the task requires workspace, code, network, or GitHub issue work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, git_status, git_diff, http_fetch, github_list_issues, github_get_issue, github_comment_issue, github_update_issue_state, or github_create_pull_request when the task requires workspace, code, network, or GitHub issue/PR work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
 
 const LIFECYCLE_TOOL_NAMES: &[&str] = &[
     "remember",
@@ -750,6 +750,7 @@ const EXECUTION_TOOL_NAMES: &[&str] = &[
     "github_get_issue",
     "github_comment_issue",
     "github_update_issue_state",
+    "github_create_pull_request",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -819,6 +820,7 @@ fn execution_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitHubGetIssueTool::new()),
         Arc::new(GitHubCommentIssueTool::new()),
         Arc::new(GitHubUpdateIssueStateTool::new()),
+        Arc::new(GitHubCreatePullRequestTool::new()),
     ]
 }
 
@@ -861,6 +863,7 @@ fn active_worker_tool_names(allowed_tools: &[String]) -> Vec<String> {
                         "github_get_issue",
                         "github_comment_issue",
                         "github_update_issue_state",
+                        "github_create_pull_request",
                     ],
                 );
             }
@@ -1808,6 +1811,120 @@ impl Tool for GitHubUpdateIssueStateTool {
     }
 }
 
+struct GitHubCreatePullRequestTool {
+    schema: serde_json::Value,
+}
+
+impl GitHubCreatePullRequestTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repository": { "type": "string", "description": "GitHub repository in owner/repo form" },
+                    "title": { "type": "string", "minLength": 1 },
+                    "head": { "type": "string", "minLength": 1, "description": "The compare branch or owner:branch ref" },
+                    "base": { "type": "string", "minLength": 1, "description": "The target branch" },
+                    "body": { "type": "string" },
+                    "draft": { "type": "boolean" }
+                },
+                "required": ["repository", "title", "head", "base"]
+            }),
+        }
+    }
+}
+
+impl Tool for GitHubCreatePullRequestTool {
+    fn name(&self) -> &str {
+        "github_create_pull_request"
+    }
+
+    fn description(&self) -> &str {
+        "Create a GitHub pull request after the worker has pushed a branch. Requires GITHUB_TOKEN."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            require_github_token()?;
+            let repository = required_string(&args, "repository")?;
+            let title = required_non_empty_string(&args, "title")?;
+            let head = required_github_ref(&args, "head")?;
+            let base = required_github_ref(&args, "base")?;
+            let body = args
+                .get("body")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let draft = args
+                .get("draft")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let url = github_pull_requests_url(&repository)?;
+            let client = github_client()?;
+            let response = github_request_builder_with_method(&client, reqwest::Method::POST, url)
+                .json(&json!({
+                    "title": title,
+                    "head": head,
+                    "base": base,
+                    "body": body,
+                    "draft": draft,
+                }))
+                .send()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let status = response.status().as_u16();
+            let response_body = response
+                .text()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if !(200..300).contains(&status) {
+                return Err(ToolError::Execution(format!(
+                    "GitHub pull request creation failed with status {status}: {}",
+                    truncate_chars(&response_body, 1_000).text
+                )));
+            }
+
+            let pull_request: serde_json::Value = serde_json::from_str(&response_body)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let pr_number = pull_request
+                .get("number")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let pr_url = pull_request
+                .get("html_url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("no url");
+
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("Created GitHub pull request #{pr_number}: {pr_url}"),
+                }],
+                details: json!({
+                    "repository": repository,
+                    "number": pr_number,
+                    "head": head,
+                    "base": base,
+                    "draft": draft,
+                    "status": status,
+                    "pull_request_url": pr_url,
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
 fn github_issues_url(
     repository: &str,
     state: &str,
@@ -1861,6 +1978,14 @@ fn github_issue_comments_url(
     let (owner, repo) = parse_github_repository(repository)?;
     reqwest::Url::parse(&format!(
         "https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+    ))
+    .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+}
+
+fn github_pull_requests_url(repository: &str) -> Result<reqwest::Url, ToolError> {
+    let (owner, repo) = parse_github_repository(repository)?;
+    reqwest::Url::parse(&format!(
+        "https://api.github.com/repos/{owner}/{repo}/pulls"
     ))
     .map_err(|error| ToolError::InvalidArguments(error.to_string()))
 }
@@ -1961,6 +2086,28 @@ fn required_issue_number(args: &serde_json::Value) -> Result<u64, ToolError> {
         })
 }
 
+fn required_non_empty_string(args: &serde_json::Value, field: &str) -> Result<String, ToolError> {
+    let value = required_string(args, field)?;
+    if value.trim().is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "{field} must not be empty"
+        )));
+    }
+
+    Ok(value)
+}
+
+fn required_github_ref(args: &serde_json::Value, field: &str) -> Result<String, ToolError> {
+    let value = required_non_empty_string(args, field)?;
+    if !is_safe_github_ref(&value) {
+        return Err(ToolError::InvalidArguments(format!(
+            "{field} may only contain ASCII letters, digits, '.', '_', '-', '/', or ':'"
+        )));
+    }
+
+    Ok(value)
+}
+
 fn required_issue_update_state(args: &serde_json::Value) -> Result<&'static str, ToolError> {
     match args
         .get("state")
@@ -1976,6 +2123,12 @@ fn required_issue_update_state(args: &serde_json::Value) -> Result<&'static str,
             "state must be open or closed".to_owned(),
         )),
     }
+}
+
+fn is_safe_github_ref(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':'))
 }
 
 fn is_safe_github_path_part(value: &str) -> bool {
@@ -3225,7 +3378,8 @@ mod tests {
                 "github_list_issues",
                 "github_get_issue",
                 "github_comment_issue",
-                "github_update_issue_state"
+                "github_update_issue_state",
+                "github_create_pull_request"
             ]
         );
     }
@@ -3250,6 +3404,7 @@ mod tests {
         assert!(names.contains(&"github_get_issue".to_owned()));
         assert!(names.contains(&"github_comment_issue".to_owned()));
         assert!(names.contains(&"github_update_issue_state".to_owned()));
+        assert!(names.contains(&"github_create_pull_request".to_owned()));
         assert!(!names.contains(&"shell".to_owned()));
     }
 
@@ -3369,6 +3524,39 @@ mod tests {
         ));
         assert!(matches!(
             github_issue_comments_url("owner/repo", 0),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn github_pull_requests_url_validates_repository() {
+        let url = github_pull_requests_url("oh-my-harness/Persistent-Agent")
+            .expect("valid GitHub pull requests url");
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/oh-my-harness/Persistent-Agent/pulls"
+        );
+
+        assert!(matches!(
+            github_pull_requests_url("not/enough/parts"),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn github_ref_validation_allows_branch_and_fork_refs() {
+        assert_eq!(
+            required_github_ref(&json!({ "head": "feature/fix-issue_42" }), "head")
+                .expect("branch ref"),
+            "feature/fix-issue_42"
+        );
+        assert_eq!(
+            required_github_ref(&json!({ "head": "owner:feature/fix-issue.42" }), "head")
+                .expect("fork branch ref"),
+            "owner:feature/fix-issue.42"
+        );
+        assert!(matches!(
+            required_github_ref(&json!({ "head": "feature fix" }), "head"),
             Err(ToolError::InvalidArguments(_))
         ));
     }
