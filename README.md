@@ -8,6 +8,21 @@ The first milestone focuses on reliable serial execution. The architecture shoul
 
 - [Technical Selection](docs/TECH_SELECTION.md)
 
+## Agent Framework Dependency Policy
+
+Persistent Agent must use the `oh-my-harness` framework family covered by
+[`oh-my-harness/llm-harness-skills`](https://github.com/oh-my-harness/llm-harness-skills).
+The allowed agent-framework repositories are:
+
+- [`oh-my-harness/llm-api-adapter`](https://github.com/oh-my-harness/llm-api-adapter)
+- [`oh-my-harness/llm-harness-core`](https://github.com/oh-my-harness/llm-harness-core)
+- [`oh-my-harness/llm-harness-runtime`](https://github.com/oh-my-harness/llm-harness-runtime)
+
+Do not replace these with similarly named crates or unrelated harness/runtime packages. In
+particular, `llm_adapter` / `llm_runtime` from other publishers are not acceptable as the
+agent framework implementation and must be replaced by the approved `oh-my-harness`
+repositories.
+
 ## Current Implementation
 
 The repository now contains the first executable skeleton:
@@ -23,7 +38,7 @@ The repository now contains the first executable skeleton:
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
-- DeepSeek harness worker using the `llm_runtime` tool loop for task completion, blockers, memory candidates, artifacts, and follow-up tasks, with a legacy single-response LLM worker fallback.
+- DeepSeek worker plumbing exists, but the agent worker must be migrated to the approved `oh-my-harness` repositories above before it is considered framework-compliant.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Main-agent global action audit API and Web panel for non-task-specific tool calls.
@@ -52,7 +67,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server uses the harness tool-loop worker by default. Set `PERSISTENT_AGENT_WORKER_MODE=llm_json` only when you need to temporarily fall back to the older single-response JSON worker.
+When `DEEPSEEK_API_KEY` is set, the server can call DeepSeek. The current worker dependency wiring is transitional and must be replaced with `oh-my-harness/llm-api-adapter`, `oh-my-harness/llm-harness-core`, and `oh-my-harness/llm-harness-runtime`.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 

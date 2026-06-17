@@ -10,11 +10,17 @@ The goal is to build a durable product around an existing agent framework instea
 
 Use the `oh-my-harness` framework family as the agent foundation:
 
-- `llm-api-adapter`: provider adapter layer.
-- `llm-harness-core`: core agent loop, `Agent`, `AgentHarness`, tools, hooks, sessions, compaction, skills, and events.
-- `llm-harness-runtime`: platform services such as task lifecycle, sandbox, tool registry, MCP, resource injection, sub-agents, tracing, audit, auth, budget, and approval.
+- `llm-api-adapter` from [`oh-my-harness/llm-api-adapter`](https://github.com/oh-my-harness/llm-api-adapter): provider adapter layer.
+- `llm-harness-core` from [`oh-my-harness/llm-harness-core`](https://github.com/oh-my-harness/llm-harness-core): core agent loop, `Agent`, `AgentHarness`, tools, hooks, sessions, compaction, skills, and events.
+- `llm-harness-runtime` from [`oh-my-harness/llm-harness-runtime`](https://github.com/oh-my-harness/llm-harness-runtime): runtime v0.2 platform services such as task lifecycle, sandbox, tool registry, MCP, resource injection, sub-agents, tracing, audit, auth, budget, and approval.
 
-Product code should prefer `AgentHarness` as the product-facing agent entry point.
+This dependency policy is mandatory. These repositories are the framework sources identified by
+[`oh-my-harness/llm-harness-skills`](https://github.com/oh-my-harness/llm-harness-skills), and
+product code must not substitute unrelated packages with similar names. Crates such as
+`llm_adapter` or `llm_runtime` from non-`oh-my-harness` publishers are not approved substitutes for
+the agent loop, provider adapter, runtime, tool registry, or skill system.
+
+Product code should prefer `AgentHarness` from `oh-my-harness/llm-harness-core` as the product-facing agent entry point.
 
 Use runtime services where they already match product concerns:
 
@@ -25,7 +31,7 @@ Use runtime services where they already match product concerns:
 - `HumanApprovalWrapper` for risky tools and future user approval flows.
 - `AuditSink` and `TraceExporter` for durable execution records and observability.
 
-Do not write a separate provider client, tool protocol, hook system, or low-level agent loop in product code unless the framework is missing a capability and the gap is explicitly recorded.
+Do not write a separate provider client, tool protocol, hook system, or low-level agent loop in product code unless the approved `oh-my-harness` framework is missing a capability and the gap is explicitly recorded.
 
 ### Product Backend
 
