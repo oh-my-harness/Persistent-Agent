@@ -45,7 +45,20 @@ impl AppState {
         worker: WorkerBackend,
         scheduler_policy: SchedulerPolicy,
     ) -> Self {
-        let main_agent = MainAgent::new(db.clone());
+        Self::new_with_scheduler_policy_and_main_agent(
+            db.clone(),
+            worker,
+            scheduler_policy,
+            MainAgent::new(db),
+        )
+    }
+
+    pub fn new_with_scheduler_policy_and_main_agent(
+        db: Db,
+        worker: WorkerBackend,
+        scheduler_policy: SchedulerPolicy,
+        main_agent: MainAgent,
+    ) -> Self {
         let scheduler = Scheduler::with_policy(db.clone(), worker, scheduler_policy);
         Self {
             db,

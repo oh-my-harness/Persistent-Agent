@@ -1422,6 +1422,12 @@ name = "persistent-agent-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "llm-harness-agent",
+ "llm-harness-loop",
+ "llm-harness-runtime",
+ "llm-harness-runtime-sandbox-os",
+ "llm_adapter",
  "persistent-agent-db",
  "persistent-agent-domain",
  "serde",
@@ -1503,6 +1509,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "persistent-agent-agent",
  "persistent-agent-api",
  "persistent-agent-db",
  "persistent-agent-scheduler",

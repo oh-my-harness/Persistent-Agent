@@ -3424,18 +3424,28 @@ mod tests {
             .iter()
             .find(|event| event.event_type == "worker_context_prepared")
             .expect("worker context event");
-        assert_eq!(context_event.details["allowed_tools"], json!(["github", "shell"]));
+        assert_eq!(
+            context_event.details["allowed_tools"],
+            json!(["github", "shell"])
+        );
         assert_eq!(context_event.details["skill_resource_count"], json!(2));
-        assert_eq!(context_event.details["skill_resource_error_count"], json!(1));
+        assert_eq!(
+            context_event.details["skill_resource_error_count"],
+            json!(1)
+        );
         let resources = context_event.details["skill_resources"]
             .as_array()
             .expect("skill resource summaries");
-        assert!(resources
-            .iter()
-            .any(|resource| resource["loaded"] == json!(true)));
-        assert!(resources
-            .iter()
-            .any(|resource| resource["loaded"] == json!(false)));
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource["loaded"] == json!(true))
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource["loaded"] == json!(false))
+        );
 
         Ok(())
     }

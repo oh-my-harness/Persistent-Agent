@@ -7,10 +7,17 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+llm_adapter.workspace = true
+llm-harness-agent.workspace = true
+llm-harness-loop.workspace = true
+llm-harness-runtime.workspace = true
+llm-harness-runtime-sandbox-os.workspace = true
 persistent-agent-db = { path = "../persistent-agent-db" }
 persistent-agent-domain = { path = "../persistent-agent-domain" }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

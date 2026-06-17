@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+persistent-agent-agent = { path = "../../crates/persistent-agent-agent" }
 persistent-agent-api = { path = "../../crates/persistent-agent-api" }
 persistent-agent-db = { path = "../../crates/persistent-agent-db" }
 persistent-agent-scheduler = { path = "../../crates/persistent-agent-scheduler" }

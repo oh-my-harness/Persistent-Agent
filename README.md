@@ -31,6 +31,7 @@ The repository now contains the first executable skeleton:
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
 - Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
+- Optional main-agent LLM advisor through the approved `oh-my-harness` `AgentHarness`; deterministic task-state changes still run through product code, and the advisor composes the user-facing reply from the completed action context.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, notes, and execution history.
@@ -68,7 +69,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter`. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, and `http_fetch`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call.
+When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, and `http_fetch`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
 
 Active skill `resource_path` values must be relative to the workspace. If the path points to a directory, the scheduler loads `SKILL.md` from that directory; if it points to a file, the scheduler loads that file. Loaded content is injected into the worker prompt with a bounded size, while missing or invalid resources are recorded in worker context events without stopping task execution.
 

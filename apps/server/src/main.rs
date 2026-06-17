@@ -1,5 +1,6 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use persistent_agent_agent::{MainAgent, MainAgentLlmConfig, OhMyHarnessMainAgentAdvisor};
 use persistent_agent_api::{AppState, router, spawn_heartbeat, spawn_scheduler_loop};
 use persistent_agent_db::Db;
 use persistent_agent_scheduler::{
@@ -18,9 +19,16 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
 
     let db = Db::connect(&database_url).await?;
-    let worker = build_worker();
+    let llm_config = deepseek_config_from_env();
+    let worker = build_worker(llm_config.clone());
+    let main_agent = build_main_agent(db.clone(), llm_config);
     let scheduler_policy = scheduler_policy();
-    let state = AppState::new_with_scheduler_policy(db, worker, scheduler_policy);
+    let state = AppState::new_with_scheduler_policy_and_main_agent(
+        db,
+        worker,
+        scheduler_policy,
+        main_agent,
+    );
     let scheduler_interval = scheduler_interval();
 
     tokio::spawn(spawn_heartbeat(state.events.clone()));
@@ -38,14 +46,13 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_worker() -> WorkerBackend {
-    match std::env::var("DEEPSEEK_API_KEY") {
-        Ok(api_key) if !api_key.trim().is_empty() => {
-            let model =
-                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
-            tracing::info!(%model, "using DeepSeek worker through oh-my-harness AgentHarness");
+fn build_worker(llm_config: Option<MainAgentLlmConfig>) -> WorkerBackend {
+    match llm_config {
+        Some(config) => {
+            tracing::info!(model = %config.model, "using DeepSeek worker through oh-my-harness AgentHarness");
             WorkerBackend::Harness(OhMyHarnessWorker::new(LlmWorkerConfig::deepseek(
-                api_key, model,
+                config.api_key,
+                config.model,
             )))
         }
         _ => {
@@ -53,6 +60,28 @@ fn build_worker() -> WorkerBackend {
             WorkerBackend::Stub(StubWorker)
         }
     }
+}
+
+fn build_main_agent(db: Db, llm_config: Option<MainAgentLlmConfig>) -> MainAgent {
+    match llm_config {
+        Some(config) => {
+            tracing::info!(model = %config.model, "using DeepSeek main agent advisor through oh-my-harness AgentHarness");
+            MainAgent::new_with_advisor(db, Arc::new(OhMyHarnessMainAgentAdvisor::new(config)))
+        }
+        None => {
+            tracing::info!("DEEPSEEK_API_KEY not set; using deterministic main agent only");
+            MainAgent::new(db)
+        }
+    }
+}
+
+fn deepseek_config_from_env() -> Option<MainAgentLlmConfig> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY").ok()?;
+    if api_key.trim().is_empty() {
+        return None;
+    }
+    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
+    Some(MainAgentLlmConfig::deepseek(api_key, model))
 }
 
 fn scheduler_interval() -> Duration {

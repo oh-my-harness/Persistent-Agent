@@ -36,6 +36,17 @@ The final worker path should be:
 Scheduler -> TaskWorker -> OhMyHarnessWorker -> AgentHarness -> WorkerResult
 ```
 
+The main-agent conversation path should also use the approved harness where LLM assistance is
+enabled:
+
+```text
+User message -> deterministic MainAgent task operation -> OhMyHarnessMainAgentAdvisor -> AgentHarness -> conversational reply
+```
+
+The deterministic product operation remains the authority for task state changes. The advisor does
+not receive state-changing tools; it composes the final user-facing response from the verified action
+context and falls back to the deterministic reply on empty output or LLM failure.
+
 `OhMyHarnessWorker` must use:
 
 - `AgentHarness` from the approved runtime v0.2 `llm-harness-agent` package (wired)

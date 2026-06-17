@@ -1,5 +1,13 @@
-use std::{env, fs, path::Path, process::Command};
+use std::{env, fs, path::Path, process::Command, sync::Arc};
 
+use async_trait::async_trait;
+use llm_adapter::deepseek;
+use llm_harness_agent::prelude::{
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock,
+};
+use llm_harness_loop::LlmClient;
+use llm_harness_runtime::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task,
@@ -67,11 +75,24 @@ const ZH_RESULT: &str = "\u{6210}\u{679c}";
 #[derive(Clone)]
 pub struct MainAgent {
     db: Db,
+    advisor: Option<Arc<dyn MainAgentAdvisor>>,
 }
 
 impl MainAgent {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self { db, advisor: None }
+    }
+
+    pub fn new_with_advisor(db: Db, advisor: Arc<dyn MainAgentAdvisor>) -> Self {
+        Self {
+            db,
+            advisor: Some(advisor),
+        }
+    }
+
+    pub fn with_advisor(mut self, advisor: Arc<dyn MainAgentAdvisor>) -> Self {
+        self.advisor = Some(advisor);
+        self
     }
 
     pub async fn create_task(&self, input: CreateTask) -> anyhow::Result<Task> {
@@ -600,7 +621,7 @@ impl MainAgent {
         let intent = parse_intent(&input.content);
         let scheduler_tick_requested = matches!(intent, MainAgentIntent::RunSchedulerTick);
         let mut changed_tasks = Vec::new();
-        let reply = match intent {
+        let deterministic_reply = match intent {
             MainAgentIntent::SplitTasks { titles } => {
                 for title in titles {
                     let task = self
@@ -923,6 +944,15 @@ impl MainAgent {
             }
         };
 
+        let reply = self
+            .maybe_advise_reply(
+                &input.content,
+                deterministic_reply,
+                scheduler_tick_requested,
+                &changed_tasks,
+            )
+            .await?;
+
         let assistant_message = self
             .db
             .add_conversation_message(conversation.id, None, "assistant", &reply)
@@ -935,6 +965,74 @@ impl MainAgent {
             changed_tasks,
             scheduler_tick_requested,
         })
+    }
+
+    async fn maybe_advise_reply(
+        &self,
+        user_message: &str,
+        deterministic_reply: String,
+        scheduler_tick_requested: bool,
+        changed_tasks: &[Task],
+    ) -> anyhow::Result<String> {
+        let Some(advisor) = &self.advisor else {
+            return Ok(deterministic_reply);
+        };
+
+        let conversation = self.db.get_or_create_main_conversation().await?;
+        let context = MainAgentAdviceContext {
+            user_message: user_message.to_owned(),
+            deterministic_reply: deterministic_reply.clone(),
+            scheduler_tick_requested,
+            changed_tasks: changed_tasks.to_vec(),
+            task_pool_summary: self.summarize_task_pool().await?,
+            recent_messages: self
+                .db
+                .list_conversation_messages(conversation.id, 12)
+                .await?,
+        };
+
+        match advisor.advise(context).await {
+            Ok(reply) if !reply.trim().is_empty() => {
+                let reply = reply.trim().to_owned();
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_advisor_reply",
+                        serde_json::json!({
+                            "used": true,
+                            "deterministic_reply": deterministic_reply,
+                        }),
+                    )
+                    .await?;
+                Ok(reply)
+            }
+            Ok(_) => {
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_advisor_empty_reply",
+                        serde_json::json!({ "fallback": true }),
+                    )
+                    .await?;
+                Ok(deterministic_reply)
+            }
+            Err(error) => {
+                self.db
+                    .record_action(
+                        None,
+                        "main_agent",
+                        "llm_advisor_failed",
+                        serde_json::json!({
+                            "error": error.to_string(),
+                            "fallback": true,
+                        }),
+                    )
+                    .await?;
+                Ok(deterministic_reply)
+            }
+        }
     }
 
     async fn find_task(&self, selector: &str) -> anyhow::Result<Result<Task, String>> {
@@ -1024,6 +1122,56 @@ pub struct MainAgentMessageResponse {
     pub assistant_message: ConversationMessage,
     pub changed_tasks: Vec<Task>,
     pub scheduler_tick_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainAgentAdviceContext {
+    pub user_message: String,
+    pub deterministic_reply: String,
+    pub scheduler_tick_requested: bool,
+    pub changed_tasks: Vec<Task>,
+    pub task_pool_summary: TaskPoolSummary,
+    pub recent_messages: Vec<ConversationMessage>,
+}
+
+#[async_trait]
+pub trait MainAgentAdvisor: Send + Sync {
+    async fn advise(&self, context: MainAgentAdviceContext) -> anyhow::Result<String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct MainAgentLlmConfig {
+    pub api_key: String,
+    pub model: String,
+    pub timeout_ms: u64,
+}
+
+impl MainAgentLlmConfig {
+    pub fn deepseek(api_key: String, model: String) -> Self {
+        Self {
+            api_key,
+            model,
+            timeout_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OhMyHarnessMainAgentAdvisor {
+    config: MainAgentLlmConfig,
+}
+
+impl OhMyHarnessMainAgentAdvisor {
+    pub fn new(config: MainAgentLlmConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl MainAgentAdvisor for OhMyHarnessMainAgentAdvisor {
+    async fn advise(&self, context: MainAgentAdviceContext) -> anyhow::Result<String> {
+        dispatch_main_agent_advisor(self.config.clone(), main_agent_advisor_prompt(&context)).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1366,6 +1514,122 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     MainAgentIntent::Help
+}
+
+const MAIN_AGENT_ADVISOR_SYSTEM_PROMPT: &str = "You are the main agent for Persistent Agent. The deterministic task-state operation has already been performed by product code. Write a concise, helpful user-facing reply in the user's language. Preserve the facts from the deterministic reply. Do not claim that you changed task state unless the deterministic reply says it happened. Mention useful next steps only when they directly follow from the current context.";
+
+async fn dispatch_main_agent_advisor(
+    config: MainAgentLlmConfig,
+    prompt: String,
+) -> anyhow::Result<String> {
+    let client = Arc::new(deepseek::client(config.api_key)) as Arc<dyn LlmClient>;
+    let sandbox = OsEnvSandbox::new(SandboxConfig {
+        fs_allowlist: Vec::new(),
+        fs_denylist: Vec::new(),
+        net_allowlist: Vec::new(),
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: std::env::current_dir().ok(),
+    });
+    sandbox.start().await?;
+
+    let mut opts = AgentHarnessOptions::new(config.model);
+    opts.max_tokens = 500;
+    opts.system_prompt = Some(MAIN_AGENT_ADVISOR_SYSTEM_PROMPT.to_owned());
+    opts.tools = Vec::new();
+
+    let harness = AgentHarness::new_in_memory(client, sandbox.env(), opts).await;
+    let mut events = harness.subscribe();
+    harness.prompt(prompt).await?;
+    let wait = harness.wait_for_idle();
+    tokio::time::timeout(std::time::Duration::from_millis(config.timeout_ms), wait).await?;
+
+    let mut assistant_text = String::new();
+    while let Ok(event) = events.try_recv() {
+        if let AgentHarnessEvent::Agent(llm_harness_agent::prelude::AgentEvent::AgentEnd {
+            new_messages,
+        }) = event.as_ref()
+        {
+            assistant_text.push_str(&assistant_text_from_messages(new_messages));
+        }
+    }
+
+    Ok(assistant_text)
+}
+
+fn main_agent_advisor_prompt(context: &MainAgentAdviceContext) -> String {
+    format!(
+        "User message:\n{}\n\nDeterministic reply already produced by the task manager:\n{}\n\nScheduler scan requested: {}\n\nChanged tasks:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}",
+        context.user_message,
+        context.deterministic_reply,
+        context.scheduler_tick_requested,
+        format_advisor_changed_tasks(&context.changed_tasks),
+        format_advisor_summary(&context.task_pool_summary),
+        format_advisor_recent_messages(&context.recent_messages),
+    )
+}
+
+fn assistant_text_from_messages(messages: &[llm_harness_agent::prelude::AgentMessage]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let llm_harness_agent::prelude::AgentMessage::Assistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.content {
+            if let ContentBlock::Text { text } = block {
+                output.push_str(text);
+            }
+        }
+    }
+    output
+}
+
+fn format_advisor_changed_tasks(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "none".to_owned();
+    }
+
+    tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "- {} [{}] priority {} queue {}",
+                task.title, task.status, task.priority, task.queue_position
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_advisor_summary(summary: &TaskPoolSummary) -> String {
+    format!(
+        "{} total, {} queued, {} running, {} waiting for user, {} waiting for schedule, {} completed, {} failed, {} cancelled, {} paused",
+        summary.total,
+        summary.queued,
+        summary.running,
+        summary.waiting_for_user,
+        summary.waiting_for_schedule,
+        summary.completed,
+        summary.failed,
+        summary.cancelled,
+        summary.paused
+    )
+}
+
+fn format_advisor_recent_messages(messages: &[ConversationMessage]) -> String {
+    if messages.is_empty() {
+        return "none".to_owned();
+    }
+
+    messages
+        .iter()
+        .map(|message| format!("- {}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -2794,6 +3058,23 @@ mod tests {
     use super::*;
     use persistent_agent_db::Db;
     use persistent_agent_domain::CreateMemory;
+    use std::sync::Mutex as StdMutex;
+
+    struct FixedAdvisor {
+        reply: String,
+        contexts: Arc<StdMutex<Vec<MainAgentAdviceContext>>>,
+    }
+
+    #[async_trait]
+    impl MainAgentAdvisor for FixedAdvisor {
+        async fn advise(&self, context: MainAgentAdviceContext) -> anyhow::Result<String> {
+            self.contexts
+                .lock()
+                .expect("advisor contexts lock")
+                .push(context);
+            Ok(self.reply.clone())
+        }
+    }
 
     #[test]
     fn parses_create_task_with_priority() {
@@ -3266,6 +3547,45 @@ mod tests {
         assert_eq!(response.changed_tasks.len(), 1);
         assert_eq!(task.requested_skills, vec!["github", "shell"]);
         assert!(response.assistant_message.content.contains("Created task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_advisor_reply_when_configured() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let contexts = Arc::new(StdMutex::new(Vec::new()));
+        let agent = MainAgent::new_with_advisor(
+            db.clone(),
+            Arc::new(FixedAdvisor {
+                reply: "Advisor: created and queued the task.".to_owned(),
+                contexts: contexts.clone(),
+            }),
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "create task: Check GitHub issues".to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(
+            response.assistant_message.content,
+            "Advisor: created and queued the task."
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(response.changed_tasks.len(), 1);
+        let captured = contexts.lock().expect("advisor contexts lock");
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].deterministic_reply.contains("Created task"));
+        assert_eq!(captured[0].changed_tasks.len(), 1);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "llm_advisor_reply")
+        );
 
         Ok(())
     }
