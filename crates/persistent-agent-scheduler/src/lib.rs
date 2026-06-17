@@ -148,6 +148,39 @@ where
             .iter()
             .filter(|resource| resource.error.is_some())
             .count();
+        let worker_kind = std::any::type_name::<W>();
+        self.db
+            .record_action(
+                Some(task.id),
+                "main_agent",
+                "delegate_task_to_worker",
+                json!({
+                    "worker_kind": worker_kind,
+                    "lease_owner": self.lease_owner,
+                    "attempt_id": attempt.id,
+                    "requested_skills": &task.requested_skills,
+                    "matched_skills": &task.matched_skills,
+                    "active_skills": context.skills.iter().map(|skill| skill.name.clone()).collect::<Vec<_>>(),
+                    "allowed_tools": &context.allowed_tools,
+                }),
+            )
+            .await?;
+        self.db
+            .record_attempt_event(
+                attempt.id,
+                task.id,
+                "main_agent_delegated_worker",
+                "Main agent delegated the task to a worker.",
+                json!({
+                    "worker_kind": worker_kind,
+                    "lease_owner": self.lease_owner,
+                    "requested_skills": &task.requested_skills,
+                    "matched_skills": &task.matched_skills,
+                    "active_skills": context.skills.iter().map(|skill| skill.name.clone()).collect::<Vec<_>>(),
+                    "allowed_tools": &context.allowed_tools,
+                }),
+            )
+            .await?;
         self.db
             .record_attempt_event(
                 attempt.id,
@@ -5046,7 +5079,29 @@ mod tests {
 
         scheduler.tick().await?;
 
+        let actions = db.list_task_actions(task.id).await?;
         let events = db.list_task_attempt_events(task.id).await?;
+        let delegation_action = actions
+            .iter()
+            .find(|action| action.action_type == "delegate_task_to_worker")
+            .expect("main agent should record worker delegation");
+        assert_eq!(delegation_action.actor, "main_agent");
+        assert_eq!(
+            delegation_action.details["lease_owner"],
+            json!("persistent-agent-scheduler")
+        );
+        assert!(
+            delegation_action.details["worker_kind"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("StubWorker"))
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "main_agent_delegated_worker"
+                && event.details["lease_owner"] == json!("persistent-agent-scheduler")
+                && event.details["worker_kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.contains("StubWorker"))
+        }));
         assert!(
             events
                 .iter()

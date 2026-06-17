@@ -39,7 +39,7 @@ The repository now contains the first executable skeleton:
 - Task dependencies with API management, audit records, and scheduler gating for dependency-aware execution.
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
-- Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans that return the tick result, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
+- Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans that return the tick result, auditable main-agent-to-worker delegation records, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
 - DeepSeek worker execution now runs through `AgentHarness` from the approved `oh-my-harness` framework. The current code uses the runtime v0.2 workspace packages `llm-harness-agent`, `llm-harness-runtime`, and `llm-harness-runtime-sandbox-os` from `oh-my-harness/llm-harness-runtime` so the agent, runtime registry, and sandbox types stay source-compatible.
 - The worker registers product lifecycle tools and basic execution tools through runtime `InMemoryToolRegistry`, runs with runtime `OsEnvSandbox`, and calls DeepSeek through the approved `oh-my-harness/llm-api-adapter`.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
