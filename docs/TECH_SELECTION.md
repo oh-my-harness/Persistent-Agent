@@ -117,6 +117,7 @@ SSE:
 - task status updates;
 - current run events;
 - tool-call events;
+- main-agent global action events;
 - assistant text deltas;
 - main-agent task-management decisions;
 - scheduler heartbeat.

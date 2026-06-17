@@ -1,4 +1,4 @@
-use std::{convert::Infallible, time::Duration};
+use std::{collections::HashSet, convert::Infallible, time::Duration};
 
 use axum::{
     Json, Router,
@@ -85,6 +85,7 @@ impl Default for EventBus {
 pub enum AppEvent {
     TaskChanged { task: Task },
     MainAgentReply { message: ConversationMessage },
+    MainAgentAction { action: TaskAction },
     SchedulerTick { tick: SchedulerTick },
     Heartbeat,
 }
@@ -485,6 +486,13 @@ async fn send_main_agent_message(
     State(state): State<AppState>,
     Json(input): Json<MainAgentMessageInput>,
 ) -> Result<Json<persistent_agent_agent::MainAgentMessageResponse>, ApiError> {
+    let previous_global_action_ids = state
+        .db
+        .list_global_actions()
+        .await?
+        .into_iter()
+        .map(|action| action.id)
+        .collect::<HashSet<_>>();
     let response = state.main_agent.handle_user_message(input).await?;
     for task in &response.changed_tasks {
         state
@@ -494,6 +502,11 @@ async fn send_main_agent_message(
     state.events.send(AppEvent::MainAgentReply {
         message: response.assistant_message.clone(),
     });
+    for action in state.db.list_global_actions().await? {
+        if !previous_global_action_ids.contains(&action.id) {
+            state.events.send(AppEvent::MainAgentAction { action });
+        }
+    }
     if response.scheduler_tick_requested {
         let tick = state.scheduler.tick().await?;
         state

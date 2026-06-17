@@ -688,6 +688,14 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
         tone: "info",
         timestamp,
       };
+    case "main_agent_action":
+      return {
+        id: `${timestamp}-main-agent-action-${event.action.id}`,
+        title: `Main agent action: ${event.action.action_type}`,
+        detail: JSON.stringify(event.action.details),
+        tone: event.action.action_type.endsWith("_failed") ? "warning" : "info",
+        timestamp,
+      };
     case "scheduler_tick":
       return schedulerTimelineEvent(event.tick, timestamp);
     case "heartbeat":

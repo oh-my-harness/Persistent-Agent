@@ -70,6 +70,7 @@ export interface SchedulerState {
 export type AppEvent =
   | { type: "task_changed"; task: Task }
   | { type: "main_agent_reply"; message: ConversationMessage }
+  | { type: "main_agent_action"; action: TaskAction }
   | { type: "scheduler_tick"; tick: SchedulerTick }
   | { type: "heartbeat" };
 

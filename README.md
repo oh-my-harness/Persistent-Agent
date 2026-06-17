@@ -41,8 +41,8 @@ The repository now contains the first executable skeleton:
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.
 - Worker-completed results can create auditable one-off follow-up tasks in the queue.
-- Axum API with REST endpoints and an SSE event stream.
-- Vite React Web UI under `apps/web` with a readable execution monitor for current run state, next queued work, and SSE events.
+- Axum API with REST endpoints and an SSE event stream for task changes, main-agent replies, main-agent actions, scheduler ticks, and heartbeats.
+- Vite React Web UI under `apps/web` with a readable execution monitor for current run state, next queued work, main-agent action events, and SSE events.
 
 Run the backend:
 
