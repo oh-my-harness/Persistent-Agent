@@ -2,8 +2,8 @@ use std::{env, fs, path::Path, process::Command};
 
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task, TaskId,
-    TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
+    ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task,
+    TaskAction, TaskId, TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -328,6 +328,19 @@ impl MainAgent {
             .await?;
 
         Ok(format_task_pool_explanation(&tasks))
+    }
+
+    pub async fn list_main_agent_actions(&self) -> anyhow::Result<String> {
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_global_actions",
+                serde_json::json!({ "limit": 10 }),
+            )
+            .await?;
+        let actions = self.db.list_global_actions().await?;
+        Ok(format_global_action_list(&actions))
     }
 
     pub async fn explain_task_state(&self, id: TaskId) -> anyhow::Result<String> {
@@ -752,6 +765,7 @@ impl MainAgent {
                 let tasks = self.list_task_pool().await?;
                 format_task_list(&tasks)
             }
+            MainAgentIntent::ListGlobalActions => self.list_main_agent_actions().await?,
             MainAgentIntent::ExplainTaskPool => self.explain_task_pool_state().await?,
             MainAgentIntent::ExplainTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => self.explain_task_state(task.id).await?,
@@ -797,7 +811,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -972,6 +986,7 @@ enum MainAgentIntent {
         question: String,
     },
     ListTasks,
+    ListGlobalActions,
     ExplainTaskPool,
     ExplainTask {
         selector: String,
@@ -1030,6 +1045,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_list_tasks_request(&normalized) {
         return MainAgentIntent::ListTasks;
+    }
+
+    if is_global_action_list_request(&normalized) {
+        return MainAgentIntent::ListGlobalActions;
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
@@ -1326,6 +1345,25 @@ fn is_list_tasks_request(normalized: &str) -> bool {
     ) && !is_create_request(normalized)
 }
 
+fn is_global_action_list_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "main agent audit",
+            "main-agent audit",
+            "global actions",
+            "global action",
+            "recent actions",
+            "audit actions",
+            "audit log",
+            "tool calls",
+            "\u{5ba1}\u{8ba1}\u{8bb0}\u{5f55}",
+            "\u{5168}\u{5c40}\u{52a8}\u{4f5c}",
+            "\u{5de5}\u{5177}\u{8c03}\u{7528}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
 fn is_scheduler_scan_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -1424,6 +1462,28 @@ fn format_task_list(tasks: &[Task]) -> String {
     }
     if tasks.len() > 10 {
         lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn format_global_action_list(actions: &[TaskAction]) -> String {
+    if actions.is_empty() {
+        return "No global main-agent actions yet.".to_owned();
+    }
+
+    let mut lines = vec![format!(
+        "Recent global main-agent actions ({} shown):",
+        actions.len().min(10)
+    )];
+    for action in actions.iter().take(10) {
+        lines.push(format!(
+            "- {} [{}] {} {}",
+            action.id.to_string().chars().take(8).collect::<String>(),
+            action.actor,
+            action.action_type,
+            action.details
+        ));
     }
 
     lines.join("\n")
@@ -2545,6 +2605,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_global_action_list_intents() {
+        assert_eq!(
+            parse_intent("show main agent audit"),
+            MainAgentIntent::ListGlobalActions
+        );
+        assert_eq!(
+            parse_intent("list recent tool calls"),
+            MainAgentIntent::ListGlobalActions
+        );
+    }
+
+    #[test]
     fn parses_scheduler_scan_intents() {
         assert_eq!(
             parse_intent("run scheduler tick"),
@@ -3213,6 +3285,38 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "list_tasks")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_global_actions_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        agent.inspect_workspace_status().await?;
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show main agent audit".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Recent global main-agent actions")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("inspect_workspace_status")
+        );
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "list_global_actions" && action.details["limit"] == 10
+        }));
 
         Ok(())
     }

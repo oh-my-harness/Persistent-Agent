@@ -204,6 +204,7 @@ The main agent is the conversational task manager, scheduler, and worker coordin
 It should:
 
 - talk with the user about goals, tasks, queue state, blockers, and priorities;
+- show recent global audit actions for non-task-specific tool calls;
 - create, update, pause, resume, cancel, reorder, and reprioritize tasks through explicit tools;
 - split vague user requests into concrete task proposals;
 - summarize the task pool and explain why work is or is not running;

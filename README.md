@@ -15,7 +15,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
+- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
 - Web task detail panel with editable task title/description/requested skills, task conversation, latest result, dependencies, and execution history.
@@ -118,7 +118,7 @@ Tasks can enter the system through three channels:
 2. Structured creation through Web UI forms and queue controls.
 3. System-created follow-up tasks from recurring jobs, worker summaries, or main-agent planning.
 
-The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add requested skills, add resource locks, inspect local workspace status, run a scheduler scan, or summarize the queue.
+The conversational path should be a first-class product surface. Users can ask the main agent to create tasks with requested skills, split vague goals into multiple tasks, reprioritize work, pause recurring tasks, resume blocked tasks, add requested skills, add resource locks, inspect local workspace status, show recent audit actions, run a scheduler scan, or summarize the queue.
 
 Structured UI controls remain important for exact edits, batch operations, and reviewable state changes.
 
@@ -281,7 +281,7 @@ Core views:
 
 - task pool: create tasks, reorder queue, filter status, inspect priority;
 - task detail: description, metadata, dependencies, run history, artifacts, memory candidates;
-- main conversation: talk to the main agent to create, update, reorder, explain, inspect workspace state, or discuss tasks;
+- main conversation: talk to the main agent to create, update, reorder, explain, inspect workspace state, show audit actions, or discuss tasks;
 - main-agent audit: inspect recent global tool calls and non-task-specific actions;
 - task conversation: user-agent discussion for blocked or active tasks;
 - execution monitor: current running task, next queued task, logs, state transitions;
