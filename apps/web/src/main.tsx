@@ -209,6 +209,8 @@ function SkillManager() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [rules, setRules] = useState("");
+  const [tools, setTools] = useState("");
+  const [resourcePath, setResourcePath] = useState("");
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ["skills"] });
     await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -219,6 +221,8 @@ function SkillManager() {
       setName("");
       setDescription("");
       setRules("");
+      setTools("");
+      setResourcePath("");
       await refresh();
     },
   });
@@ -266,8 +270,8 @@ function SkillManager() {
             name: name.trim(),
             description,
             trigger_rules: splitCsv(rules),
-            tool_subset: [],
-            resource_path: null,
+            tool_subset: splitCsv(tools),
+            resource_path: resourcePath.trim() || null,
           });
         }}
       >
@@ -276,6 +280,16 @@ function SkillManager() {
           value={rules}
           onChange={(event) => setRules(event.target.value)}
           placeholder="Triggers, e.g. github, issue, type:recurring"
+        />
+        <input
+          value={tools}
+          onChange={(event) => setTools(event.target.value)}
+          placeholder="Tools, e.g. github, shell, filesystem"
+        />
+        <input
+          value={resourcePath}
+          onChange={(event) => setResourcePath(event.target.value)}
+          placeholder="Resource path, e.g. skills/github"
         />
         <textarea
           value={description}
