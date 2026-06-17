@@ -1370,6 +1370,22 @@ pub enum MainAgentPlan {
         selector: String,
         priority: i64,
     },
+    ReorderTask {
+        selector: String,
+        queue_position: i64,
+    },
+    AddTaskDependency {
+        selector: String,
+        depends_on_selector: String,
+    },
+    RemoveTaskDependency {
+        selector: String,
+        depends_on_selector: String,
+    },
+    AddTaskNote {
+        selector: String,
+        content: String,
+    },
     AddRequestedSkills {
         selector: String,
         skill_names: Vec<String>,
@@ -1387,6 +1403,18 @@ pub enum MainAgentPlan {
     },
     DeleteSkillDefinition {
         selector: String,
+    },
+    AddResourceLock {
+        selector: String,
+        resource_key: String,
+    },
+    RemoveResourceLock {
+        selector: String,
+        resource_key: String,
+    },
+    RequestClarification {
+        selector: String,
+        question: String,
     },
     ListTasks,
     Summarize,
@@ -1418,6 +1446,30 @@ impl MainAgentPlan {
             Self::ReprioritizeTask { selector, priority } => {
                 MainAgentIntent::ReprioritizeTask { selector, priority }
             }
+            Self::ReorderTask {
+                selector,
+                queue_position,
+            } => MainAgentIntent::ReorderTask {
+                selector,
+                queue_position,
+            },
+            Self::AddTaskDependency {
+                selector,
+                depends_on_selector,
+            } => MainAgentIntent::AddTaskDependency {
+                selector,
+                depends_on_selector,
+            },
+            Self::RemoveTaskDependency {
+                selector,
+                depends_on_selector,
+            } => MainAgentIntent::RemoveTaskDependency {
+                selector,
+                depends_on_selector,
+            },
+            Self::AddTaskNote { selector, content } => {
+                MainAgentIntent::AddTaskNote { selector, content }
+            }
             Self::AddRequestedSkills {
                 selector,
                 skill_names,
@@ -1440,6 +1492,23 @@ impl MainAgentPlan {
             }
             Self::DeleteSkillDefinition { selector } => {
                 MainAgentIntent::DeleteSkillDefinition { selector }
+            }
+            Self::AddResourceLock {
+                selector,
+                resource_key,
+            } => MainAgentIntent::AddResourceLock {
+                selector,
+                resource_key,
+            },
+            Self::RemoveResourceLock {
+                selector,
+                resource_key,
+            } => MainAgentIntent::RemoveResourceLock {
+                selector,
+                resource_key,
+            },
+            Self::RequestClarification { selector, question } => {
+                MainAgentIntent::RequestClarification { selector, question }
             }
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
@@ -2039,11 +2108,18 @@ async fn dispatch_main_agent_planner(
         "plan_resume_task",
         "plan_cancel_task",
         "plan_reprioritize_task",
+        "plan_reorder_task",
+        "plan_add_task_dependency",
+        "plan_remove_task_dependency",
+        "plan_add_task_note",
         "plan_add_requested_skills",
         "plan_remove_requested_skills",
         "plan_create_skill_definition",
         "plan_update_skill_definition",
         "plan_delete_skill_definition",
+        "plan_add_resource_lock",
+        "plan_remove_resource_lock",
+        "plan_request_clarification",
         "plan_list_tasks",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
@@ -2082,6 +2158,20 @@ fn main_agent_planner_tool_registry(
         PlannedTaskSelectorAction::Cancel,
     )));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
+    registry.register(Arc::new(PlanReorderTaskTool::new(state.clone())));
+    registry.register(Arc::new(PlanTaskDependencyTool::new(
+        state.clone(),
+        "plan_add_task_dependency",
+        "Plan to make one task depend on another task.",
+        PlannedDependencyAction::Add,
+    )));
+    registry.register(Arc::new(PlanTaskDependencyTool::new(
+        state.clone(),
+        "plan_remove_task_dependency",
+        "Plan to remove a dependency between two tasks.",
+        PlannedDependencyAction::Remove,
+    )));
+    registry.register(Arc::new(PlanTaskNoteTool::new(state.clone())));
     registry.register(Arc::new(PlanRequestedSkillsTool::new(
         state.clone(),
         "plan_add_requested_skills",
@@ -2097,6 +2187,19 @@ fn main_agent_planner_tool_registry(
     registry.register(Arc::new(PlanCreateSkillDefinitionTool::new(state.clone())));
     registry.register(Arc::new(PlanUpdateSkillDefinitionTool::new(state.clone())));
     registry.register(Arc::new(PlanDeleteSkillDefinitionTool::new(state.clone())));
+    registry.register(Arc::new(PlanResourceLockTool::new(
+        state.clone(),
+        "plan_add_resource_lock",
+        "Plan to add a resource lock to a task.",
+        PlannedResourceLockAction::Add,
+    )));
+    registry.register(Arc::new(PlanResourceLockTool::new(
+        state.clone(),
+        "plan_remove_resource_lock",
+        "Plan to remove a resource lock from a task.",
+        PlannedResourceLockAction::Remove,
+    )));
+    registry.register(Arc::new(PlanRequestClarificationTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_tasks",
@@ -2404,6 +2507,216 @@ impl Tool for PlanReprioritizeTaskTool {
             self.state.lock().await.plan =
                 Some(MainAgentPlan::ReprioritizeTask { selector, priority });
             Ok(planner_tool_result("planned task priority change"))
+        })
+    }
+}
+
+struct PlanReorderTaskTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanReorderTaskTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "queue_position": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["selector", "queue_position"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanReorderTaskTool {
+    fn name(&self) -> &str {
+        "plan_reorder_task"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to move a task to a specific queue position."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let queue_position = args
+                .get("queue_position")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments("queue_position is required".to_owned())
+                })?;
+            self.state.lock().await.plan = Some(MainAgentPlan::ReorderTask {
+                selector,
+                queue_position,
+            });
+            Ok(planner_tool_result("planned task reorder"))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlannedDependencyAction {
+    Add,
+    Remove,
+}
+
+struct PlanTaskDependencyTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedDependencyAction,
+    schema: serde_json::Value,
+}
+
+impl PlanTaskDependencyTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedDependencyAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Dependent task id or title fragment."
+                    },
+                    "depends_on_selector": {
+                        "type": "string",
+                        "description": "Prerequisite task id or title fragment."
+                    }
+                },
+                "required": ["selector", "depends_on_selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanTaskDependencyTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let depends_on_selector = planner_required_string(&args, "depends_on_selector")?;
+            let plan = match self.action {
+                PlannedDependencyAction::Add => MainAgentPlan::AddTaskDependency {
+                    selector,
+                    depends_on_selector,
+                },
+                PlannedDependencyAction::Remove => MainAgentPlan::RemoveTaskDependency {
+                    selector,
+                    depends_on_selector,
+                },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned task dependency change"))
+        })
+    }
+}
+
+struct PlanTaskNoteTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanTaskNoteTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "content": { "type": "string" }
+                },
+                "required": ["selector", "content"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanTaskNoteTool {
+    fn name(&self) -> &str {
+        "plan_add_task_note"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to add a note to an existing task."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::AddTaskNote {
+                selector: planner_required_string(&args, "selector")?,
+                content: planner_required_string(&args, "content")?,
+            });
+            Ok(planner_tool_result("planned task note"))
         })
     }
 }
@@ -2732,6 +3045,151 @@ impl Tool for PlanDeleteSkillDefinitionTool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PlannedResourceLockAction {
+    Add,
+    Remove,
+}
+
+struct PlanResourceLockTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedResourceLockAction,
+    schema: serde_json::Value,
+}
+
+impl PlanResourceLockTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedResourceLockAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "resource_key": {
+                        "type": "string",
+                        "description": "Resource key such as repo:owner/name."
+                    }
+                },
+                "required": ["selector", "resource_key"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanResourceLockTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let resource_key = planner_required_string(&args, "resource_key")?;
+            let plan = match self.action {
+                PlannedResourceLockAction::Add => MainAgentPlan::AddResourceLock {
+                    selector,
+                    resource_key,
+                },
+                PlannedResourceLockAction::Remove => MainAgentPlan::RemoveResourceLock {
+                    selector,
+                    resource_key,
+                },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned task resource lock change"))
+        })
+    }
+}
+
+struct PlanRequestClarificationTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanRequestClarificationTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "question": { "type": "string" }
+                },
+                "required": ["selector", "question"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanRequestClarificationTool {
+    fn name(&self) -> &str {
+        "plan_request_clarification"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to ask the user a clarification question for one task."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::RequestClarification {
+                selector: planner_required_string(&args, "selector")?,
+                question: planner_required_string(&args, "question")?,
+            });
+            Ok(planner_tool_result("planned user clarification request"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -2836,7 +3294,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -5506,6 +5964,237 @@ mod tests {
         assert_eq!(updated.priority, 9);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("priority to 9"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_queue_reordering() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Prepare changelog".to_owned(),
+                    description: "Write changelog".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ReorderTask {
+                selector: "Prepare changelog".to_owned(),
+                queue_position: 8,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you move the changelog work later in the queue?".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.queue_position, 8);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("queue position 8")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_dependencies() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_task(
+            CreateTask {
+                title: "Build package".to_owned(),
+                description: "Build the package".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            },
+            "test",
+        )
+        .await?;
+        let deploy = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy package".to_owned(),
+                    description: "Deploy after build".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::AddTaskDependency {
+                selector: "Deploy package".to_owned(),
+                depends_on_selector: "Build package".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Deployment should wait until the build is done.".to_owned(),
+            })
+            .await?;
+        let dependencies = db.list_task_dependencies(deploy.id).await?;
+
+        assert_eq!(dependencies.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Added dependency")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_notes() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::AddTaskNote {
+                selector: "Deploy release".to_owned(),
+                content: "Wait for staging approval".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please keep this coordination caveat with the deployment item."
+                    .to_owned(),
+            })
+            .await?;
+        let notes = db.list_task_notes(task.id).await?;
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "Wait for staging approval");
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Added note"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_resource_locks() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Fix repository issue".to_owned(),
+                    description: "Work on the repository issue".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::AddResourceLock {
+                selector: "Fix repository issue".to_owned(),
+                resource_key: "repo:oh-my-harness/Persistent-Agent".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please reserve the shared repository context for that work.".to_owned(),
+            })
+            .await?;
+        let locks = db.list_task_resource_locks(task.id).await?;
+
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].resource_key, "repo:oh-my-harness/Persistent-Agent");
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Added resource lock")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_clarification_requests() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::RequestClarification {
+                selector: "Deploy release".to_owned(),
+                question: "Which environment should receive the deployment?".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please ask the missing deployment question before proceeding.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let messages = db.list_task_conversation_messages(task.id, 20).await?;
+
+        assert_eq!(updated.status, TaskStatus::WaitingForUser);
+        assert_eq!(
+            updated.blocked_reason.as_deref(),
+            Some("Which environment should receive the deployment?")
+        );
+        assert!(messages.iter().any(|message| message.role == "assistant"
+            && message.content == "Which environment should receive the deployment?"));
+        assert_eq!(response.changed_tasks.len(), 1);
 
         Ok(())
     }
