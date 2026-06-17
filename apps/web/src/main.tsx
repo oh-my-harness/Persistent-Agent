@@ -35,7 +35,18 @@ import {
   updateSkill,
   updateTask,
 } from "./api";
-import type { AppEvent, ConversationMessage, Memory, SchedulerState, SchedulerTick, Task, TaskAction, TaskType } from "./types";
+import type {
+  AppEvent,
+  ConversationMessage,
+  Memory,
+  SchedulerState,
+  SchedulerTick,
+  Task,
+  TaskAction,
+  TaskAttempt,
+  TaskAttemptEvent,
+  TaskType,
+} from "./types";
 import type { Skill } from "./types";
 import "./styles.css";
 
@@ -1210,6 +1221,15 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
   const resourceLocks = history.data?.resource_locks ?? [];
   const notes = history.data?.notes ?? [];
   const actions = history.data?.actions ?? [];
+  const latestAttempt = latestAttemptByTime(attempts);
+  const contextEvent = latestContextEvent(attemptEvents);
+  const runSnapshot = buildWorkerRunSnapshot({
+    latestAttempt,
+    contextEvent,
+    eventCount: attemptEvents.length,
+    artifactCount: artifacts.length,
+    memoryCandidateCount: memoryCandidates.length,
+  });
   const addLock = useMutation({
     mutationFn: (value: string) => addTaskResourceLock(taskId, value),
     onSuccess: async () => {
@@ -1249,6 +1269,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
 
   return (
     <div className="task-history">
+      <WorkerRunSummary snapshot={runSnapshot} isLoading={history.isLoading} />
       <div className="history-column">
         <h4>Attempts</h4>
         {attempts.map((attempt) => (
@@ -1271,7 +1292,7 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
               <time>{new Date(event.created_at).toLocaleString()}</time>
             </div>
             <p>{event.message}</p>
-            <code>{JSON.stringify(event.details)}</code>
+            <EventDetails details={event.details} />
           </div>
         ))}
         {!history.isLoading && attemptEvents.length === 0 && <p className="empty">No worker events yet.</p>}
@@ -1422,13 +1443,199 @@ function TaskHistoryPanel({ taskId }: { taskId: string }) {
               <time>{new Date(action.created_at).toLocaleString()}</time>
             </div>
             <p>{action.actor}</p>
-            <code>{JSON.stringify(action.details)}</code>
+            <EventDetails details={action.details} />
           </div>
         ))}
         {!history.isLoading && actions.length === 0 && <p className="empty">No actions yet.</p>}
       </div>
     </div>
   );
+}
+
+interface WorkerRunSnapshot {
+  status?: string;
+  startedAt?: string;
+  finishedAt?: string | null;
+  summary?: string | null;
+  eventCount: number;
+  artifactCount: number;
+  memoryCandidateCount: number;
+  allowedTools: string[];
+  requestedSkills: string[];
+  matchedSkills: string[];
+  skillResourceCount?: number;
+  skillResourceErrorCount?: number;
+  noteCount?: number;
+  conversationMessageCount?: number;
+}
+
+function WorkerRunSummary({ snapshot, isLoading }: { snapshot: WorkerRunSnapshot; isLoading: boolean }) {
+  if (isLoading) {
+    return <p className="empty history-summary">Loading worker run evidence.</p>;
+  }
+
+  if (!snapshot.status && snapshot.eventCount === 0) {
+    return <p className="empty history-summary">No worker run evidence yet.</p>;
+  }
+
+  return (
+    <section className="history-summary" aria-label="Worker run summary">
+      <div className="history-summary-heading">
+        <div>
+          <h4>Worker Run</h4>
+          <p>{snapshot.summary || "Latest attempt context and execution evidence."}</p>
+        </div>
+        {snapshot.status && <span className={`status ${snapshot.status.replaceAll("_", "-")}`}>{snapshot.status.replaceAll("_", " ")}</span>}
+      </div>
+      <div className="run-metrics">
+        <RunMetric label="Events" value={snapshot.eventCount} />
+        <RunMetric label="Artifacts" value={snapshot.artifactCount} />
+        <RunMetric label="Memory" value={snapshot.memoryCandidateCount} />
+        <RunMetric label="Skill files" value={snapshot.skillResourceCount ?? 0} />
+        <RunMetric label="Resource errors" value={snapshot.skillResourceErrorCount ?? 0} tone={snapshot.skillResourceErrorCount ? "warning" : undefined} />
+      </div>
+      <div className="run-facts">
+        {snapshot.startedAt && (
+          <span>
+            started <time>{new Date(snapshot.startedAt).toLocaleString()}</time>
+          </span>
+        )}
+        {snapshot.finishedAt && (
+          <span>
+            finished <time>{new Date(snapshot.finishedAt).toLocaleString()}</time>
+          </span>
+        )}
+        {typeof snapshot.noteCount === "number" && <span>notes {snapshot.noteCount}</span>}
+        {typeof snapshot.conversationMessageCount === "number" && <span>messages {snapshot.conversationMessageCount}</span>}
+      </div>
+      <TagGroup label="Tools" values={snapshot.allowedTools} emptyLabel="default tool set" />
+      <TagGroup label="Requested" values={snapshot.requestedSkills} emptyLabel="none" />
+      <TagGroup label="Matched" values={snapshot.matchedSkills} emptyLabel="none" />
+    </section>
+  );
+}
+
+function RunMetric({ label, value, tone }: { label: string; value: number; tone?: "warning" }) {
+  return (
+    <div className={`run-metric ${tone ?? ""}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function TagGroup({ label, values, emptyLabel }: { label: string; values: string[]; emptyLabel: string }) {
+  return (
+    <div className="tag-group">
+      <span>{label}</span>
+      <div>
+        {values.length > 0 ? values.map((value) => <code key={value}>{value}</code>) : <em>{emptyLabel}</em>}
+      </div>
+    </div>
+  );
+}
+
+function EventDetails({ details }: { details: unknown }) {
+  const record = asRecord(details);
+  if (!record) {
+    return <code>{String(details ?? "")}</code>;
+  }
+
+  const entries = Object.entries(record);
+  if (entries.length === 0) {
+    return null;
+  }
+
+  return (
+    <dl className="event-details">
+      {entries.map(([key, value]) => (
+        <React.Fragment key={key}>
+          <dt>{key.replaceAll("_", " ")}</dt>
+          <dd>{formatDetailValue(value)}</dd>
+        </React.Fragment>
+      ))}
+    </dl>
+  );
+}
+
+function buildWorkerRunSnapshot(input: {
+  latestAttempt?: TaskAttempt;
+  contextEvent?: TaskAttemptEvent;
+  eventCount: number;
+  artifactCount: number;
+  memoryCandidateCount: number;
+}): WorkerRunSnapshot {
+  const details = asRecord(input.contextEvent?.details);
+  return {
+    status: input.latestAttempt?.status,
+    startedAt: input.latestAttempt?.started_at,
+    finishedAt: input.latestAttempt?.finished_at,
+    summary: input.latestAttempt?.summary,
+    eventCount: input.eventCount,
+    artifactCount: input.artifactCount,
+    memoryCandidateCount: input.memoryCandidateCount,
+    allowedTools: stringArrayDetail(details?.allowed_tools),
+    requestedSkills: stringArrayDetail(details?.requested_skills),
+    matchedSkills: stringArrayDetail(details?.matched_skills),
+    skillResourceCount: numberDetail(details?.skill_resource_count),
+    skillResourceErrorCount: numberDetail(details?.skill_resource_error_count),
+    noteCount: numberDetail(details?.note_count),
+    conversationMessageCount: numberDetail(details?.conversation_message_count),
+  };
+}
+
+function latestContextEvent(events: TaskAttemptEvent[]): TaskAttemptEvent | undefined {
+  return [...events]
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+    .find((event) => event.event_type === "worker_context_prepared");
+}
+
+function latestAttemptByTime(attempts: TaskAttempt[]): TaskAttempt | undefined {
+  return [...attempts].sort((left, right) => {
+    const leftTime = Date.parse(left.finished_at ?? left.started_at);
+    const rightTime = Date.parse(right.finished_at ?? right.started_at);
+    return rightTime - leftTime;
+  })[0];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function stringArrayDetail(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function numberDetail(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatDetailValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    if (value.every((item) => typeof item === "string")) {
+      return value.length > 0 ? value.join(", ") : "none";
+    }
+    return JSON.stringify(value);
+  }
+  if (value && typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (value === null || typeof value === "undefined") {
+    return "none";
+  }
+
+  return String(value);
 }
 
 function TaskConversation({ task }: { task: Task }) {
