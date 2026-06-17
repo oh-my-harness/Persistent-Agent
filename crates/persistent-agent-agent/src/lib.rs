@@ -12,7 +12,7 @@ use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus,
     Skill, Task, TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus,
-    TaskType, UpdateTask,
+    TaskType, UpdateSkill, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -263,6 +263,20 @@ impl MainAgent {
             )
             .await?;
         Ok(skills)
+    }
+
+    pub async fn update_skill_definition(
+        &self,
+        selector: &str,
+        input: UpdateSkill,
+    ) -> anyhow::Result<Result<Skill, String>> {
+        match self.find_skill(selector).await? {
+            Ok(skill) => Ok(Ok(self
+                .db
+                .update_skill(skill.id, input, "main_agent")
+                .await?)),
+            Err(reply) => Ok(Err(reply)),
+        }
     }
 
     pub async fn delete_skill_definition(
@@ -977,6 +991,18 @@ impl MainAgent {
                 let skills = self.list_skill_definitions().await?;
                 format_skill_definitions(&skills)
             }
+            MainAgentIntent::UpdateSkillDefinition { selector, input } => {
+                match self.update_skill_definition(&selector, input).await? {
+                    Ok(skill) => format!(
+                        "Updated skill '{}'. Triggers: {}. Tools: {}. Resource: {}.",
+                        skill.name,
+                        format_skill_list(&skill.trigger_rules),
+                        format_skill_list(&skill.tool_subset),
+                        skill.resource_path.as_deref().unwrap_or("none")
+                    ),
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::DeleteSkillDefinition { selector } => {
                 match self.delete_skill_definition(&selector).await? {
                     Ok(skill) => format!("Deleted skill '{}'.", skill.name),
@@ -1372,6 +1398,10 @@ enum MainAgentIntent {
         input: CreateSkill,
     },
     ListSkillDefinitions,
+    UpdateSkillDefinition {
+        selector: String,
+        input: UpdateSkill,
+    },
     DeleteSkillDefinition {
         selector: String,
     },
@@ -1777,6 +1807,10 @@ fn parse_skill_definition_intent(content: &str, normalized: &str) -> Option<Main
         return Some(MainAgentIntent::DeleteSkillDefinition { selector });
     }
 
+    if let Some((selector, input)) = extract_update_skill_definition(content, normalized) {
+        return Some(MainAgentIntent::UpdateSkillDefinition { selector, input });
+    }
+
     extract_create_skill_definition(content, normalized)
         .map(|input| MainAgentIntent::CreateSkillDefinition { input })
 }
@@ -1889,6 +1923,95 @@ fn extract_create_skill_definition(content: &str, normalized: &str) -> Option<Cr
         tool_subset,
         resource_path,
     })
+}
+
+fn extract_update_skill_definition(
+    content: &str,
+    normalized: &str,
+) -> Option<(String, UpdateSkill)> {
+    let prefix = if normalized.starts_with("update skill definition") {
+        "update skill definition"
+    } else if normalized.starts_with("update skill") {
+        "update skill"
+    } else if normalized.starts_with("edit skill definition") {
+        "edit skill definition"
+    } else if normalized.starts_with("edit skill") {
+        "edit skill"
+    } else if normalized.starts_with("set skill") {
+        "set skill"
+    } else {
+        return None;
+    };
+
+    let body = content[prefix.len()..].trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut sections = body
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|section| !section.is_empty());
+    let selector = clean_skill_field(sections.next()?);
+    if selector.is_empty() {
+        return None;
+    }
+
+    let mut input = UpdateSkill::default();
+    for section in sections {
+        let normalized_section = section.to_lowercase();
+        if let Some(value) =
+            strip_skill_clause_value(section, &normalized_section, &["name", "rename"])
+        {
+            let value = clean_skill_field(&value);
+            if !value.is_empty() {
+                input.name = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) =
+            strip_skill_clause_value(section, &normalized_section, &["description", "desc"])
+        {
+            input.description = Some(value);
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["trigger rules", "triggers", "trigger", "rules"],
+        ) {
+            input.trigger_rules = Some(parse_skill_names(&value));
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["tool subset", "tools", "tool"],
+        ) {
+            input.tool_subset = Some(parse_skill_names(&value));
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["resource path", "resource_path", "resource"],
+        ) {
+            let value = value.trim().to_owned();
+            if !value.is_empty() {
+                input.resource_path = Some(value);
+            }
+        }
+    }
+
+    has_skill_update(&input).then_some((selector, input))
+}
+
+fn has_skill_update(input: &UpdateSkill) -> bool {
+    input.name.is_some()
+        || input.description.is_some()
+        || input.trigger_rules.is_some()
+        || input.tool_subset.is_some()
+        || input.resource_path.is_some()
 }
 
 fn split_skill_name_description(head: &str) -> (String, String) {
@@ -3735,6 +3858,21 @@ mod tests {
             MainAgentIntent::ListSkillDefinitions
         );
         assert_eq!(
+            parse_intent(
+                "update skill rust; triggers cargo,clippy; tools shell; resource skills/rust-v2"
+            ),
+            MainAgentIntent::UpdateSkillDefinition {
+                selector: "rust".to_owned(),
+                input: UpdateSkill {
+                    name: None,
+                    description: None,
+                    trigger_rules: Some(vec!["cargo".to_owned(), "clippy".to_owned()]),
+                    tool_subset: Some(vec!["shell".to_owned()]),
+                    resource_path: Some("skills/rust-v2".to_owned()),
+                },
+            }
+        );
+        assert_eq!(
             parse_intent("delete skill rust"),
             MainAgentIntent::DeleteSkillDefinition {
                 selector: "rust".to_owned()
@@ -3905,6 +4043,26 @@ mod tests {
                 .content
                 .contains("resource: skills/rust")
         );
+
+        let updated = agent
+            .handle_user_message(MainAgentMessageInput {
+                content:
+                    "update skill rust; triggers cargo,clippy; tools shell; resource skills/rust-v2"
+                        .to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert!(
+            updated
+                .assistant_message
+                .content
+                .contains("Updated skill 'rust'")
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].trigger_rules, vec!["cargo", "clippy"]);
+        assert_eq!(skills[0].tool_subset, vec!["shell"]);
+        assert_eq!(skills[0].resource_path.as_deref(), Some("skills/rust-v2"));
 
         let deleted = agent
             .handle_user_message(MainAgentMessageInput {

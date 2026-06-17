@@ -30,7 +30,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, create/list/delete skill definitions, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
+- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, create/list/update/delete skill definitions, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
 - Optional main-agent LLM advisor through the approved `oh-my-harness` `AgentHarness`; deterministic task-state changes still run through product code, and the advisor composes the user-facing reply from the completed action context.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Web task pool controls for status filtering, priority changes, and queue-position changes.
@@ -277,6 +277,7 @@ The main-agent conversation can manage skill definitions directly. Example:
 ```text
 create skill rust: Rust workspace maintenance; triggers cargo,rust; tools shell,filesystem; resource skills/rust
 list skills
+update skill rust; triggers cargo,clippy; tools shell; resource skills/rust-v2
 delete skill rust
 ```
 

@@ -337,7 +337,7 @@ pub struct CreateSkill {
     pub resource_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UpdateSkill {
     pub name: Option<String>,
     pub description: Option<String>,
