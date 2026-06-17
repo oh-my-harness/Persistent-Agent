@@ -77,9 +77,11 @@ Run the real LLM scheduler smoke test only when you intentionally want to call D
 ```powershell
 $env:DEEPSEEK_API_KEY = "..."
 cargo test -p persistent-agent-scheduler llm_harness_scheduler_smoke_completes_task -- --ignored --nocapture
+cargo test -p persistent-agent-agent llm_harness_main_agent_smoke_plans_and_advises -- --ignored --nocapture
 ```
 
 That smoke creates an in-memory task, runs the scheduler with `OhMyHarnessWorker`, verifies the worker calls `complete_task` through `AgentHarness`, and checks the persisted task attempt/events.
+The main-agent smoke sends an unsupported free-form user request through `OhMyHarnessMainAgentAdvisor`, verifies the LLM planner calls a bounded planning tool through `AgentHarness`, checks that product code creates the task, and verifies the LLM advisor writes the final reply from the completed action context.
 
 Active skill `resource_path` values must be relative to the workspace. If the path points to a directory, the scheduler loads `SKILL.md` from that directory; if it points to a file, the scheduler loads that file. Loaded content is injected into the worker prompt with a bounded size, while missing or invalid resources are recorded in worker context events without stopping task execution.
 

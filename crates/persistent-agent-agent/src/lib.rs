@@ -6360,6 +6360,52 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DEEPSEEK_API_KEY and calls the real LLM through oh-my-harness AgentHarness"]
+    async fn llm_harness_main_agent_smoke_plans_and_advises() -> anyhow::Result<()> {
+        let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") else {
+            eprintln!("Skipping smoke: DEEPSEEK_API_KEY is not set.");
+            return Ok(());
+        };
+        if api_key.trim().is_empty() {
+            eprintln!("Skipping smoke: DEEPSEEK_API_KEY is empty.");
+            return Ok(());
+        }
+
+        let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_owned());
+        let mut config = MainAgentLlmConfig::deepseek(api_key, model);
+        config.timeout_ms = 60_000;
+        let harness_main_agent = Arc::new(OhMyHarnessMainAgentAdvisor::new(config));
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone())
+            .with_planner(harness_main_agent.clone())
+            .with_advisor(harness_main_agent);
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "The backlog should hold a work item titled exactly 'Main agent LLM smoke' with description 'from the main-agent harness smoke test'.".to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].title.contains("Main agent LLM smoke"));
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "llm_planner_intent")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "llm_advisor_reply")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_agent_uses_llm_planner_for_task_state_changes() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         let task = db
