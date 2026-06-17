@@ -23,7 +23,7 @@ The repository now contains the first executable skeleton:
 - Task resource locks with API management, audit records, and scheduler gating against conflicting running tasks.
 - Task notes with main-agent commands, API management, task history display, and worker-context injection.
 - Serial scheduler loop with an explicit scheduler policy, shared execution lock, manual tick endpoint, main-agent requested scans, and stub worker that exercises task claiming, attempts, completion, blockers, and event emission.
-- DeepSeek LLM worker with structured completed/blocked result parsing.
+- DeepSeek harness worker using the `llm_runtime` tool loop for task completion, blockers, memory candidates, artifacts, and follow-up tasks, with a legacy single-response LLM worker fallback.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Main-agent global action audit API and Web panel for non-task-specific tool calls.
@@ -51,6 +51,8 @@ cargo run -p persistent-agent-server
 ```
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
+
+When `DEEPSEEK_API_KEY` is set, the server uses the harness tool-loop worker by default. Set `PERSISTENT_AGENT_WORKER_MODE=llm_json` only when you need to temporarily fall back to the older single-response JSON worker.
 
 The server scans the task pool every 30 seconds by default. Set `SCHEDULER_INTERVAL_SECONDS=0` to disable the background scheduler loop, or set another positive value to adjust the polling interval.
 
