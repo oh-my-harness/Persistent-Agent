@@ -6,6 +6,7 @@ import type {
   SchedulerTick,
   Skill,
   Task,
+  TaskAction,
   TaskDependency,
   TaskHistory,
   TaskMessageResponse,
@@ -156,6 +157,10 @@ export function getSchedulerState(): Promise<SchedulerState> {
 
 export function listMainAgentMessages(): Promise<ConversationMessage[]> {
   return request<ConversationMessage[]>("/api/main-agent/messages");
+}
+
+export function listMainAgentActions(): Promise<TaskAction[]> {
+  return request<TaskAction[]>("/api/main-agent/actions");
 }
 
 export function sendMainAgentMessage(content: string): Promise<MainAgentMessageResponse> {

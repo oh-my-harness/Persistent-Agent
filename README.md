@@ -26,6 +26,7 @@ The repository now contains the first executable skeleton:
 - DeepSeek LLM worker with structured completed/blocked result parsing.
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
+- Main-agent global action audit API and Web panel for non-task-specific tool calls.
 - Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
 - Scheduler finalization preserves user status changes made while a task is running, such as cancellation or pause.
@@ -280,7 +281,8 @@ Core views:
 
 - task pool: create tasks, reorder queue, filter status, inspect priority;
 - task detail: description, metadata, dependencies, run history, artifacts, memory candidates;
-- main conversation: talk to the main agent to create, update, reorder, explain, or discuss tasks;
+- main conversation: talk to the main agent to create, update, reorder, explain, inspect workspace state, or discuss tasks;
+- main-agent audit: inspect recent global tool calls and non-task-specific actions;
 - task conversation: user-agent discussion for blocked or active tasks;
 - execution monitor: current running task, next queued task, logs, state transitions;
 - skills: manage user-defined skills and see activation rules;

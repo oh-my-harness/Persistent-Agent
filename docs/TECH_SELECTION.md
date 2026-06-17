@@ -310,6 +310,7 @@ MVP screens:
 - task pool: queue, status filters, create task, reorder, pause/resume;
 - task detail: metadata, attempt history, logs, artifacts, linked conversation;
 - main conversation: user talks with the main agent to create, update, prioritize, pause, resume, or discuss tasks;
+- main-agent audit: recent global action records for non-task-specific tool calls;
 - task conversation: user replies for blocked tasks and active task discussion;
 - execution monitor: current run, next queued task, events, tool calls, output stream;
 - skills: list, create/edit, activation rules, tool subsets;

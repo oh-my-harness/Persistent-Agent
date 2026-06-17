@@ -124,6 +124,7 @@ pub fn router(state: AppState) -> Router {
             "/api/main-agent/messages",
             get(main_agent_messages).post(send_main_agent_message),
         )
+        .route("/api/main-agent/actions", get(main_agent_actions))
         .route("/api/memories", get(list_memories))
         .route(
             "/api/memories/{id}",
@@ -472,6 +473,12 @@ async fn main_agent_messages(
     Ok(Json(
         state.main_agent.main_conversation_messages(100).await?,
     ))
+}
+
+async fn main_agent_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TaskAction>>, ApiError> {
+    Ok(Json(state.db.list_global_actions().await?))
 }
 
 async fn send_main_agent_message(

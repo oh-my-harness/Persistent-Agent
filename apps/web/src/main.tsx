@@ -14,6 +14,7 @@ import {
   getTaskHistory,
   getTaskPoolSummary,
   getSchedulerState,
+  listMainAgentActions,
   listMainAgentMessages,
   listMemories,
   listSkills,
@@ -33,7 +34,7 @@ import {
   updateSkill,
   updateTask,
 } from "./api";
-import type { AppEvent, ConversationMessage, Memory, SchedulerState, SchedulerTick, Task, TaskType } from "./types";
+import type { AppEvent, ConversationMessage, Memory, SchedulerState, SchedulerTick, Task, TaskAction, TaskType } from "./types";
 import type { Skill } from "./types";
 import "./styles.css";
 
@@ -80,6 +81,7 @@ function Shell() {
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
       void queryClient.invalidateQueries({ queryKey: ["summary"] });
       void queryClient.invalidateQueries({ queryKey: ["scheduler-state"] });
+      void queryClient.invalidateQueries({ queryKey: ["main-agent-actions"] });
       void queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
       void queryClient.invalidateQueries({ queryKey: ["memories"] });
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
@@ -144,6 +146,7 @@ function Shell() {
         <section className="content-grid">
           <TaskComposer />
           <MainAgentChat />
+          <MainAgentAudit />
           <SkillManager />
           <MemoryReview />
           <section className="panel task-list-panel">
@@ -515,6 +518,7 @@ function MainAgentChat() {
     onSuccess: async () => {
       setContent("");
       await queryClient.invalidateQueries({ queryKey: ["main-agent-messages"] });
+      await queryClient.invalidateQueries({ queryKey: ["main-agent-actions"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["summary"] });
     },
@@ -554,6 +558,45 @@ function MainAgentChat() {
         </button>
       </form>
     </section>
+  );
+}
+
+function MainAgentAudit() {
+  const actions = useQuery({
+    queryKey: ["main-agent-actions"],
+    queryFn: listMainAgentActions,
+    refetchInterval: 10_000,
+  });
+  const visibleActions = (actions.data ?? []).slice(0, 8);
+
+  return (
+    <section className="panel main-agent-audit-panel">
+      <div className="panel-heading">
+        <h2>Main Agent Audit</h2>
+        <span>{actions.isLoading ? "Loading" : `${visibleActions.length} recent`}</span>
+      </div>
+      <div className="audit-list">
+        {visibleActions.map((action) => (
+          <AuditActionItem action={action} key={action.id} />
+        ))}
+        {!actions.isLoading && visibleActions.length === 0 && (
+          <p className="empty">No global main-agent actions yet.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function AuditActionItem({ action }: { action: TaskAction }) {
+  return (
+    <article className="history-item">
+      <div>
+        <strong>{action.action_type}</strong>
+        <time>{new Date(action.created_at).toLocaleString()}</time>
+      </div>
+      <p>{action.actor}</p>
+      <code>{JSON.stringify(action.details)}</code>
+    </article>
   );
 }
 

@@ -712,6 +712,13 @@ textarea {
   overflow: auto;
 }
 
+.audit-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+}
+
 .task-history {
   display: grid;
   gap: 14px;
