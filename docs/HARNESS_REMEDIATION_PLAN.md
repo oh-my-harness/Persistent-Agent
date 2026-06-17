@@ -89,8 +89,9 @@ The first harness-backed product tools are:
 - `git_status` / `git_diff` (wired as read-only git inspection helpers through runtime `ExecutionEnv`)
 - `http_fetch` (wired for HTTP(S) lookups)
 - `github_list_issues` (wired for read-only GitHub issue discovery; uses optional `GITHUB_TOKEN`)
+- `github_get_issue` (wired for read-only GitHub issue detail retrieval; uses optional `GITHUB_TOKEN`)
 
-Specialized tools such as browser automation, first-class GitHub issue/PR operations, and richer git
+Specialized tools such as browser automation, first-class GitHub issue/PR write operations, and richer git
 workflows should be added later through the approved runtime tool policy and audit path.
 
 ## Verification Gates
