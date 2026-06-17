@@ -974,6 +974,34 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::UpdateTaskDetails {
+                selector,
+                title,
+                description,
+            } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let previous_title = task.title.clone();
+                    let task = self
+                        .update_task(
+                            task.id,
+                            UpdateTask {
+                                title,
+                                description,
+                                priority: None,
+                                requested_skills: None,
+                                schedule: None,
+                            },
+                        )
+                        .await?;
+                    let reply = format!(
+                        "Updated task '{}'. Title: '{}'. Description: {}",
+                        previous_title, task.title, task.description
+                    );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::ReprioritizeTask { selector, priority } => {
                 match self.find_task(&selector).await? {
                     Ok(task) => {
@@ -1300,7 +1328,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1641,6 +1669,11 @@ pub enum MainAgentPlan {
     CancelTask {
         selector: String,
     },
+    UpdateTaskDetails {
+        selector: String,
+        title: Option<String>,
+        description: Option<String>,
+    },
     ReprioritizeTask {
         selector: String,
         priority: i64,
@@ -1763,6 +1796,15 @@ impl MainAgentPlan {
             Self::PauseTask { selector } => MainAgentIntent::PauseTask { selector },
             Self::ResumeTask { selector } => MainAgentIntent::ResumeTask { selector },
             Self::CancelTask { selector } => MainAgentIntent::CancelTask { selector },
+            Self::UpdateTaskDetails {
+                selector,
+                title,
+                description,
+            } => MainAgentIntent::UpdateTaskDetails {
+                selector,
+                title,
+                description,
+            },
             Self::ReprioritizeTask { selector, priority } => {
                 MainAgentIntent::ReprioritizeTask { selector, priority }
             }
@@ -1966,6 +2008,11 @@ enum MainAgentIntent {
     CancelTask {
         selector: String,
     },
+    UpdateTaskDetails {
+        selector: String,
+        title: Option<String>,
+        description: Option<String>,
+    },
     ReprioritizeTask {
         selector: String,
         priority: i64,
@@ -2093,6 +2140,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_scheduler_scan_request(&normalized) {
         return MainAgentIntent::RunSchedulerTick;
+    }
+
+    if let Some(intent) = parse_task_detail_update_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if let Some(intent) = parse_skill_definition_intent(trimmed, &normalized) {
@@ -2493,6 +2544,7 @@ async fn dispatch_main_agent_planner(
         "plan_pause_task",
         "plan_resume_task",
         "plan_cancel_task",
+        "plan_update_task_details",
         "plan_reprioritize_task",
         "plan_reorder_task",
         "plan_convert_task_type",
@@ -2560,6 +2612,7 @@ fn main_agent_planner_tool_registry(
         "Plan to cancel a task selected by id or title fragment.",
         PlannedTaskSelectorAction::Cancel,
     )));
+    registry.register(Arc::new(PlanUpdateTaskDetailsTool::new(state.clone())));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanReorderTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanConvertTaskTypeTool::new(state.clone())));
@@ -2919,6 +2972,90 @@ impl Tool for PlanTaskSelectorTool {
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned task state change"))
+        })
+    }
+}
+
+struct PlanUpdateTaskDetailsTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanUpdateTaskDetailsTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "New task title, if the user asked to rename it."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New task description, if the user asked to change task details."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanUpdateTaskDetailsTool {
+    fn name(&self) -> &str {
+        "plan_update_task_details"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to update an existing task's title and/or description."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let title = args
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let description = args
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            if title.is_none() && description.is_none() {
+                return Err(ToolError::InvalidArguments(
+                    "plan_update_task_details requires title or description".to_owned(),
+                ));
+            }
+            self.state.lock().await.plan = Some(MainAgentPlan::UpdateTaskDetails {
+                selector,
+                title,
+                description,
+            });
+            Ok(planner_tool_result("planned task detail update"))
         })
     }
 }
@@ -4282,7 +4419,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -5823,6 +5960,124 @@ fn parse_reply_to_task_intent(content: &str, normalized: &str) -> Option<MainAge
         .map(|(selector, content)| MainAgentIntent::ReplyToTask { selector, content })
 }
 
+fn parse_task_detail_update_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if is_create_request(normalized) {
+        return None;
+    }
+
+    if let Some((selector, title)) =
+        split_selector_and_value_after_phrase(content, normalized, "rename task", " to ")
+    {
+        return Some(MainAgentIntent::UpdateTaskDetails {
+            selector,
+            title: Some(title),
+            description: None,
+        });
+    }
+
+    if let Some((selector, title)) = split_selector_and_value_after_marker(
+        content,
+        normalized,
+        &[
+            "set task title",
+            "update task title",
+            "change task title",
+            "rename task",
+        ],
+        &[" to ", ":", "\u{ff1a}"],
+    ) {
+        return Some(MainAgentIntent::UpdateTaskDetails {
+            selector,
+            title: Some(title),
+            description: None,
+        });
+    }
+
+    if let Some((selector, description)) = split_selector_and_value_after_marker(
+        content,
+        normalized,
+        &[
+            "set task description",
+            "update task description",
+            "change task description",
+            "\u{66f4}\u{65b0}\u{4efb}\u{52a1}\u{63cf}\u{8ff0}",
+            "\u{4fee}\u{6539}\u{4efb}\u{52a1}\u{63cf}\u{8ff0}",
+        ],
+        &[" to ", ":", "\u{ff1a}"],
+    ) {
+        return Some(MainAgentIntent::UpdateTaskDetails {
+            selector,
+            title: None,
+            description: Some(description),
+        });
+    }
+
+    if !contains_any(
+        normalized,
+        &[
+            "update task",
+            "change task",
+            "edit task",
+            "\u{66f4}\u{65b0}\u{4efb}\u{52a1}",
+            "\u{4fee}\u{6539}\u{4efb}\u{52a1}",
+        ],
+    ) || contains_any(
+        normalized,
+        &[
+            "priority",
+            "queue",
+            "note",
+            "skill",
+            "resource lock",
+            "dependency",
+            ZH_PRIORITY,
+            ZH_SKILL,
+        ],
+    ) {
+        return None;
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "update",
+            "change",
+            "edit",
+            "task",
+            "title",
+            "description",
+            "desc",
+            "\u{66f4}\u{65b0}",
+            "\u{4fee}\u{6539}",
+            ZH_TASK,
+            "\u{6807}\u{9898}",
+            "\u{63cf}\u{8ff0}",
+            "\u{5185}\u{5bb9}",
+        ],
+    );
+    let title = extract_labeled_value(content, normalized, &["title", "\u{6807}\u{9898}"]);
+    let description = extract_labeled_value(
+        content,
+        normalized,
+        &[
+            "description",
+            "desc",
+            "\u{63cf}\u{8ff0}",
+            "\u{5185}\u{5bb9}",
+        ],
+    );
+
+    if selector.is_empty() || selector == content || (title.is_none() && description.is_none()) {
+        return None;
+    }
+
+    Some(MainAgentIntent::UpdateTaskDetails {
+        selector,
+        title,
+        description,
+    })
+}
+
 fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if !contains_any(
         normalized,
@@ -5973,6 +6228,101 @@ fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+fn split_selector_and_value_after_phrase(
+    content: &str,
+    normalized: &str,
+    phrase: &str,
+    separator: &str,
+) -> Option<(String, String)> {
+    let phrase_index = normalized.find(phrase)?;
+    let after_phrase_start = phrase_index + phrase.len();
+    let after_phrase = &content[after_phrase_start..];
+    let after_phrase_normalized = &normalized[after_phrase_start..];
+    let separator_index = after_phrase_normalized.find(separator)?;
+    let selector = after_phrase[..separator_index]
+        .trim()
+        .trim_matches([':', '\u{ff1a}', '"', '\''])
+        .trim();
+    let value = after_phrase[separator_index + separator.len()..]
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim();
+
+    (!selector.is_empty() && !value.is_empty()).then(|| (selector.to_owned(), value.to_owned()))
+}
+
+fn split_selector_and_value_after_marker(
+    content: &str,
+    normalized: &str,
+    prefixes: &[&str],
+    separators: &[&str],
+) -> Option<(String, String)> {
+    for prefix in prefixes {
+        if let Some(prefix_index) = normalized.find(prefix) {
+            let after_prefix_start = prefix_index + prefix.len();
+            let after_prefix = &content[after_prefix_start..];
+            let after_prefix_normalized = &normalized[after_prefix_start..];
+            for separator in separators {
+                if let Some(separator_index) = after_prefix_normalized.find(separator) {
+                    let selector = after_prefix[..separator_index]
+                        .trim()
+                        .trim_matches([':', '\u{ff1a}', '"', '\''])
+                        .trim();
+                    let value = after_prefix[separator_index + separator.len()..]
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .trim();
+                    if !selector.is_empty() && !value.is_empty() {
+                        return Some((selector.to_owned(), value.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_labeled_value(content: &str, normalized: &str, labels: &[&str]) -> Option<String> {
+    let mut earliest: Option<(usize, usize)> = None;
+    for label in labels {
+        for suffix in [":", "\u{ff1a}"] {
+            let marker = format!("{label}{suffix}");
+            if let Some(index) = normalized.find(&marker) {
+                let value_start = index + marker.len();
+                if earliest
+                    .map(|(existing_index, _)| index < existing_index)
+                    .unwrap_or(true)
+                {
+                    earliest = Some((index, value_start));
+                }
+            }
+        }
+    }
+
+    let (_, value_start) = earliest?;
+    let mut value_end = content.len();
+    let value_tail_normalized = &normalized[value_start..];
+    for label in [
+        " title:",
+        " description:",
+        " desc:",
+        " \u{6807}\u{9898}\u{ff1a}",
+        " \u{63cf}\u{8ff0}\u{ff1a}",
+        " \u{5185}\u{5bb9}\u{ff1a}",
+    ] {
+        if let Some(index) = value_tail_normalized.find(label) {
+            value_end = value_end.min(value_start + index);
+        }
+    }
+
+    let value = content[value_start..value_end]
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn semantic_task_selector(value: &str) -> Option<String> {
@@ -6493,6 +6843,14 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "unpause task",
         "cancel task",
         "cancel",
+        "update task title",
+        "update task description",
+        "update task",
+        "change task title",
+        "change task description",
+        "change task",
+        "edit task",
+        "rename task",
         "task",
         ZH_CONVERT_TASK,
         ZH_TASK,
@@ -6959,6 +7317,44 @@ mod tests {
             MainAgentIntent::ReorderTask {
                 selector: "\u{68c0}\u{67e5} GitHub issues".to_owned(),
                 queue_position: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_detail_update_intents() {
+        assert_eq!(
+            parse_intent("rename task Deploy release to Ship release"),
+            MainAgentIntent::UpdateTaskDetails {
+                selector: "Deploy release".to_owned(),
+                title: Some("Ship release".to_owned()),
+                description: None,
+            }
+        );
+        assert_eq!(
+            parse_intent("update task Deploy release title: Ship release"),
+            MainAgentIntent::UpdateTaskDetails {
+                selector: "Deploy release".to_owned(),
+                title: Some("Ship release".to_owned()),
+                description: None,
+            }
+        );
+        assert_eq!(
+            parse_intent("update task Deploy release description: Deploy to production"),
+            MainAgentIntent::UpdateTaskDetails {
+                selector: "Deploy release".to_owned(),
+                title: None,
+                description: Some("Deploy to production".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{66f4}\u{65b0}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{63cf}\u{8ff0}\u{ff1a}\u{53d1}\u{5e03}\u{5230}\u{751f}\u{4ea7}"
+            ),
+            MainAgentIntent::UpdateTaskDetails {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+                title: None,
+                description: Some("\u{53d1}\u{5e03}\u{5230}\u{751f}\u{4ea7}".to_owned()),
             }
         );
     }
@@ -7599,6 +7995,56 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].task_snapshot.len(), 1);
         assert_eq!(captured[0].task_snapshot[0].title, "Watch GitHub issues");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_detail_updates() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Old deployment instructions".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::UpdateTaskDetails {
+                selector: "Deploy release".to_owned(),
+                title: Some("Ship production release".to_owned()),
+                description: Some("Deploy to production after staging approval.".to_owned()),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please clean up the deployment task name and details.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.title, "Ship production release");
+        assert_eq!(
+            updated.description,
+            "Deploy to production after staging approval."
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Updated task"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "update_task")
+        );
 
         Ok(())
     }
@@ -8528,6 +8974,52 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Paused task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_update_task_details_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Old deployment instructions".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "update task Deploy release description: Deploy to production".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.description, "Deploy to production");
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Updated task"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "update_task")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "rename task Deploy release to Ship release".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(updated.title, "Ship release");
+        assert_eq!(response.changed_tasks.len(), 1);
 
         Ok(())
     }
