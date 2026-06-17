@@ -408,6 +408,7 @@ impl MainAgent {
                 task_type,
                 priority,
                 interval_seconds,
+                requested_skills,
             } => {
                 let schedule = match task_type {
                     TaskType::OneOff => None,
@@ -421,7 +422,7 @@ impl MainAgent {
                         description,
                         task_type,
                         priority,
-                        requested_skills: Vec::new(),
+                        requested_skills,
                         schedule,
                         created_by: "user".to_owned(),
                     })
@@ -800,6 +801,7 @@ enum MainAgentIntent {
         task_type: TaskType,
         priority: i64,
         interval_seconds: Option<i64>,
+        requested_skills: Vec<String>,
     },
     PauseTask {
         selector: String,
@@ -1059,6 +1061,7 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         let interval_seconds = (task_type == TaskType::Recurring)
             .then(|| extract_interval_seconds(&normalized))
             .flatten();
+        let requested_skills = extract_create_requested_skills(trimmed, &normalized);
         let title = extract_title(trimmed);
 
         return MainAgentIntent::CreateTask {
@@ -1067,6 +1070,7 @@ fn parse_intent(content: &str) -> MainAgentIntent {
             task_type,
             priority,
             interval_seconds,
+            requested_skills,
         };
     }
 
@@ -2002,6 +2006,7 @@ fn split_dependency_selectors(
 }
 
 fn extract_title(content: &str) -> String {
+    let content = strip_create_skill_clause(content);
     for separator in ["\u{ff1a}", ":", "\u{ff0c}", ",", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
             let title = tail.trim();
@@ -2027,6 +2032,51 @@ fn extract_title(content: &str) -> String {
     } else {
         clamp_title(&title)
     }
+}
+
+fn extract_create_requested_skills(content: &str, normalized: &str) -> Vec<String> {
+    for marker in [
+        " with requested skills ",
+        " with requested skill ",
+        " with skills ",
+        " with skill ",
+        " using skills ",
+        " using skill ",
+        " use skills ",
+        " use skill ",
+        "\u{4f7f}\u{7528}\u{6280}\u{80fd}",
+        "\u{6307}\u{5b9a}\u{6280}\u{80fd}",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            let after = &content[index + marker.len()..];
+            return parse_skill_names(after);
+        }
+    }
+
+    Vec::new()
+}
+
+fn strip_create_skill_clause(content: &str) -> String {
+    let normalized = content.to_lowercase();
+    let mut end = content.len();
+    for marker in [
+        " with requested skills ",
+        " with requested skill ",
+        " with skills ",
+        " with skill ",
+        " using skills ",
+        " using skill ",
+        " use skills ",
+        " use skill ",
+        "\u{4f7f}\u{7528}\u{6280}\u{80fd}",
+        "\u{6307}\u{5b9a}\u{6280}\u{80fd}",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            end = end.min(index);
+        }
+    }
+
+    content[..end].trim().to_owned()
 }
 
 fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
@@ -2214,6 +2264,20 @@ mod tests {
                 task_type: TaskType::OneOff,
                 priority: 7,
                 interval_seconds: None,
+                requested_skills: Vec::new(),
+            }
+        );
+
+        assert_eq!(
+            parse_intent("create task: Check GitHub issues with skills github, shell"),
+            MainAgentIntent::CreateTask {
+                title: "Check GitHub issues".to_owned(),
+                description: "create task: Check GitHub issues with skills github, shell"
+                    .to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                interval_seconds: None,
+                requested_skills: vec!["github".to_owned(), "shell".to_owned()],
             }
         );
     }
@@ -2257,6 +2321,7 @@ mod tests {
                 task_type: TaskType::Recurring,
                 priority: 3,
                 interval_seconds: Some(60),
+                requested_skills: Vec::new(),
             }
         );
     }
@@ -2558,6 +2623,30 @@ mod tests {
                 selector: "\u{4f18}\u{5148}\u{8fd0}\u{884c} cargo test".to_owned(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_create_task_with_requested_skills_by_conversation() -> anyhow::Result<()>
+    {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "create task: Check GitHub issues with skills github, shell".to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+        let task = tasks
+            .iter()
+            .find(|task| task.title == "Check GitHub issues")
+            .expect("created task");
+
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert_eq!(task.requested_skills, vec!["github", "shell"]);
+        assert!(response.assistant_message.content.contains("Created task"));
+
+        Ok(())
     }
 
     #[tokio::test]
