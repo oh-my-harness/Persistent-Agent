@@ -244,7 +244,10 @@ where
                 memory_candidates,
                 artifacts,
                 follow_up_tasks,
+                tool_events,
             } => {
+                self.record_worker_tool_events(attempt.id, task.id, &tool_events)
+                    .await?;
                 self.db
                     .record_attempt_event(
                         attempt.id,
@@ -322,7 +325,12 @@ where
                     },
                 })
             }
-            WorkerResult::Blocked { reason } => {
+            WorkerResult::Blocked {
+                reason,
+                tool_events,
+            } => {
+                self.record_worker_tool_events(attempt.id, task.id, &tool_events)
+                    .await?;
                 self.db
                     .record_attempt_event(
                         attempt.id,
@@ -461,6 +469,37 @@ where
         Ok(created_tasks)
     }
 
+    async fn record_worker_tool_events(
+        &self,
+        attempt_id: persistent_agent_domain::TaskAttemptId,
+        task_id: persistent_agent_domain::TaskId,
+        tool_events: &[WorkerToolEvent],
+    ) -> anyhow::Result<()> {
+        for event in tool_events {
+            let status = match event.status {
+                WorkerToolEventStatus::Succeeded => "succeeded",
+                WorkerToolEventStatus::Failed => "failed",
+            };
+            self.db
+                .record_attempt_event(
+                    attempt_id,
+                    task_id,
+                    "worker_tool_executed",
+                    &format!("Worker tool '{}' {status}.", event.tool_name),
+                    json!({
+                        "tool_name": event.tool_name,
+                        "status": status,
+                        "args": event.args,
+                        "result": event.result,
+                        "error": event.error,
+                    }),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     async fn execute_worker_with_heartbeat(
         &self,
         task: Task,
@@ -583,6 +622,7 @@ impl TaskWorker for StubWorker {
                     memory_candidates: Vec::new(),
                     artifacts: Vec::new(),
                     follow_up_tasks: Vec::new(),
+                    tool_events: Vec::new(),
                 });
             }
 
@@ -591,6 +631,7 @@ impl TaskWorker for StubWorker {
                     "I need more user input before continuing task '{}'. Please add the missing context in this task conversation.",
                     task.title
                 ),
+                tool_events: Vec::new(),
             });
         }
 
@@ -602,6 +643,7 @@ impl TaskWorker for StubWorker {
             memory_candidates: Vec::new(),
             artifacts: Vec::new(),
             follow_up_tasks: Vec::new(),
+            tool_events: Vec::new(),
         })
     }
 }
@@ -759,6 +801,7 @@ struct HarnessWorkerState {
     memory_candidates: Vec<String>,
     artifacts: Vec<WorkerArtifact>,
     follow_up_tasks: Vec<WorkerFollowUpTask>,
+    tool_events: Vec<WorkerToolEvent>,
 }
 
 impl HarnessWorkerState {
@@ -769,18 +812,30 @@ impl HarnessWorkerState {
                 mut memory_candidates,
                 mut artifacts,
                 mut follow_up_tasks,
+                mut tool_events,
             } => {
                 memory_candidates.extend(std::mem::take(&mut self.memory_candidates));
                 artifacts.extend(std::mem::take(&mut self.artifacts));
                 follow_up_tasks.extend(std::mem::take(&mut self.follow_up_tasks));
+                tool_events.extend(std::mem::take(&mut self.tool_events));
                 WorkerResult::Completed {
                     summary,
                     memory_candidates: dedupe_strings(memory_candidates),
                     artifacts: dedupe_artifacts(artifacts),
                     follow_up_tasks: dedupe_follow_up_tasks(follow_up_tasks),
+                    tool_events,
                 }
             }
-            WorkerResult::Blocked { reason } => WorkerResult::Blocked { reason },
+            WorkerResult::Blocked {
+                reason,
+                mut tool_events,
+            } => {
+                tool_events.extend(std::mem::take(&mut self.tool_events));
+                WorkerResult::Blocked {
+                    reason,
+                    tool_events,
+                }
+            }
         }
     }
 }
@@ -797,13 +852,74 @@ fn product_lifecycle_tools(state: Arc<Mutex<HarnessWorkerState>>) -> Vec<Arc<dyn
 
 fn worker_tool_registry(state: Arc<Mutex<HarnessWorkerState>>) -> Arc<InMemoryToolRegistry> {
     let registry = Arc::new(InMemoryToolRegistry::new());
-    for tool in product_lifecycle_tools(state) {
-        registry.register(tool);
+    for tool in product_lifecycle_tools(state.clone()) {
+        registry.register(Arc::new(ObservedTool::new(tool, state.clone())));
     }
     for tool in execution_tools() {
-        registry.register(tool);
+        registry.register(Arc::new(ObservedTool::new(tool, state.clone())));
     }
     registry
+}
+
+struct ObservedTool {
+    inner: Arc<dyn Tool>,
+    state: Arc<Mutex<HarnessWorkerState>>,
+}
+
+impl ObservedTool {
+    fn new(inner: Arc<dyn Tool>, state: Arc<Mutex<HarnessWorkerState>>) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl Tool for ObservedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        self.inner.execution_mode()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let tool_name = self.name().to_owned();
+            let args_summary = summarize_json_value(&args, 2_000);
+            let result = self.inner.execute(args, ctx).await;
+            let event = match &result {
+                Ok(result) => WorkerToolEvent {
+                    tool_name,
+                    status: WorkerToolEventStatus::Succeeded,
+                    args: args_summary,
+                    result: Some(summarize_tool_result(result)),
+                    error: None,
+                },
+                Err(error) => WorkerToolEvent {
+                    tool_name,
+                    status: WorkerToolEventStatus::Failed,
+                    args: args_summary,
+                    result: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            self.state.lock().await.tool_events.push(event);
+            result
+        })
+    }
 }
 
 fn execution_tools() -> Vec<Arc<dyn Tool>> {
@@ -2365,7 +2481,10 @@ impl Tool for BlockTaskTool {
     > {
         Box::pin(async move {
             let reason = required_string(&args, "reason")?;
-            self.state.lock().await.result = Some(WorkerResult::Blocked { reason });
+            self.state.lock().await.result = Some(WorkerResult::Blocked {
+                reason,
+                tool_events: Vec::new(),
+            });
             Ok(tool_text_result("task marked blocked", true))
         })
     }
@@ -2563,6 +2682,35 @@ fn tool_text_result(text: &str, terminate: bool) -> ToolResult {
         }],
         details: json!({ "message": text }),
         terminate,
+    }
+}
+
+fn summarize_tool_result(result: &ToolResult) -> serde_json::Value {
+    json!({
+        "terminate": result.terminate,
+        "details": summarize_json_value(&result.details, 4_000),
+        "content": result.content.iter().map(summarize_content_block).collect::<Vec<_>>(),
+    })
+}
+
+fn summarize_content_block(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Text { text } => {
+            json!({ "type": "text", "text": truncate_chars(text, 4_000).text })
+        }
+        _ => json!({ "type": "non_text" }),
+    }
+}
+
+fn summarize_json_value(value: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    let serialized = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+    if serialized.chars().count() <= max_chars {
+        value.clone()
+    } else {
+        json!({
+            "truncated": true,
+            "text": truncate_chars(&serialized, max_chars).text,
+        })
     }
 }
 
@@ -3053,6 +3201,7 @@ fn parse_structured_worker_result(parsed: StructuredWorkerResult) -> WorkerResul
                 .or(parsed.summary)
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "Worker is blocked and needs user input.".to_owned()),
+            tool_events: Vec::new(),
         },
         "completed" => WorkerResult::Completed {
             summary: parsed
@@ -3063,6 +3212,7 @@ fn parse_structured_worker_result(parsed: StructuredWorkerResult) -> WorkerResul
             memory_candidates: clean_memory_candidates(parsed.memory_candidates),
             artifacts: clean_artifacts(parsed.artifacts),
             follow_up_tasks: clean_follow_up_tasks(parsed.follow_up_tasks),
+            tool_events: Vec::new(),
         },
         _ => fallback_worker_result(""),
     }
@@ -3200,6 +3350,7 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
             } else {
                 trimmed.to_owned()
             },
+            tool_events: Vec::new(),
         }
     } else {
         WorkerResult::Completed {
@@ -3211,6 +3362,7 @@ fn fallback_worker_result(text: &str) -> WorkerResult {
             memory_candidates: Vec::new(),
             artifacts: Vec::new(),
             follow_up_tasks: Vec::new(),
+            tool_events: Vec::new(),
         }
     }
 }
@@ -3223,10 +3375,30 @@ pub enum WorkerResult {
         memory_candidates: Vec<String>,
         artifacts: Vec<WorkerArtifact>,
         follow_up_tasks: Vec<WorkerFollowUpTask>,
+        #[serde(default)]
+        tool_events: Vec<WorkerToolEvent>,
     },
     Blocked {
         reason: String,
+        #[serde(default)]
+        tool_events: Vec<WorkerToolEvent>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerToolEvent {
+    pub tool_name: String,
+    pub status: WorkerToolEventStatus,
+    pub args: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerToolEventStatus {
+    Succeeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3633,6 +3805,7 @@ mod tests {
                 priority: 1,
                 requested_skills: vec!["testing".to_owned()],
             }],
+            tool_events: Vec::new(),
         };
 
         let result = state.merge_into_result(WorkerResult::Completed {
@@ -3640,6 +3813,7 @@ mod tests {
             memory_candidates: vec!["Prefer focused regression checks.".to_owned()],
             artifacts: Vec::new(),
             follow_up_tasks: Vec::new(),
+            tool_events: Vec::new(),
         });
 
         assert!(matches!(
@@ -3649,6 +3823,7 @@ mod tests {
                 ref memory_candidates,
                 ref artifacts,
                 ref follow_up_tasks,
+                ..
             } if summary == "Harness completed the task."
                 && memory_candidates == &vec!["Prefer focused regression checks.".to_owned()]
                 && artifacts.len() == 1
@@ -3770,7 +3945,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            WorkerResult::Blocked { ref reason } if reason.contains("target repository")
+            WorkerResult::Blocked { ref reason, .. } if reason.contains("target repository")
         ));
     }
 
@@ -3794,7 +3969,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            WorkerResult::Blocked { ref reason } if reason.contains("missing context")
+            WorkerResult::Blocked { ref reason, .. } if reason.contains("missing context")
         ));
     }
 
@@ -4149,6 +4324,7 @@ mod tests {
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4207,6 +4383,7 @@ mod tests {
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4321,6 +4498,7 @@ mod tests {
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4423,6 +4601,7 @@ mod tests {
                 memory_candidates: Vec::new(),
                 artifacts: Vec::new(),
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4624,6 +4803,7 @@ mod tests {
                 ],
                 artifacts: Vec::new(),
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4731,6 +4911,7 @@ mod tests {
                     summary: Some("Run report".to_owned()),
                 }],
                 follow_up_tasks: Vec::new(),
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4789,6 +4970,7 @@ mod tests {
                     priority: 5,
                     requested_skills: vec!["testing".to_owned()],
                 }],
+                tool_events: Vec::new(),
             })
         }
     }
@@ -4875,6 +5057,66 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "worker_completed")
         );
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct ToolEventWorker;
+
+    #[async_trait]
+    impl TaskWorker for ToolEventWorker {
+        async fn execute(
+            &self,
+            _task: Task,
+            _context: WorkerContext,
+        ) -> anyhow::Result<WorkerResult> {
+            Ok(WorkerResult::Completed {
+                summary: "used a tool".to_owned(),
+                memory_candidates: Vec::new(),
+                artifacts: Vec::new(),
+                follow_up_tasks: Vec::new(),
+                tool_events: vec![WorkerToolEvent {
+                    tool_name: "read_file".to_owned(),
+                    status: WorkerToolEventStatus::Succeeded,
+                    args: json!({ "path": "README.md" }),
+                    result: Some(json!({ "content": [{ "type": "text", "text": "README" }] })),
+                    error: None,
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_persists_worker_tool_events() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Tool audit task".to_owned(),
+                    description: "Worker should expose tool execution evidence".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let scheduler = Scheduler::new(db.clone(), ToolEventWorker);
+
+        scheduler.tick().await?;
+
+        let events = db.list_task_attempt_events(task.id).await?;
+        let tool_event = events
+            .iter()
+            .find(|event| event.event_type == "worker_tool_executed")
+            .expect("worker tool event should be persisted");
+        assert_eq!(tool_event.details["tool_name"], "read_file");
+        assert_eq!(tool_event.details["status"], "succeeded");
+        assert_eq!(tool_event.details["args"]["path"], "README.md");
+        assert_eq!(tool_event.details["result"]["content"][0]["text"], "README");
 
         Ok(())
     }
@@ -5061,6 +5303,11 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "worker_completed")
         );
+        assert!(events.iter().any(|event| {
+            event.event_type == "worker_tool_executed"
+                && event.details["tool_name"] == "complete_task"
+                && event.details["status"] == "succeeded"
+        }));
 
         Ok(())
     }

@@ -45,7 +45,7 @@ The repository now contains the first executable skeleton:
 - Blocked task conversation flow that records worker questions, accepts user replies, clears stale leases, and injects recent task messages into the next worker run.
 - Task execution history API and UI for attempts and auditable task actions.
 - Main-agent global action audit API and Web panel for non-task-specific tool calls.
-- Worker attempt event logs for context preparation, lease heartbeats, completion, and blockers.
+- Worker attempt event logs for context preparation, tool executions, lease heartbeats, completion, and blockers.
 - Running task leases are refreshed while workers execute, and expired running leases are recovered back into the queue before each scheduler scan.
 - Scheduler finalization preserves user status changes made while a task is running, such as cancellation or pause.
 - Running workers are stopped when their task lease is lost because the task was cancelled, paused, or otherwise moved out of `running`.
@@ -70,7 +70,7 @@ cargo run -p persistent-agent-server
 
 Enable the DeepSeek LLM worker by setting `DEEPSEEK_API_KEY` in your local environment. Do not commit real API keys.
 
-When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, `git_status`, `git_diff`, `http_fetch`, `github_list_issues`, `github_get_issue`, `github_comment_issue`, `github_update_issue_state`, and `github_create_pull_request`) through runtime `InMemoryToolRegistry`, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
+When `DEEPSEEK_API_KEY` is set, the server calls DeepSeek through `AgentHarness` and the approved `oh-my-harness/llm-api-adapter` for both worker execution and the main-agent advisor. The worker exposes product lifecycle tools (`complete_task`, `block_task`, `remember`, `record_artifact`, and `create_follow_up_task`) plus execution tools (`read_file`, `write_file`, `append_file`, `list_dir`, `shell`, `git_status`, `git_diff`, `http_fetch`, `github_list_issues`, `github_get_issue`, `github_comment_issue`, `github_update_issue_state`, and `github_create_pull_request`) through runtime `InMemoryToolRegistry`, wraps those tools with product audit capture, and provides the harness with runtime `OsEnvSandbox`, so task completion flows through the harness loop instead of a direct one-shot JSON call. Each worker tool call is persisted as a `worker_tool_executed` attempt event with the tool name, status, bounded argument summary, bounded result summary, and error if any. The main-agent advisor runs with no state-changing tools; product code performs the actual task operation first, then the advisor writes a concise conversational reply from that verified context.
 
 Run the real LLM scheduler smoke test only when you intentionally want to call DeepSeek:
 

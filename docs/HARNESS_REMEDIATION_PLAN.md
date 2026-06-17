@@ -57,6 +57,7 @@ receives skills through the approved harness context path.
 - provider calls through `llm-api-adapter` (wired)
 - runtime `InMemoryToolRegistry` from `llm-harness-runtime` (wired)
 - runtime `OsEnvSandbox` from `llm-harness-runtime-sandbox-os` (wired)
+- product audit wrapping for registered worker tools, persisted as `worker_tool_executed` task attempt events (wired)
 - runtime hooks, audit, sub-agent, auth/approval, and budget services (available as dependencies; product policies still need dedicated feature work before they should affect live task execution)
 
 ## Product Context To Inject

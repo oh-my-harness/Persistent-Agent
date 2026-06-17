@@ -239,7 +239,8 @@ It should:
 - receive task context, selected skills, memories, and allowed tools;
 - receive active product skill metadata, tool subsets, and resource paths;
 - derive the allowed-tool list from active skill tool subsets and emit it in attempt events;
-- emit framework events into the product event stream;
+- persist worker tool execution evidence into attempt events;
+- later bridge lower-level framework streaming events into the product event stream where useful;
 - produce a final task result;
 - report blockers in a structured form;
 - propose memory candidates.
@@ -254,6 +255,7 @@ Rules:
 - JSON Schema parameters;
 - use `ExecutionEnv` for filesystem and shell work;
 - put UI/audit metadata in `ToolResult.details`;
+- wrap registered worker tools with product audit capture so each call records a bounded `worker_tool_executed` attempt event;
 - use sequential execution mode for mutating or unsafe tools;
 - keep provider/model selection out of tools.
 
