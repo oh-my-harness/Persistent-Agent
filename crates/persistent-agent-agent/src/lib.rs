@@ -405,6 +405,21 @@ impl MainAgent {
         }
     }
 
+    pub async fn list_task_conversation(&self, task_id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(task_id).await?;
+        let messages = self.db.list_task_conversation_messages(task_id, 20).await?;
+        self.db
+            .record_action(
+                Some(task_id),
+                "main_agent",
+                "list_task_conversation",
+                serde_json::json!({ "message_count": messages.len() }),
+            )
+            .await?;
+
+        Ok(format_task_conversation(&task, &messages))
+    }
+
     pub async fn summarize_task_pool(&self) -> anyhow::Result<TaskPoolSummary> {
         let tasks = self.db.list_tasks().await?;
         let mut summary = TaskPoolSummary {
@@ -1148,6 +1163,12 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::ListTaskConversation { selector } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => self.list_task_conversation(task.id).await?,
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::Summarize => {
                 let summary = self.summarize_task_pool().await?;
                 format!(
@@ -1279,7 +1300,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1690,6 +1711,9 @@ pub enum MainAgentPlan {
     ListTaskHistory {
         selector: String,
     },
+    ListTaskConversation {
+        selector: String,
+    },
     InspectWorkspace,
     InspectWorkspaceFile {
         path: String,
@@ -1823,6 +1847,9 @@ impl MainAgentPlan {
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
             Self::ListTaskHistory { selector } => MainAgentIntent::ListTaskHistory { selector },
+            Self::ListTaskConversation { selector } => {
+                MainAgentIntent::ListTaskConversation { selector }
+            }
             Self::InspectWorkspace => MainAgentIntent::InspectWorkspace,
             Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
             Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
@@ -2000,6 +2027,9 @@ enum MainAgentIntent {
     ListTaskHistory {
         selector: String,
     },
+    ListTaskConversation {
+        selector: String,
+    },
     InspectWorkspace,
     InspectWorkspaceFile {
         path: String,
@@ -2100,6 +2130,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(selector) = extract_task_history_selector(trimmed, &normalized) {
         return MainAgentIntent::ListTaskHistory { selector };
+    }
+
+    if let Some(selector) = extract_task_conversation_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskConversation { selector };
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
@@ -2479,6 +2513,7 @@ async fn dispatch_main_agent_planner(
         "plan_explain_task",
         "plan_list_task_artifacts",
         "plan_list_task_history",
+        "plan_list_task_conversation",
         "plan_inspect_workspace",
         "plan_inspect_workspace_file",
         "plan_approve_memory",
@@ -2599,6 +2634,12 @@ fn main_agent_planner_tool_registry(
         "plan_list_task_history",
         "Plan to list attempts, worker events, and audit actions for one task.",
         PlannedTaskReadAction::ListHistory,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_conversation",
+        "Plan to list recent conversation messages for one task.",
+        PlannedTaskReadAction::ListConversation,
     )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
@@ -3760,6 +3801,7 @@ enum PlannedTaskReadAction {
     Explain,
     ListArtifacts,
     ListHistory,
+    ListConversation,
 }
 
 struct PlanTaskReadTool {
@@ -3828,6 +3870,9 @@ impl Tool for PlanTaskReadTool {
                     MainAgentPlan::ListTaskArtifacts { selector }
                 }
                 PlannedTaskReadAction::ListHistory => MainAgentPlan::ListTaskHistory { selector },
+                PlannedTaskReadAction::ListConversation => {
+                    MainAgentPlan::ListTaskConversation { selector }
+                }
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned task read action"))
@@ -4250,6 +4295,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     .replace(
         "- plan_list_task_artifacts: list artifacts for one task.",
         "- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.",
+    )
+    .replace(
+        "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.",
+        "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_task_conversation: list recent conversation messages for one task.",
     )
 }
 
@@ -4911,6 +4960,64 @@ fn extract_task_history_selector(content: &str, normalized: &str) -> Option<Stri
     (!selector.is_empty() && selector != content).then_some(selector)
 }
 
+fn extract_task_conversation_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "conversation",
+            "messages",
+            "message thread",
+            "chat",
+            "\u{4f1a}\u{8bdd}",
+            "\u{5bf9}\u{8bdd}",
+            "\u{6d88}\u{606f}",
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+    {
+        return None;
+    }
+
+    for prefix in [
+        "show conversation for task",
+        "list conversation for task",
+        "show messages for task",
+        "list messages for task",
+        "show task conversation",
+        "list task conversation",
+        "task conversation",
+        "task messages",
+    ] {
+        if let Some(index) = normalized.find(prefix) {
+            let selector = content[index + prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\'']);
+            if !selector.is_empty() {
+                return Some(selector.to_owned());
+            }
+        }
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "show",
+            "list",
+            "conversation",
+            "messages",
+            "message",
+            "thread",
+            "chat",
+            ZH_LIST,
+            "\u{67e5}\u{770b}",
+            "\u{4f1a}\u{8bdd}",
+            "\u{5bf9}\u{8bdd}",
+            "\u{6d88}\u{606f}",
+        ],
+    );
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
 fn is_scheduler_scan_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -5192,6 +5299,27 @@ fn format_task_history(
                 action.action_type
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_conversation(task: &Task, messages: &[ConversationMessage]) -> String {
+    if messages.is_empty() {
+        return format!("Task '{}' has no conversation messages yet.", task.title);
+    }
+
+    let mut lines = vec![format!(
+        "Task '{}' conversation ({} shown):",
+        task.title,
+        messages.len().min(20)
+    )];
+    for message in messages.iter().take(20) {
+        lines.push(format!(
+            "- {}: {}",
+            message.role,
+            bounded_preview(&message.content, 240)
+        ));
     }
 
     lines.join("\n")
@@ -6690,6 +6818,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_conversation_intents() {
+        assert_eq!(
+            parse_intent("show conversation for task Deploy release"),
+            MainAgentIntent::ListTaskConversation {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release messages"),
+            MainAgentIntent::ListTaskConversation {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{5bf9}\u{8bdd}"
+            ),
+            MainAgentIntent::ListTaskConversation {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_scheduler_scan_intents() {
         assert_eq!(
             parse_intent("run scheduler tick"),
@@ -7881,6 +8033,13 @@ mod tests {
             serde_json::json!({ "summary": "published release notes" }),
         )
         .await?;
+        db.add_conversation_message(
+            task.conversation_id.expect("task conversation"),
+            Some(task.id),
+            "assistant",
+            "Which environment?",
+        )
+        .await?;
 
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ListTaskArtifacts {
@@ -7983,6 +8142,32 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "list_task_history")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskConversation {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Show me the conversation thread for deployment.".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Which environment?")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_conversation")
         );
 
         Ok(())
@@ -9002,6 +9187,60 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "list_task_history")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_task_conversation_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .request_user_clarification(task.id, "Which environment?")
+            .await?;
+        agent.reply_to_task(task.id, "Use production.").await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show conversation for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' conversation")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Which environment?")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Use production.")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_conversation")
         );
 
         Ok(())
