@@ -727,7 +727,7 @@ async fn dispatch_task_with_harness(
     Ok(state.merge_into_result(result))
 }
 
-const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, or http_fetch when the task requires workspace or network work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
+const HARNESS_WORKER_SYSTEM_PROMPT: &str = "You are a worker agent inside Persistent Agent. Execute the assigned task as far as possible using the provided context and available tools. Use read_file, write_file, append_file, list_dir, shell, http_fetch, or github_list_issues when the task requires workspace, network, or GitHub issue work; do not merely describe steps when a tool can perform them. You must call complete_task when the task is genuinely done, or block_task when user input is required. Before complete_task, call remember only for durable preferences, pitfalls, project conventions, or reusable task learnings. Call record_artifact for durable outputs or references. Call create_follow_up_task only for concrete one-off work that should be queued after this task succeeds. Do not mark a task completed if you only explained what should be done.";
 
 const LIFECYCLE_TOOL_NAMES: &[&str] = &[
     "remember",
@@ -744,6 +744,7 @@ const EXECUTION_TOOL_NAMES: &[&str] = &[
     "list_dir",
     "shell",
     "http_fetch",
+    "github_list_issues",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -807,6 +808,7 @@ fn execution_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDirTool::new()),
         Arc::new(ShellTool::new()),
         Arc::new(HttpFetchTool::new()),
+        Arc::new(GitHubListIssuesTool::new()),
     ]
 }
 
@@ -834,8 +836,11 @@ fn active_worker_tool_names(allowed_tools: &[String]) -> Vec<String> {
                 );
             }
             "shell" | "bash" | "powershell" | "cmd" => extend_unique(&mut names, &["shell"]),
-            "network" | "net" | "http" | "https" | "web" | "github" | "github_search" => {
+            "network" | "net" | "http" | "https" | "web" => {
                 extend_unique(&mut names, &["http_fetch"]);
+            }
+            "github" | "github_search" | "github_issues" | "issues" => {
+                extend_unique(&mut names, &["http_fetch", "github_list_issues"]);
             }
             known if EXECUTION_TOOL_NAMES.contains(&known) => extend_unique(&mut names, &[known]),
             _ => {}
@@ -1236,6 +1241,175 @@ impl Tool for HttpFetchTool {
             })
         })
     }
+}
+
+struct GitHubListIssuesTool {
+    schema: serde_json::Value,
+}
+
+impl GitHubListIssuesTool {
+    fn new() -> Self {
+        Self {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repository": { "type": "string", "description": "GitHub repository in owner/repo form" },
+                    "state": { "type": "string", "enum": ["open", "closed", "all"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 30 }
+                },
+                "required": ["repository"]
+            }),
+        }
+    }
+}
+
+impl Tool for GitHubListIssuesTool {
+    fn name(&self) -> &str {
+        "github_list_issues"
+    }
+
+    fn description(&self) -> &str {
+        "List GitHub issues for an owner/repo repository. Pull requests are filtered out."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let repository = required_string(&args, "repository")?;
+            let state = args
+                .get("state")
+                .and_then(|value| value.as_str())
+                .unwrap_or("open");
+            let limit = bounded_usize(&args, "limit", 10, 1, 30);
+            let url = github_issues_url(&repository, state, limit)?;
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent("Persistent-Agent/0.1")
+                .build()
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+                .get(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if !(200..300).contains(&status) {
+                return Err(ToolError::Execution(format!(
+                    "GitHub issues request failed with status {status}: {}",
+                    truncate_chars(&body, 1_000).text
+                )));
+            }
+
+            let issues: Vec<serde_json::Value> = serde_json::from_str(&body)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let summaries = issues
+                .into_iter()
+                .filter(|issue| issue.get("pull_request").is_none())
+                .take(limit)
+                .map(format_github_issue_summary)
+                .collect::<Vec<_>>();
+            let text = if summaries.is_empty() {
+                "No matching GitHub issues found.".to_owned()
+            } else {
+                summaries.join("\n")
+            };
+
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text { text }],
+                details: json!({
+                    "repository": repository,
+                    "state": state,
+                    "limit": limit,
+                    "status": status,
+                    "count": summaries.len(),
+                }),
+                terminate: false,
+            })
+        })
+    }
+}
+
+fn github_issues_url(
+    repository: &str,
+    state: &str,
+    limit: usize,
+) -> Result<reqwest::Url, ToolError> {
+    let repository = repository.trim().trim_matches('/');
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default().trim();
+    let repo = parts.next().unwrap_or_default().trim();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return Err(ToolError::InvalidArguments(
+            "repository must be in owner/repo form".to_owned(),
+        ));
+    }
+    if !is_safe_github_path_part(owner) || !is_safe_github_path_part(repo) {
+        return Err(ToolError::InvalidArguments(
+            "repository owner and name may only contain ASCII letters, digits, '.', '_' or '-'"
+                .to_owned(),
+        ));
+    }
+
+    let state = match state.trim().to_ascii_lowercase().as_str() {
+        "open" | "" => "open",
+        "closed" => "closed",
+        "all" => "all",
+        _ => {
+            return Err(ToolError::InvalidArguments(
+                "state must be open, closed, or all".to_owned(),
+            ));
+        }
+    };
+
+    reqwest::Url::parse_with_params(
+        &format!("https://api.github.com/repos/{owner}/{repo}/issues"),
+        [
+            ("state", state.to_owned()),
+            ("per_page", limit.clamp(1, 30).to_string()),
+        ],
+    )
+    .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+}
+
+fn is_safe_github_path_part(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn format_github_issue_summary(issue: serde_json::Value) -> String {
+    let number = issue
+        .get("number")
+        .and_then(|value| value.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let title = issue
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("untitled issue");
+    let state = issue
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let url = issue
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("no url");
+    format!("#{number} [{state}] {title} - {url}")
 }
 
 struct CompleteTaskTool {
@@ -2379,7 +2553,8 @@ mod tests {
                 "append_file",
                 "list_dir",
                 "shell",
-                "http_fetch"
+                "http_fetch",
+                "github_list_issues"
             ]
         );
     }
@@ -2394,6 +2569,7 @@ mod tests {
         assert!(names.contains(&"append_file".to_owned()));
         assert!(names.contains(&"list_dir".to_owned()));
         assert!(names.contains(&"http_fetch".to_owned()));
+        assert!(names.contains(&"github_list_issues".to_owned()));
         assert!(!names.contains(&"shell".to_owned()));
     }
 
@@ -2458,6 +2634,25 @@ mod tests {
             .expect_err("file urls should be rejected");
 
         assert!(error.to_string().contains("http or https"));
+    }
+
+    #[test]
+    fn github_issues_url_validates_repository_and_state() {
+        let url = github_issues_url("oh-my-harness/Persistent-Agent", "all", 50)
+            .expect("valid GitHub issues url");
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/oh-my-harness/Persistent-Agent/issues?state=all&per_page=30"
+        );
+
+        assert!(matches!(
+            github_issues_url("not/enough/parts", "open", 10),
+            Err(ToolError::InvalidArguments(_))
+        ));
+        assert!(matches!(
+            github_issues_url("owner/repo", "triaged", 10),
+            Err(ToolError::InvalidArguments(_))
+        ));
     }
 
     #[test]

@@ -87,6 +87,7 @@ The first harness-backed product tools are:
 - `read_file` / `write_file` / `append_file` / `list_dir` (wired through runtime `ExecutionEnv`)
 - `shell` (wired through runtime `ExecutionEnv`)
 - `http_fetch` (wired for HTTP(S) lookups)
+- `github_list_issues` (wired for read-only GitHub issue discovery)
 
 Specialized tools such as browser automation, first-class GitHub issue/PR operations, and richer git
 workflows should be added later through the approved runtime tool policy and audit path.
