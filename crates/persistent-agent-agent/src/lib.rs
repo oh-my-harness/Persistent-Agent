@@ -10,8 +10,9 @@ use llm_harness_runtime::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
-    ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task,
-    TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
+    ConversationId, ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus,
+    Skill, Task, TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus,
+    TaskType, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -245,6 +246,33 @@ impl MainAgent {
                 "main_agent",
             )
             .await
+    }
+
+    pub async fn create_skill_definition(&self, input: CreateSkill) -> anyhow::Result<Skill> {
+        self.db.create_skill(input, "main_agent").await
+    }
+
+    pub async fn list_skill_definitions(&self) -> anyhow::Result<Vec<Skill>> {
+        let skills = self.db.list_skills().await?;
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_skills",
+                serde_json::json!({ "count": skills.len() }),
+            )
+            .await?;
+        Ok(skills)
+    }
+
+    pub async fn delete_skill_definition(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<Result<Skill, String>> {
+        match self.find_skill(selector).await? {
+            Ok(skill) => Ok(Ok(self.db.delete_skill(skill.id, "main_agent").await?)),
+            Err(reply) => Ok(Err(reply)),
+        }
     }
 
     pub async fn add_task_resource_lock(
@@ -935,12 +963,32 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::ListMemories { filter } => self.list_memories_for_review(filter).await?,
+            MainAgentIntent::CreateSkillDefinition { input } => {
+                let skill = self.create_skill_definition(input).await?;
+                format!(
+                    "Created skill '{}'. Triggers: {}. Tools: {}. Resource: {}.",
+                    skill.name,
+                    format_skill_list(&skill.trigger_rules),
+                    format_skill_list(&skill.tool_subset),
+                    skill.resource_path.as_deref().unwrap_or("none")
+                )
+            }
+            MainAgentIntent::ListSkillDefinitions => {
+                let skills = self.list_skill_definitions().await?;
+                format_skill_definitions(&skills)
+            }
+            MainAgentIntent::DeleteSkillDefinition { selector } => {
+                match self.delete_skill_definition(&selector).await? {
+                    Ok(skill) => format!("Deleted skill '{}'.", skill.name),
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::RunSchedulerTick => {
                 "Scheduler scan requested. I will ask the scheduler to check the task pool now."
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1090,6 +1138,35 @@ impl MainAgent {
             [] => Ok(Err(format!("No memory matched '{selector}'."))),
             _ => Ok(Err(format!(
                 "Found {} memories matching '{selector}'. Please use a more specific content fragment or id.",
+                matches.len()
+            ))),
+        }
+    }
+
+    async fn find_skill(&self, selector: &str) -> anyhow::Result<Result<Skill, String>> {
+        let needle = selector.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Err(
+                "Please tell me which skill to manage by name or skill id.".to_owned(),
+            ));
+        }
+
+        let matches = self
+            .db
+            .list_skills()
+            .await?
+            .into_iter()
+            .filter(|skill| {
+                skill.id.to_string().starts_with(&needle)
+                    || skill.name.to_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [skill] => Ok(Ok(skill.clone())),
+            [] => Ok(Err(format!("No skill matched '{selector}'."))),
+            _ => Ok(Err(format!(
+                "Found {} skills matching '{selector}'. Please use a more specific name or id.",
                 matches.len()
             ))),
         }
@@ -1291,6 +1368,13 @@ enum MainAgentIntent {
     ListMemories {
         filter: MemoryListFilter,
     },
+    CreateSkillDefinition {
+        input: CreateSkill,
+    },
+    ListSkillDefinitions,
+    DeleteSkillDefinition {
+        selector: String,
+    },
     RunSchedulerTick,
     Summarize,
     Help,
@@ -1318,6 +1402,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_scheduler_scan_request(&normalized) {
         return MainAgentIntent::RunSchedulerTick;
+    }
+
+    if let Some(intent) = parse_skill_definition_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if contains_any(
@@ -1678,6 +1766,171 @@ fn parse_split_intent(content: &str, normalized: &str) -> Option<MainAgentIntent
     let tail = split_tail(content)?;
     let titles = extract_split_titles(tail);
     (titles.len() >= 2).then_some(MainAgentIntent::SplitTasks { titles })
+}
+
+fn parse_skill_definition_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if is_skill_definition_list_request(normalized) {
+        return Some(MainAgentIntent::ListSkillDefinitions);
+    }
+
+    if let Some(selector) = extract_delete_skill_definition_selector(content, normalized) {
+        return Some(MainAgentIntent::DeleteSkillDefinition { selector });
+    }
+
+    extract_create_skill_definition(content, normalized)
+        .map(|input| MainAgentIntent::CreateSkillDefinition { input })
+}
+
+fn is_skill_definition_list_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "list skills",
+            "show skills",
+            "list skill definitions",
+            "show skill definitions",
+        ],
+    ) || (contains_any(normalized, &[ZH_LIST]) && contains_any(normalized, &[ZH_SKILL]))
+}
+
+fn extract_delete_skill_definition_selector(content: &str, normalized: &str) -> Option<String> {
+    if contains_any(normalized, &[" from task", " to task", " requested skill"]) {
+        return None;
+    }
+
+    for prefix in ["delete skill definition", "delete skill", "remove skill"] {
+        if normalized.starts_with(prefix) {
+            let selector = content[prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '"', '\''])
+                .trim()
+                .to_owned();
+            return (!selector.is_empty()).then_some(selector);
+        }
+    }
+
+    None
+}
+
+fn extract_create_skill_definition(content: &str, normalized: &str) -> Option<CreateSkill> {
+    let prefix = if normalized.starts_with("create skill definition") {
+        "create skill definition"
+    } else if normalized.starts_with("create skill") {
+        "create skill"
+    } else if normalized.starts_with("add skill definition") {
+        "add skill definition"
+    } else {
+        return None;
+    };
+
+    let body = content[prefix.len()..].trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut sections = body
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|section| !section.is_empty());
+    let head = sections.next()?;
+    let (name, mut description) = split_skill_name_description(head);
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut trigger_rules = Vec::new();
+    let mut tool_subset = Vec::new();
+    let mut resource_path = None;
+
+    for section in sections {
+        let normalized_section = section.to_lowercase();
+        if let Some(value) =
+            strip_skill_clause_value(section, &normalized_section, &["description", "desc"])
+        {
+            description = value;
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["trigger rules", "triggers", "trigger", "rules"],
+        ) {
+            trigger_rules = parse_skill_names(&value);
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["tool subset", "tools", "tool"],
+        ) {
+            tool_subset = parse_skill_names(&value);
+            continue;
+        }
+        if let Some(value) = strip_skill_clause_value(
+            section,
+            &normalized_section,
+            &["resource path", "resource_path", "resource"],
+        ) {
+            let value = value.trim().to_owned();
+            if !value.is_empty() {
+                resource_path = Some(value);
+            }
+        }
+    }
+
+    if trigger_rules.is_empty() {
+        trigger_rules.push(name.clone());
+    }
+
+    Some(CreateSkill {
+        name,
+        description,
+        trigger_rules,
+        tool_subset,
+        resource_path,
+    })
+}
+
+fn split_skill_name_description(head: &str) -> (String, String) {
+    let head = clean_skill_field(head);
+    for separator in [":", "\u{ff1a}", " - "] {
+        if let Some((name, description)) = head.split_once(separator) {
+            let name = clean_skill_field(name);
+            let description = clean_skill_field(description);
+            return (name, description);
+        }
+    }
+
+    (head.clone(), head)
+}
+
+fn strip_skill_clause_value(
+    section: &str,
+    normalized_section: &str,
+    labels: &[&str],
+) -> Option<String> {
+    for label in labels {
+        if normalized_section.starts_with(label) {
+            let value = section[label.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '=', '"', '\''])
+                .trim()
+                .to_owned();
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn clean_skill_field(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches([
+            ':', '\u{ff1a}', ',', '\u{ff0c}', '.', '\u{3002}', '"', '\'', '`',
+        ])
+        .trim()
+        .to_owned()
 }
 
 fn split_tail(content: &str) -> Option<&str> {
@@ -2748,6 +3001,31 @@ fn format_skill_list(skill_names: &[String]) -> String {
     }
 }
 
+fn format_skill_definitions(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return "No skills are defined yet.".to_owned();
+    }
+
+    skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "- {}: {}\n  triggers: {}\n  tools: {}\n  resource: {}",
+                skill.name,
+                if skill.description.trim().is_empty() {
+                    "no description"
+                } else {
+                    skill.description.trim()
+                },
+                format_skill_list(&skill.trigger_rules),
+                format_skill_list(&skill.tool_subset),
+                skill.resource_path.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn extract_memory_selector(content: &str) -> String {
     for separator in ["\u{ff1a}", ":", "\n"] {
         if let Some((_, tail)) = content.split_once(separator) {
@@ -3437,6 +3715,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_skill_definition_intents() {
+        assert_eq!(
+            parse_intent(
+                "create skill rust: Rust workspace maintenance; triggers cargo,rust; tools shell,filesystem; resource skills/rust"
+            ),
+            MainAgentIntent::CreateSkillDefinition {
+                input: CreateSkill {
+                    name: "rust".to_owned(),
+                    description: "Rust workspace maintenance".to_owned(),
+                    trigger_rules: vec!["cargo".to_owned(), "rust".to_owned()],
+                    tool_subset: vec!["shell".to_owned(), "filesystem".to_owned()],
+                    resource_path: Some("skills/rust".to_owned()),
+                },
+            }
+        );
+        assert_eq!(
+            parse_intent("list skills"),
+            MainAgentIntent::ListSkillDefinitions
+        );
+        assert_eq!(
+            parse_intent("delete skill rust"),
+            MainAgentIntent::DeleteSkillDefinition {
+                selector: "rust".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("remove skill browser from task Deploy release"),
+            MainAgentIntent::RemoveRequestedSkills {
+                selector: "Deploy release".to_owned(),
+                skill_names: vec!["browser".to_owned()],
+            }
+        );
+    }
+
+    #[test]
     fn parses_task_resource_lock_intents() {
         assert_eq!(
             parse_intent("add resource lock to task Deploy release: repo:persistent-agent"),
@@ -3547,6 +3860,66 @@ mod tests {
         assert_eq!(response.changed_tasks.len(), 1);
         assert_eq!(task.requested_skills, vec!["github", "shell"]);
         assert!(response.assistant_message.content.contains("Created task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_manage_skill_definitions_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let created = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "create skill rust: Rust workspace maintenance; triggers cargo,rust; tools shell,filesystem; resource skills/rust".to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert!(
+            created
+                .assistant_message
+                .content
+                .contains("Created skill 'rust'")
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "rust");
+        assert_eq!(skills[0].trigger_rules, vec!["cargo", "rust"]);
+        assert_eq!(skills[0].tool_subset, vec!["shell", "filesystem"]);
+        assert_eq!(skills[0].resource_path.as_deref(), Some("skills/rust"));
+
+        let listed = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "list skills".to_owned(),
+            })
+            .await?;
+        assert!(
+            listed
+                .assistant_message
+                .content
+                .contains("Rust workspace maintenance")
+        );
+        assert!(
+            listed
+                .assistant_message
+                .content
+                .contains("resource: skills/rust")
+        );
+
+        let deleted = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "delete skill rust".to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert!(
+            deleted
+                .assistant_message
+                .content
+                .contains("Deleted skill 'rust'")
+        );
+        assert!(skills.is_empty());
 
         Ok(())
     }

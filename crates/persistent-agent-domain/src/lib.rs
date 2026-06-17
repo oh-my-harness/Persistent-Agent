@@ -328,7 +328,7 @@ pub struct Skill {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSkill {
     pub name: String,
     pub description: String,

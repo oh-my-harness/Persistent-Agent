@@ -47,6 +47,10 @@ The deterministic product operation remains the authority for task state changes
 not receive state-changing tools; it composes the final user-facing response from the verified action
 context and falls back to the deterministic reply on empty output or LLM failure.
 
+The deterministic main-agent operation layer includes skill definition management, so users can
+create, list, and delete skills through the main conversation while worker execution still receives
+skills through the approved harness context path.
+
 `OhMyHarnessWorker` must use:
 
 - `AgentHarness` from the approved runtime v0.2 `llm-harness-agent` package (wired)
