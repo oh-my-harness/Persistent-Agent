@@ -90,6 +90,7 @@ pub enum AppEvent {
     MainAgentReply { message: ConversationMessage },
     MainAgentAction { action: TaskAction },
     SchedulerTick { tick: SchedulerTick },
+    SchedulerError { error: String },
     Heartbeat,
 }
 
@@ -757,7 +758,11 @@ pub async fn spawn_scheduler_loop(state: AppState, interval_duration: Duration) 
                     tracing::error!(?error, "scheduler loop event emission failed");
                 }
             }
-            Err(error) => tracing::error!(?error, "scheduler loop tick failed"),
+            Err(error) => {
+                let error = error.to_string();
+                tracing::error!(error, "scheduler loop tick failed");
+                state.events.send(AppEvent::SchedulerError { error });
+            }
         }
     }
 }

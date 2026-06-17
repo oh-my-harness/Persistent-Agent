@@ -82,6 +82,7 @@ export type AppEvent =
   | { type: "main_agent_reply"; message: ConversationMessage }
   | { type: "main_agent_action"; action: TaskAction }
   | { type: "scheduler_tick"; tick: SchedulerTick }
+  | { type: "scheduler_error"; error: string }
   | { type: "heartbeat" };
 
 export interface ConversationMessage {

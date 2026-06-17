@@ -706,6 +706,14 @@ function toTimelineEvent(event: AppEvent | null, raw: string): TimelineEvent {
       };
     case "scheduler_tick":
       return schedulerTimelineEvent(event.tick, timestamp);
+    case "scheduler_error":
+      return {
+        id: `${timestamp}-scheduler-error`,
+        title: "Scheduler error",
+        detail: event.error,
+        tone: "danger",
+        timestamp,
+      };
     case "heartbeat":
       return {
         id: `${timestamp}-heartbeat`,
