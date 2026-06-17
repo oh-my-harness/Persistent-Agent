@@ -309,7 +309,7 @@ pub struct CreateMemory {
     pub confidence: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct UpdateMemory {
     pub scope: Option<String>,
     pub content: Option<String>,

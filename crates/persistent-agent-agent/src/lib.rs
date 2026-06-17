@@ -15,7 +15,7 @@ use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus,
     Skill, Task, TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus,
-    TaskType, UpdateSkill, UpdateTask,
+    TaskType, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -677,6 +677,14 @@ impl MainAgent {
             .await
     }
 
+    pub async fn update_memory(&self, id: MemoryId, input: UpdateMemory) -> anyhow::Result<Memory> {
+        self.db.update_memory(id, input, "main_agent").await
+    }
+
+    pub async fn delete_memory(&self, id: MemoryId) -> anyhow::Result<Memory> {
+        self.db.delete_memory(id, "main_agent").await
+    }
+
     pub async fn list_memories_for_review(
         &self,
         filter: MemoryListFilter,
@@ -1074,6 +1082,28 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::UpdateMemory { selector, input } => match self.find_memory(&selector).await? {
+                Ok(memory) => {
+                    let memory = self.update_memory(memory.id, input).await?;
+                    format!(
+                        "Updated memory '{}': {}",
+                        memory.id.to_string().chars().take(8).collect::<String>(),
+                        memory.content
+                    )
+                }
+                Err(reply) => reply,
+            },
+            MainAgentIntent::DeleteMemory { selector } => match self.find_memory(&selector).await? {
+                Ok(memory) => {
+                    let memory = self.delete_memory(memory.id).await?;
+                    format!(
+                        "Deleted memory '{}': {}",
+                        memory.id.to_string().chars().take(8).collect::<String>(),
+                        memory.content
+                    )
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::ListMemories { filter } => self.list_memories_for_review(filter).await?,
             MainAgentIntent::CreateSkillDefinition { input } => {
                 let skill = self.create_skill_definition(input).await?;
@@ -1112,7 +1142,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1424,7 +1454,7 @@ pub struct MainAgentPlanContext {
     pub recent_messages: Vec<ConversationMessage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum MainAgentPlan {
     CreateTask {
@@ -1522,6 +1552,13 @@ pub enum MainAgentPlan {
         selector: String,
     },
     RejectMemory {
+        selector: String,
+    },
+    UpdateMemory {
+        selector: String,
+        input: UpdateMemory,
+    },
+    DeleteMemory {
         selector: String,
     },
     ListMemories {
@@ -1642,6 +1679,10 @@ impl MainAgentPlan {
             Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
             Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
             Self::RejectMemory { selector } => MainAgentIntent::RejectMemory { selector },
+            Self::UpdateMemory { selector, input } => {
+                MainAgentIntent::UpdateMemory { selector, input }
+            }
+            Self::DeleteMemory { selector } => MainAgentIntent::DeleteMemory { selector },
             Self::ListMemories { filter } => MainAgentIntent::ListMemories { filter },
             Self::ListSkillDefinitions => MainAgentIntent::ListSkillDefinitions,
             Self::ListTasks => MainAgentIntent::ListTasks,
@@ -1727,7 +1768,7 @@ impl MemoryListFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum MainAgentIntent {
     SplitTasks {
         titles: Vec<String>,
@@ -1815,6 +1856,13 @@ enum MainAgentIntent {
         selector: String,
     },
     RejectMemory {
+        selector: String,
+    },
+    UpdateMemory {
+        selector: String,
+        input: UpdateMemory,
+    },
+    DeleteMemory {
         selector: String,
     },
     ListMemories {
@@ -2273,6 +2321,8 @@ async fn dispatch_main_agent_planner(
         "plan_inspect_workspace_file",
         "plan_approve_memory",
         "plan_reject_memory",
+        "plan_update_memory",
+        "plan_delete_memory",
         "plan_list_memories",
         "plan_list_skill_definitions",
         "plan_list_tasks",
@@ -2399,6 +2449,13 @@ fn main_agent_planner_tool_registry(
         "plan_reject_memory",
         "Plan to reject a memory candidate selected by id, scope, or content fragment.",
         PlannedMemoryReviewAction::Reject,
+    )));
+    registry.register(Arc::new(PlanUpdateMemoryTool::new(state.clone())));
+    registry.register(Arc::new(PlanMemoryReviewTool::new(
+        state.clone(),
+        "plan_delete_memory",
+        "Plan to delete a memory selected by id, scope, or content fragment.",
+        PlannedMemoryReviewAction::Delete,
     )));
     registry.register(Arc::new(PlanListMemoriesTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
@@ -3661,6 +3718,7 @@ impl Tool for PlanInspectWorkspaceFileTool {
 enum PlannedMemoryReviewAction {
     Approve,
     Reject,
+    Delete,
 }
 
 struct PlanMemoryReviewTool {
@@ -3726,9 +3784,88 @@ impl Tool for PlanMemoryReviewTool {
             let plan = match self.action {
                 PlannedMemoryReviewAction::Approve => MainAgentPlan::ApproveMemory { selector },
                 PlannedMemoryReviewAction::Reject => MainAgentPlan::RejectMemory { selector },
+                PlannedMemoryReviewAction::Delete => MainAgentPlan::DeleteMemory { selector },
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned memory review action"))
+        })
+    }
+}
+
+struct PlanUpdateMemoryTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanUpdateMemoryTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Memory id, scope, or content fragment identifying the memory."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional replacement scope."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Optional replacement memory content."
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Optional replacement confidence from 0.0 to 1.0."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanUpdateMemoryTool {
+    fn name(&self) -> &str {
+        "plan_update_memory"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to update an existing memory's scope, content, or confidence."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let input = UpdateMemory {
+                scope: planner_optional_string(&args, "scope"),
+                content: planner_optional_string(&args, "content"),
+                confidence: args.get("confidence").and_then(|value| value.as_f64()),
+            };
+            if input.scope.is_none() && input.content.is_none() && input.confidence.is_none() {
+                return Err(ToolError::InvalidArguments(
+                    "plan_update_memory requires at least one of scope, content, or confidence"
+                        .to_owned(),
+                ));
+            }
+            self.state.lock().await.plan = Some(MainAgentPlan::UpdateMemory { selector, input });
+            Ok(planner_tool_result("planned memory update"))
         })
     }
 }
@@ -3928,6 +4065,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
         format_advisor_recent_messages(&context.recent_messages),
+    )
+    .replace(
+        "- plan_list_memories: list memory candidates by status.",
+        "- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.",
     )
 }
 
@@ -5203,6 +5344,39 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
     if contains_any(
         normalized,
         &[
+            "update memory",
+            "update memory candidate",
+            "edit memory",
+            "edit memory candidate",
+            "revise memory",
+            "\u{66f4}\u{65b0}\u{8bb0}\u{5fc6}",
+            "\u{4fee}\u{6539}\u{8bb0}\u{5fc6}",
+            "\u{7f16}\u{8f91}\u{8bb0}\u{5fc6}",
+        ],
+    ) {
+        return split_memory_update(content)
+            .map(|(selector, input)| MainAgentIntent::UpdateMemory { selector, input });
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "delete memory",
+            "delete memory candidate",
+            "remove memory",
+            "remove memory candidate",
+            "forget memory",
+            "\u{5220}\u{9664}\u{8bb0}\u{5fc6}",
+            "\u{79fb}\u{9664}\u{8bb0}\u{5fc6}",
+        ],
+    ) {
+        let selector = extract_memory_selector(content);
+        return (!selector.is_empty()).then_some(MainAgentIntent::DeleteMemory { selector });
+    }
+
+    if contains_any(
+        normalized,
+        &[
             "reject memory",
             "reject memory candidate",
             "discard memory",
@@ -5212,6 +5386,27 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
     ) {
         let selector = extract_memory_selector(content);
         return (!selector.is_empty()).then_some(MainAgentIntent::RejectMemory { selector });
+    }
+
+    None
+}
+
+fn split_memory_update(content: &str) -> Option<(String, UpdateMemory)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector = extract_memory_selector(head);
+            let content = tail.trim().trim_matches(['"', '\'']).trim();
+            if !selector.is_empty() && !content.is_empty() {
+                return Some((
+                    selector,
+                    UpdateMemory {
+                        scope: None,
+                        content: Some(content.to_owned()),
+                        confidence: None,
+                    },
+                ));
+            }
+        }
     }
 
     None
@@ -5556,18 +5751,40 @@ fn extract_memory_selector(content: &str) -> String {
         "reject memory",
         "discard memory candidate",
         "discard memory",
+        "update memory candidate",
+        "update memory",
+        "edit memory candidate",
+        "edit memory",
+        "revise memory candidate",
+        "revise memory",
+        "delete memory candidate",
+        "delete memory",
+        "remove memory candidate",
+        "remove memory",
+        "forget memory",
         "memory candidate",
         "long-term memory",
         "approve",
         "accept",
         "reject",
         "discard",
+        "update",
+        "edit",
+        "revise",
+        "delete",
+        "remove",
+        "forget",
         "memory",
         ZH_LONG_TERM_MEMORY,
         ZH_MEMORY,
         ZH_APPROVE,
         ZH_ACCEPT,
         ZH_REJECT,
+        "\u{66f4}\u{65b0}",
+        "\u{4fee}\u{6539}",
+        "\u{7f16}\u{8f91}",
+        "\u{5220}\u{9664}",
+        "\u{79fb}\u{9664}",
     ] {
         selector = replace_case_insensitive(&selector, word, "");
     }
@@ -6411,6 +6628,23 @@ mod tests {
         assert_eq!(
             parse_intent("reject memory candidate noisy temporary note"),
             MainAgentIntent::RejectMemory {
+                selector: "noisy temporary note".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("update memory candidate prefer cargo: prefer cargo test before push"),
+            MainAgentIntent::UpdateMemory {
+                selector: "prefer cargo".to_owned(),
+                input: UpdateMemory {
+                    scope: None,
+                    content: Some("prefer cargo test before push".to_owned()),
+                    confidence: None,
+                },
+            }
+        );
+        assert_eq!(
+            parse_intent("delete memory candidate noisy temporary note"),
+            MainAgentIntent::DeleteMemory {
                 selector: "noisy temporary note".to_owned(),
             }
         );
@@ -7303,6 +7537,58 @@ mod tests {
                 .contains("Prefer cargo test before pushing.")
         );
 
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::UpdateMemory {
+                selector: "cargo test before pushing".to_owned(),
+                input: UpdateMemory {
+                    scope: None,
+                    content: Some("Prefer cargo test --workspace before pushing.".to_owned()),
+                    confidence: None,
+                },
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Tighten that remembered testing preference.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_memory(memory.id).await?;
+
+        assert_eq!(
+            updated.content,
+            "Prefer cargo test --workspace before pushing."
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Updated memory")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::DeleteMemory {
+                selector: "cargo test --workspace".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Remove that remembered testing preference.".to_owned(),
+            })
+            .await?;
+        let memories = db.list_memories().await?;
+
+        assert!(!memories.iter().any(|candidate| candidate.id == memory.id));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deleted memory")
+        );
+
         Ok(())
     }
 
@@ -7604,6 +7890,43 @@ mod tests {
                 .assistant_message
                 .content
                 .contains("Rejected memory")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: format!(
+                    "update memory candidate {}: Prefer cargo test --workspace before push",
+                    approved_memory.id
+                ),
+            })
+            .await?;
+        let updated = db.get_memory(approved_memory.id).await?;
+
+        assert_eq!(updated.content, "Prefer cargo test --workspace before push");
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Updated memory")
+        );
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "delete memory candidate Noisy temporary note".to_owned(),
+            })
+            .await?;
+        let memories = db.list_memories().await?;
+
+        assert!(
+            !memories
+                .iter()
+                .any(|memory| memory.id == rejected_memory.id)
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deleted memory")
         );
 
         Ok(())

@@ -30,7 +30,7 @@ The repository now contains the first executable skeleton:
 - Rust workspace backend under `crates/` and `apps/server`.
 - SQLite migrations and repositories for task lifecycle state.
 - Main-agent task-management service for creating, updating, pausing, resuming, cancelling, reordering, and summarizing tasks.
-- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, create/list/update/delete skill definitions, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, reply to blocked tasks, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory review, scheduler scans, and summarize.
+- Main-agent conversation commands in Chinese and English for create with requested skills, split goals, list, create/list/update/delete skill definitions, show task artifacts, show memory candidates, show audit actions, explain state, inspect local workspace status, request clarification, reply to blocked tasks, pause, resume, cancel, reprioritize, reorder, requested-skill changes, dependency changes, resource-lock changes, memory list/approve/reject/update/delete review, scheduler scans, and summarize.
 - Optional main-agent LLM planner/advisor through the approved `oh-my-harness` `AgentHarness`; unsupported free-form task requests can be converted into bounded task-management plans through harness tools, deterministic task-state changes still run through product code, and the advisor composes the user-facing reply from the completed action context.
 - Main-agent task type conversion between one-off and recurring tasks.
 - Main-agent creation of GitHub repository tasks auto-adds the `github` requested skill and a `repo:owner/repo` resource lock when the request names a repository.
@@ -54,7 +54,7 @@ The repository now contains the first executable skeleton:
 - Skill management with automatic matching, task-type default rules, explicit task selection, and active-skill metadata plus `resource_path` content injection for workers.
 - Worker context includes allowed tools aggregated from active skill tool subsets and records them in attempt events.
 - Web skill management for creating, editing, and deleting trigger rules, tool subsets, and resource paths.
-- Long-term memory candidate listing and review through Web controls or main-agent conversation, optional confidence-based auto-approval, edit/delete controls, and approved-memory injection into worker context.
+- Long-term memory candidate listing, review, update, and deletion through Web controls or main-agent conversation, optional confidence-based auto-approval, edit/delete controls, and approved-memory injection into worker context.
 - Task detail history shows memory candidates proposed by that task.
 - Worker-completed results can submit explicit memory candidates for review.
 - Worker-completed results can report artifact metadata in task history.
