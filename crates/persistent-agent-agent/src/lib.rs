@@ -14,8 +14,8 @@ use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateSkill, CreateTask, Memory, MemoryId, MemoryStatus,
-    Skill, Task, TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus,
-    TaskType, UpdateMemory, UpdateSkill, UpdateTask,
+    Skill, Task, TaskAction, TaskArtifact, TaskAttempt, TaskAttemptEvent, TaskId, TaskNote,
+    TaskResourceLock, TaskStatus, TaskType, UpdateMemory, UpdateSkill, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -503,6 +503,32 @@ impl MainAgent {
             .await?;
 
         Ok(format_task_artifacts(&task, &artifacts))
+    }
+
+    pub async fn list_task_history(&self, id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(id).await?;
+        let attempts = self.db.list_task_attempts(id).await?;
+        let attempt_events = self.db.list_task_attempt_events(id).await?;
+        let actions = self.db.list_task_actions(id).await?;
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "list_task_history",
+                serde_json::json!({
+                    "attempt_count": attempts.len(),
+                    "event_count": attempt_events.len(),
+                    "action_count": actions.len(),
+                }),
+            )
+            .await?;
+
+        Ok(format_task_history(
+            &task,
+            &attempts,
+            &attempt_events,
+            &actions,
+        ))
     }
 
     pub async fn inspect_workspace_status(&self) -> anyhow::Result<String> {
@@ -1107,6 +1133,11 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::ListTaskHistory { selector } => match self.find_task(&selector).await?
+            {
+                Ok(task) => self.list_task_history(task.id).await?,
+                Err(reply) => reply,
+            },
             MainAgentIntent::InspectWorkspace => match self.inspect_workspace_status().await {
                 Ok(reply) => reply,
                 Err(error) => format!("I could not inspect the workspace status: {error}"),
@@ -1202,7 +1233,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1604,6 +1635,9 @@ pub enum MainAgentPlan {
     ListTaskArtifacts {
         selector: String,
     },
+    ListTaskHistory {
+        selector: String,
+    },
     InspectWorkspace,
     InspectWorkspaceFile {
         path: String,
@@ -1736,6 +1770,7 @@ impl MainAgentPlan {
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
+            Self::ListTaskHistory { selector } => MainAgentIntent::ListTaskHistory { selector },
             Self::InspectWorkspace => MainAgentIntent::InspectWorkspace,
             Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
             Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
@@ -1910,6 +1945,9 @@ enum MainAgentIntent {
     ListTaskArtifacts {
         selector: String,
     },
+    ListTaskHistory {
+        selector: String,
+    },
     InspectWorkspace,
     InspectWorkspaceFile {
         path: String,
@@ -2006,6 +2044,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(selector) = extract_task_artifacts_selector(trimmed, &normalized) {
         return MainAgentIntent::ListTaskArtifacts { selector };
+    }
+
+    if let Some(selector) = extract_task_history_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskHistory { selector };
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
@@ -2384,6 +2426,7 @@ async fn dispatch_main_agent_planner(
         "plan_explain_task_pool",
         "plan_explain_task",
         "plan_list_task_artifacts",
+        "plan_list_task_history",
         "plan_inspect_workspace",
         "plan_inspect_workspace_file",
         "plan_approve_memory",
@@ -2498,6 +2541,12 @@ fn main_agent_planner_tool_registry(
         "plan_list_task_artifacts",
         "Plan to list artifacts reported for one task.",
         PlannedTaskReadAction::ListArtifacts,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_history",
+        "Plan to list attempts, worker events, and audit actions for one task.",
+        PlannedTaskReadAction::ListHistory,
     )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
@@ -3658,6 +3707,7 @@ impl Tool for PlanConvertTaskTypeTool {
 enum PlannedTaskReadAction {
     Explain,
     ListArtifacts,
+    ListHistory,
 }
 
 struct PlanTaskReadTool {
@@ -3725,6 +3775,7 @@ impl Tool for PlanTaskReadTool {
                 PlannedTaskReadAction::ListArtifacts => {
                     MainAgentPlan::ListTaskArtifacts { selector }
                 }
+                PlannedTaskReadAction::ListHistory => MainAgentPlan::ListTaskHistory { selector },
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned task read action"))
@@ -4143,6 +4194,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     .replace(
         "- plan_list_memories: list memory candidates by status.",
         "- plan_update_memory: update an existing memory's scope, content, or confidence.\n- plan_delete_memory: delete an existing memory.\n- plan_list_memories: list memory candidates by status.\n- plan_show_scheduler_state: show current scheduler execution state without running a scan.",
+    )
+    .replace(
+        "- plan_list_task_artifacts: list artifacts for one task.",
+        "- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.",
     )
 }
 
@@ -4732,6 +4787,78 @@ fn extract_task_artifacts_selector(content: &str, normalized: &str) -> Option<St
     (!selector.is_empty() && selector != content).then_some(selector)
 }
 
+fn extract_task_history_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "history",
+            "execution history",
+            "attempt",
+            "attempts",
+            "worker event",
+            "worker events",
+            "run evidence",
+            "audit trail",
+            "\u{5386}\u{53f2}",
+            "\u{6267}\u{884c}\u{8bb0}\u{5f55}",
+            "\u{5c1d}\u{8bd5}",
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+    {
+        return None;
+    }
+
+    for prefix in [
+        "show history for task",
+        "list history for task",
+        "show execution history for task",
+        "list execution history for task",
+        "show attempts for task",
+        "list attempts for task",
+        "show worker events for task",
+        "list worker events for task",
+        "task history",
+        "task attempts",
+        "task worker events",
+    ] {
+        if let Some(index) = normalized.find(prefix) {
+            let selector = content[index + prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\'']);
+            if !selector.is_empty() {
+                return Some(selector.to_owned());
+            }
+        }
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "show",
+            "list",
+            "history",
+            "execution",
+            "attempts",
+            "attempt",
+            "worker",
+            "events",
+            "event",
+            "run",
+            "evidence",
+            "audit",
+            "trail",
+            ZH_LIST,
+            "\u{67e5}\u{770b}",
+            "\u{5386}\u{53f2}",
+            "\u{6267}\u{884c}",
+            "\u{8bb0}\u{5f55}",
+            "\u{5c1d}\u{8bd5}",
+        ],
+    );
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
 fn is_scheduler_scan_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -4958,6 +5085,61 @@ fn format_task_artifacts(task: &Task, artifacts: &[TaskArtifact]) -> String {
     }
     if artifacts.len() > 10 {
         lines.push(format!("- ... and {} more", artifacts.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_history(
+    task: &Task,
+    attempts: &[TaskAttempt],
+    events: &[TaskAttemptEvent],
+    actions: &[TaskAction],
+) -> String {
+    let mut lines = vec![format!(
+        "Task '{}' history: {} attempt(s), {} worker event(s), {} action(s).",
+        task.title,
+        attempts.len(),
+        events.len(),
+        actions.len()
+    )];
+
+    if attempts.is_empty() {
+        lines.push("Attempts: none.".to_owned());
+    } else {
+        lines.push("Recent attempts:".to_owned());
+        for attempt in attempts.iter().rev().take(5) {
+            lines.push(format!(
+                "- {} [{}] {}",
+                attempt.id.to_string().chars().take(8).collect::<String>(),
+                attempt.status,
+                attempt.summary.as_deref().unwrap_or("no summary")
+            ));
+        }
+    }
+
+    if !events.is_empty() {
+        lines.push("Recent worker events:".to_owned());
+        for event in events.iter().rev().take(8) {
+            lines.push(format!(
+                "- {} [{}] {}",
+                event.id.to_string().chars().take(8).collect::<String>(),
+                event.event_type,
+                event.message
+            ));
+        }
+    }
+
+    if !actions.is_empty() {
+        lines.push("Recent task actions:".to_owned());
+        for action in actions.iter().rev().take(5) {
+            lines.push(format!(
+                "- {} [{}] {}",
+                action.id.to_string().chars().take(8).collect::<String>(),
+                action.actor,
+                action.action_type
+            ));
+        }
     }
 
     lines.join("\n")
@@ -6403,6 +6585,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_history_intents() {
+        assert_eq!(
+            parse_intent("show history for task Deploy release"),
+            MainAgentIntent::ListTaskHistory {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release worker events"),
+            MainAgentIntent::ListTaskHistory {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{6267}\u{884c}\u{8bb0}\u{5f55}"
+            ),
+            MainAgentIntent::ListTaskHistory {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_scheduler_scan_intents() {
         assert_eq!(
             parse_intent("run scheduler tick"),
@@ -7579,6 +7785,21 @@ mod tests {
             Some("Generated release notes"),
         )
         .await?;
+        let attempt = db
+            .create_attempt(
+                task.id,
+                TaskStatus::Completed,
+                Some("published release notes"),
+            )
+            .await?;
+        db.record_attempt_event(
+            attempt.id,
+            task.id,
+            "worker_completed",
+            "Worker published release notes.",
+            serde_json::json!({ "summary": "published release notes" }),
+        )
+        .await?;
 
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ListTaskArtifacts {
@@ -7655,6 +7876,32 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "inspect_scheduler_state")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskHistory {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Show me what happened during that deployment task.".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("worker_completed")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_history")
         );
 
         Ok(())
@@ -8609,6 +8856,71 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "list_task_artifacts")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_task_history_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let attempt = db
+            .create_attempt(
+                task.id,
+                TaskStatus::Completed,
+                Some("created release report"),
+            )
+            .await?;
+        db.record_attempt_event(
+            attempt.id,
+            task.id,
+            "worker_completed",
+            "Worker completed the release task.",
+            serde_json::json!({ "summary": "created release report" }),
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show history for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' history")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("worker_completed")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("created release report")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_history")
         );
 
         Ok(())
