@@ -11,6 +11,10 @@ The only approved agent framework sources are:
 - `llm_harness_core` from `https://github.com/oh-my-harness/llm-harness-core.git`
 - `llm_harness_runtime` from `https://github.com/oh-my-harness/llm-harness-runtime.git`
 
+Runtime v0.2 publishes `llm-harness-agent`, `llm-harness-loop`, `llm-harness-runtime`, and
+runtime extension crates from one workspace. Product code should keep those crates on the same git
+source to avoid duplicate `Tool`, `AgentEvent`, and `ExecutionEnv` trait instances.
+
 Do not use crates or repositories from other publishers as substitutes for the provider adapter,
 agent loop, runtime, tool registry, hooks, sub-agent support, or skill system.
 
@@ -21,8 +25,8 @@ agent loop, runtime, tool registry, hooks, sub-agent support, or skill system.
 3. Remove the temporary `HarnessWorker` built on the non-approved runtime loop. Done.
 4. Restore the worker path to either:
    - `StubWorker` when no model key is configured, or
-   - `OhMyHarnessWorker`, which executes through `AgentHarness` from `llm-harness-core` and calls DeepSeek through the approved `llm-api-adapter`.
-5. Add `oh-my-harness` core/runtime dependencies only after their public API is inspected and the worker can use them directly. Core is wired; runtime is still pending repository availability.
+   - `OhMyHarnessWorker`, which executes through `AgentHarness` from the approved runtime v0.2 `llm-harness-agent` package and calls DeepSeek through the approved `llm-api-adapter`. Done.
+5. Add `oh-my-harness` core/runtime dependencies only after their public API is inspected and the worker can use them directly. Done for `llm-harness-agent`, `llm-harness-runtime`, and `llm-harness-runtime-sandbox-os`.
 
 ## Target Worker Shape
 
@@ -34,9 +38,11 @@ Scheduler -> TaskWorker -> OhMyHarnessWorker -> AgentHarness -> WorkerResult
 
 `OhMyHarnessWorker` must use:
 
-- `AgentHarness` from `llm-harness-core` (wired)
+- `AgentHarness` from the approved runtime v0.2 `llm-harness-agent` package (wired)
 - provider calls through `llm-api-adapter` (wired)
-- runtime tool registry, hooks, audit, and sub-agent services from `llm-harness-runtime` (pending repository availability)
+- runtime `InMemoryToolRegistry` from `llm-harness-runtime` (wired)
+- runtime `OsEnvSandbox` from `llm-harness-runtime-sandbox-os` (wired)
+- runtime hooks, audit, sub-agent, auth/approval, and budget services (available as dependencies; product policies still need dedicated feature work before they should affect live task execution)
 
 ## Product Context To Inject
 

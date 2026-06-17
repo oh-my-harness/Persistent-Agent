@@ -1043,9 +1043,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "llm-harness"
-version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+name = "llm-harness-agent"
+version = "0.2.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-runtime.git#474406099b18a58b0a9cfc2b6fefa0b9dac1eb7e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1061,8 +1061,8 @@ dependencies = [
 
 [[package]]
 name = "llm-harness-loop"
-version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+version = "0.2.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-runtime.git#474406099b18a58b0a9cfc2b6fefa0b9dac1eb7e"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1078,9 +1078,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-harness-runtime"
+version = "0.2.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-runtime.git#474406099b18a58b0a9cfc2b6fefa0b9dac1eb7e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "llm-harness-agent",
+ "llm-harness-loop",
+ "llm-harness-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "llm-harness-runtime-sandbox-os"
+version = "0.2.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-runtime.git#474406099b18a58b0a9cfc2b6fefa0b9dac1eb7e"
+dependencies = [
+ "chrono",
+ "futures",
+ "llm-harness-runtime",
+ "llm-harness-types",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "llm-harness-types"
-version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-harness-core.git#8ec31bbb88eaedcef72e162d2c5f81a2129975ca"
+version = "0.2.0"
+source = "git+https://github.com/oh-my-harness/llm-harness-runtime.git#474406099b18a58b0a9cfc2b6fefa0b9dac1eb7e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1417,8 +1452,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "llm-harness",
+ "llm-harness-agent",
  "llm-harness-loop",
+ "llm-harness-runtime",
+ "llm-harness-runtime-sandbox-os",
  "llm_adapter",
  "persistent-agent-db",
  "persistent-agent-domain",
@@ -2352,7 +2389,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "pin-project-lite",
  "tokio",
 ]

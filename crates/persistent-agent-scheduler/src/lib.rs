@@ -1,10 +1,14 @@
 use async_trait::async_trait;
 use llm_adapter::deepseek;
-use llm_harness::prelude::{
+use llm_harness_agent::prelude::{
     AgentHarness, AgentHarnessEvent, AgentHarnessOptions, ContentBlock, Tool, ToolContext,
-    ToolError, ToolExecutionMode, ToolResult, UnsupportedEnv,
+    ToolError, ToolExecutionMode, ToolResult,
 };
 use llm_harness_loop::LlmClient;
+use llm_harness_runtime::{
+    InMemoryToolRegistry, ResourceLimits, Sandbox, SandboxConfig, ToolRegistry,
+};
+use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationMessage, CreateMemory, CreateTask, Memory, MemoryStatus, Skill, Task, TaskNote,
@@ -651,19 +655,40 @@ async fn dispatch_task_with_harness(
 ) -> anyhow::Result<WorkerResult> {
     let client = Arc::new(deepseek::client(config.api_key)) as Arc<dyn LlmClient>;
     let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
+    let tool_registry = worker_tool_registry(state.clone());
+    let sandbox = OsEnvSandbox::new(SandboxConfig {
+        fs_allowlist: Vec::new(),
+        fs_denylist: Vec::new(),
+        net_allowlist: Vec::new(),
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: std::env::current_dir().ok(),
+    });
+    sandbox.start().await?;
+
     let mut opts = AgentHarnessOptions::new(config.model);
     opts.max_tokens = 1200;
     opts.system_prompt = Some(HARNESS_WORKER_SYSTEM_PROMPT.to_owned());
-    opts.tools = worker_tools(state.clone());
+    opts.tools = tool_registry.subset(&[
+        "remember",
+        "record_artifact",
+        "create_follow_up_task",
+        "complete_task",
+        "block_task",
+    ]);
 
-    let harness = AgentHarness::new_in_memory(client, Arc::new(UnsupportedEnv::new()), opts).await;
+    let harness = AgentHarness::new_in_memory(client, sandbox.env(), opts).await;
     let mut events = harness.subscribe();
     harness.prompt(prompt).await?;
     harness.wait_for_idle().await;
 
     let mut assistant_text = String::new();
     while let Ok(event) = events.try_recv() {
-        if let AgentHarnessEvent::Agent(llm_harness::prelude::AgentEvent::AgentEnd {
+        if let AgentHarnessEvent::Agent(llm_harness_agent::prelude::AgentEvent::AgentEnd {
             new_messages,
         }) = event.as_ref()
         {
@@ -713,7 +738,7 @@ impl HarnessWorkerState {
     }
 }
 
-fn worker_tools(state: Arc<Mutex<HarnessWorkerState>>) -> Vec<Arc<dyn Tool>> {
+fn product_lifecycle_tools(state: Arc<Mutex<HarnessWorkerState>>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(RememberTool::new(state.clone())),
         Arc::new(RecordArtifactTool::new(state.clone())),
@@ -721,6 +746,14 @@ fn worker_tools(state: Arc<Mutex<HarnessWorkerState>>) -> Vec<Arc<dyn Tool>> {
         Arc::new(CompleteTaskTool::new(state.clone())),
         Arc::new(BlockTaskTool::new(state)),
     ]
+}
+
+fn worker_tool_registry(state: Arc<Mutex<HarnessWorkerState>>) -> Arc<InMemoryToolRegistry> {
+    let registry = Arc::new(InMemoryToolRegistry::new());
+    for tool in product_lifecycle_tools(state) {
+        registry.register(tool);
+    }
+    registry
 }
 
 struct CompleteTaskTool {
@@ -1067,10 +1100,10 @@ fn required_string(args: &serde_json::Value, field: &str) -> Result<String, Tool
         .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
 }
 
-fn assistant_text_from_messages(messages: &[llm_harness::prelude::AgentMessage]) -> String {
+fn assistant_text_from_messages(messages: &[llm_harness_agent::prelude::AgentMessage]) -> String {
     let mut output = String::new();
     for message in messages {
-        let llm_harness::prelude::AgentMessage::Assistant(assistant) = message else {
+        let llm_harness_agent::prelude::AgentMessage::Assistant(assistant) = message else {
             continue;
         };
         for block in &assistant.content {
@@ -1634,7 +1667,14 @@ mod tests {
     #[tokio::test]
     async fn harness_worker_registers_product_lifecycle_tools() {
         let state = Arc::new(Mutex::new(HarnessWorkerState::default()));
-        let tools = worker_tools(state);
+        let registry = worker_tool_registry(state);
+        let tools = registry.subset(&[
+            "remember",
+            "record_artifact",
+            "create_follow_up_task",
+            "complete_task",
+            "block_task",
+        ]);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
 
         assert_eq!(

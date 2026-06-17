@@ -20,7 +20,7 @@ product code must not substitute unrelated packages with similar names. Crates s
 `llm_adapter` or `llm_runtime` from non-`oh-my-harness` publishers are not approved substitutes for
 the agent loop, provider adapter, runtime, tool registry, or skill system.
 
-Product code should prefer `AgentHarness` from `oh-my-harness/llm-harness-core` as the product-facing agent entry point. The current DeepSeek worker already uses this path and exposes product lifecycle tools through the harness loop; `llm-harness-runtime` remains the next layer for OS tools, sandboxing, sub-agents, audit, auth, approval, and budget policy.
+Product code should prefer `AgentHarness` as the product-facing agent entry point. For runtime v0.2, Persistent Agent uses `llm-harness-agent`, `llm-harness-loop`, `llm-harness-runtime`, and `llm-harness-runtime-sandbox-os` from the same `oh-my-harness/llm-harness-runtime` git source so agent/runtime traits remain compatible. The current DeepSeek worker exposes product lifecycle tools through runtime `InMemoryToolRegistry` and runs the harness against runtime `OsEnvSandbox`; sub-agents, audit, auth, approval, and budget controls are available dependencies but still require product policy integration.
 
 Use runtime services where they already match product concerns:
 
