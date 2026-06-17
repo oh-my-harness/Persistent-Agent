@@ -1381,6 +1381,13 @@ pub enum MainAgentPlan {
     CreateSkillDefinition {
         input: CreateSkill,
     },
+    UpdateSkillDefinition {
+        selector: String,
+        input: UpdateSkill,
+    },
+    DeleteSkillDefinition {
+        selector: String,
+    },
     ListTasks,
     Summarize,
     RunSchedulerTick,
@@ -1427,6 +1434,12 @@ impl MainAgentPlan {
             },
             Self::CreateSkillDefinition { input } => {
                 MainAgentIntent::CreateSkillDefinition { input }
+            }
+            Self::UpdateSkillDefinition { selector, input } => {
+                MainAgentIntent::UpdateSkillDefinition { selector, input }
+            }
+            Self::DeleteSkillDefinition { selector } => {
+                MainAgentIntent::DeleteSkillDefinition { selector }
             }
             Self::ListTasks => MainAgentIntent::ListTasks,
             Self::Summarize => MainAgentIntent::Summarize,
@@ -2029,6 +2042,8 @@ async fn dispatch_main_agent_planner(
         "plan_add_requested_skills",
         "plan_remove_requested_skills",
         "plan_create_skill_definition",
+        "plan_update_skill_definition",
+        "plan_delete_skill_definition",
         "plan_list_tasks",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
@@ -2080,6 +2095,8 @@ fn main_agent_planner_tool_registry(
         PlannedRequestedSkillsAction::Remove,
     )));
     registry.register(Arc::new(PlanCreateSkillDefinitionTool::new(state.clone())));
+    registry.register(Arc::new(PlanUpdateSkillDefinitionTool::new(state.clone())));
+    registry.register(Arc::new(PlanDeleteSkillDefinitionTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_list_tasks",
@@ -2570,6 +2587,151 @@ impl Tool for PlanCreateSkillDefinitionTool {
     }
 }
 
+struct PlanUpdateSkillDefinitionTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanUpdateSkillDefinitionTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Skill id, name, or name fragment identifying the skill."
+                    },
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "trigger_rules": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "tool_subset": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "resource_path": { "type": "string" },
+                    "clear_resource_path": { "type": "boolean" }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanUpdateSkillDefinitionTool {
+    fn name(&self) -> &str {
+        "plan_update_skill_definition"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to update fields on an existing skill definition."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let resource_path = if args
+                .get("clear_resource_path")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                Some(None)
+            } else {
+                args.get("resource_path")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .map(Some)
+            };
+            self.state.lock().await.plan = Some(MainAgentPlan::UpdateSkillDefinition {
+                selector,
+                input: UpdateSkill {
+                    name: planner_optional_string(&args, "name"),
+                    description: planner_optional_string(&args, "description"),
+                    trigger_rules: planner_optional_string_array(&args, "trigger_rules"),
+                    tool_subset: planner_optional_string_array(&args, "tool_subset"),
+                    resource_path,
+                },
+            });
+            Ok(planner_tool_result("planned skill definition update"))
+        })
+    }
+}
+
+struct PlanDeleteSkillDefinitionTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanDeleteSkillDefinitionTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Skill id, name, or name fragment identifying the skill."
+                    }
+                },
+                "required": ["selector"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanDeleteSkillDefinitionTool {
+    fn name(&self) -> &str {
+        "plan_delete_skill_definition"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to delete an existing skill definition."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            self.state.lock().await.plan = Some(MainAgentPlan::DeleteSkillDefinition { selector });
+            Ok(planner_tool_result("planned skill definition deletion"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -2635,6 +2797,14 @@ fn planner_required_string(args: &serde_json::Value, field: &str) -> Result<Stri
         .ok_or_else(|| ToolError::InvalidArguments(format!("{field} is required")))
 }
 
+fn planner_optional_string(args: &serde_json::Value, field: &str) -> Option<String> {
+    args.get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn planner_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
     args.get(field)
         .and_then(|value| value.as_array())
@@ -2650,6 +2820,10 @@ fn planner_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn planner_optional_string_array(args: &serde_json::Value, field: &str) -> Option<Vec<String>> {
+    args.get(field).map(|_| planner_string_array(args, field))
+}
+
 fn planner_tool_result(message: &str) -> ToolResult {
     ToolResult {
         content: vec![ContentBlock::Text {
@@ -2662,7 +2836,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume one existing task by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_advisor_recent_messages(&context.recent_messages),
@@ -5422,6 +5596,91 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "llm_planner_intent")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_skill_definition_updates() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "github".to_owned(),
+                description: "Old GitHub skill".to_owned(),
+                trigger_rules: vec!["github".to_owned()],
+                tool_subset: vec!["network".to_owned()],
+                resource_path: Some("skills/github".to_owned()),
+            },
+            "test",
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::UpdateSkillDefinition {
+                selector: "github".to_owned(),
+                input: UpdateSkill {
+                    name: None,
+                    description: Some("GitHub issue and pull request work".to_owned()),
+                    trigger_rules: Some(vec!["github".to_owned(), "issue".to_owned()]),
+                    tool_subset: Some(vec!["github".to_owned(), "network".to_owned()]),
+                    resource_path: Some(None),
+                },
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you tune that reusable capability for issue work?".to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "GitHub issue and pull request work");
+        assert_eq!(
+            skills[0].trigger_rules,
+            vec!["github".to_owned(), "issue".to_owned()]
+        );
+        assert_eq!(
+            skills[0].tool_subset,
+            vec!["github".to_owned(), "network".to_owned()]
+        );
+        assert_eq!(skills[0].resource_path, None);
+        assert!(response.assistant_message.content.contains("Updated skill"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_skill_definition_deletion() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        db.create_skill(
+            CreateSkill {
+                name: "obsolete".to_owned(),
+                description: "No longer useful".to_owned(),
+                trigger_rules: vec!["obsolete".to_owned()],
+                tool_subset: Vec::new(),
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::DeleteSkillDefinition {
+                selector: "obsolete".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you remove the obsolete reusable skill?".to_owned(),
+            })
+            .await?;
+        let skills = db.list_skills().await?;
+
+        assert!(skills.is_empty());
+        assert!(response.assistant_message.content.contains("Deleted skill"));
 
         Ok(())
     }
