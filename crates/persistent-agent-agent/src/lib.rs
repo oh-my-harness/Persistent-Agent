@@ -3,7 +3,7 @@ use std::{env, fs, path::Path, process::Command};
 use persistent_agent_db::Db;
 use persistent_agent_domain::{
     ConversationId, ConversationMessage, CreateTask, Memory, MemoryId, MemoryStatus, Task,
-    TaskAction, TaskId, TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
+    TaskAction, TaskArtifact, TaskId, TaskNote, TaskResourceLock, TaskStatus, TaskType, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,8 @@ const ZH_SKILL: &str = "\u{6280}\u{80fd}";
 const ZH_SCAN: &str = "\u{626b}\u{63cf}";
 const ZH_RUN: &str = "\u{8fd0}\u{884c}";
 const ZH_SCHEDULER: &str = "\u{8c03}\u{5ea6}";
+const ZH_ARTIFACT: &str = "\u{4ea7}\u{7269}";
+const ZH_RESULT: &str = "\u{6210}\u{679c}";
 
 #[derive(Clone)]
 pub struct MainAgent {
@@ -362,6 +364,21 @@ impl MainAgent {
             .await?;
 
         Ok(format_task_explanation(&task, &dependency_states))
+    }
+
+    pub async fn list_task_artifacts(&self, id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(id).await?;
+        let artifacts = self.db.list_task_artifacts(id).await?;
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "list_task_artifacts",
+                serde_json::json!({ "artifact_count": artifacts.len() }),
+            )
+            .await?;
+
+        Ok(format_task_artifacts(&task, &artifacts))
     }
 
     pub async fn inspect_workspace_status(&self) -> anyhow::Result<String> {
@@ -831,6 +848,12 @@ impl MainAgent {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
             },
+            MainAgentIntent::ListTaskArtifacts { selector } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => self.list_task_artifacts(task.id).await?,
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::InspectWorkspace => match self.inspect_workspace_status().await {
                 Ok(reply) => reply,
                 Err(error) => format!("I could not inspect the workspace status: {error}"),
@@ -871,7 +894,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, show task artifacts, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, pause/resume/cancel tasks, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, approve/reject memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1051,6 +1074,9 @@ enum MainAgentIntent {
     ExplainTask {
         selector: String,
     },
+    ListTaskArtifacts {
+        selector: String,
+    },
     InspectWorkspace,
     InspectWorkspaceFile {
         path: String,
@@ -1109,6 +1135,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_global_action_list_request(&normalized) {
         return MainAgentIntent::ListGlobalActions;
+    }
+
+    if let Some(selector) = extract_task_artifacts_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskArtifacts { selector };
     }
 
     if let Some(intent) = parse_dependency_intent(trimmed, &normalized) {
@@ -1424,6 +1454,60 @@ fn is_global_action_list_request(normalized: &str) -> bool {
     ) && !is_create_request(normalized)
 }
 
+fn extract_task_artifacts_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "artifact",
+            "artifacts",
+            "outputs",
+            "output",
+            ZH_ARTIFACT,
+            ZH_RESULT,
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+    {
+        return None;
+    }
+
+    for prefix in [
+        "show artifacts for task",
+        "list artifacts for task",
+        "show outputs for task",
+        "list outputs for task",
+        "task artifacts",
+        "task output",
+        "task outputs",
+    ] {
+        if let Some(index) = normalized.find(prefix) {
+            let selector = content[index + prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\'']);
+            if !selector.is_empty() {
+                return Some(selector.to_owned());
+            }
+        }
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "show",
+            "list",
+            "artifacts",
+            "artifact",
+            "outputs",
+            "output",
+            ZH_LIST,
+            "\u{67e5}\u{770b}",
+            ZH_ARTIFACT,
+            ZH_RESULT,
+        ],
+    );
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
 fn is_scheduler_scan_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -1544,6 +1628,35 @@ fn format_global_action_list(actions: &[TaskAction]) -> String {
             action.action_type,
             action.details
         ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_artifacts(task: &Task, artifacts: &[TaskArtifact]) -> String {
+    if artifacts.is_empty() {
+        return format!("Task '{}' has no reported artifacts yet.", task.title);
+    }
+
+    let mut lines = vec![format!(
+        "Task '{}' has {} artifact(s):",
+        task.title,
+        artifacts.len()
+    )];
+    for artifact in artifacts.iter().take(10) {
+        let summary = artifact
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| format!(" - {summary}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {} [{}] {}{}",
+            artifact.name, artifact.artifact_type, artifact.uri, summary
+        ));
+    }
+    if artifacts.len() > 10 {
+        lines.push(format!("- ... and {} more", artifacts.len() - 10));
     }
 
     lines.join("\n")
@@ -2677,6 +2790,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_artifact_list_intents() {
+        assert_eq!(
+            parse_intent("show artifacts for task Deploy release"),
+            MainAgentIntent::ListTaskArtifacts {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release outputs"),
+            MainAgentIntent::ListTaskArtifacts {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{4ea7}\u{7269}"
+            ),
+            MainAgentIntent::ListTaskArtifacts {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_scheduler_scan_intents() {
         assert_eq!(
             parse_intent("run scheduler tick"),
@@ -3377,6 +3514,62 @@ mod tests {
         assert!(global_actions.iter().any(|action| {
             action.action_type == "list_global_actions" && action.details["limit"] == 10
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_task_artifacts_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let attempt = db
+            .create_attempt(task.id, TaskStatus::Completed, Some("created report"))
+            .await?;
+        db.record_task_artifact(
+            task.id,
+            Some(attempt.id),
+            "release-report.md",
+            "file",
+            "file://release-report.md",
+            Some("Release summary"),
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show artifacts for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("release-report.md")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Release summary")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_artifacts")
+        );
 
         Ok(())
     }
