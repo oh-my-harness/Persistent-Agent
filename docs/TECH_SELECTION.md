@@ -221,7 +221,7 @@ It should:
 - summarize the task pool and explain why work is or is not running;
 - perform lightweight local inspection when that helps task planning;
 - scan runnable tasks through scheduled ticks, manual API calls, or main-agent conversation requests;
-- move a selected task to the front of runnable work and request an immediate scheduler scan without bypassing the scheduler/worker path;
+- move a selected task, or the current next runnable task by scheduler order, to the front of runnable work and request an immediate scheduler scan without bypassing the scheduler/worker path;
 - claim a task lease;
 - resolve requested and matched skills;
 - construct or request a worker agent;
