@@ -6651,6 +6651,12 @@ fn is_waiting_for_schedule_list_request(normalized: &str) -> bool {
 }
 
 fn parse_task_status_list_intent(normalized: &str) -> Option<MainAgentIntent> {
+    if is_current_running_work_request(normalized) {
+        return Some(MainAgentIntent::ListTasksByStatus {
+            status: TaskStatus::Running,
+        });
+    }
+
     if is_create_request(normalized)
         || !contains_any(
             normalized,
@@ -6663,6 +6669,44 @@ fn parse_task_status_list_intent(normalized: &str) -> Option<MainAgentIntent> {
 
     task_status_from_list_request(normalized)
         .map(|status| MainAgentIntent::ListTasksByStatus { status })
+}
+
+fn is_current_running_work_request(normalized: &str) -> bool {
+    !is_create_request(normalized)
+        && contains_any(
+            normalized,
+            &[
+                "what is running",
+                "what's running",
+                "currently running",
+                "running now",
+                "current work",
+                "current task",
+                "active work",
+                "active task",
+                "what is executing",
+                "what's executing",
+                "executing now",
+                "\u{6b63}\u{5728}\u{8fd0}\u{884c}",
+                "\u{6b63}\u{5728}\u{6267}\u{884c}",
+                "\u{5f53}\u{524d}\u{4efb}\u{52a1}",
+            ],
+        )
+        && contains_any(
+            normalized,
+            &[
+                "what",
+                "show",
+                "list",
+                "which",
+                "current",
+                "active",
+                "\u{67e5}\u{770b}",
+                ZH_LIST,
+                "\u{54ea}",
+                "\u{4ec0}\u{4e48}",
+            ],
+        )
 }
 
 fn task_status_from_list_request(normalized: &str) -> Option<TaskStatus> {
@@ -7647,7 +7691,39 @@ fn format_task_list(tasks: &[Task]) -> String {
 }
 
 fn format_task_list_by_status(status: TaskStatus, tasks: &[Task]) -> String {
+    if status == TaskStatus::Running {
+        return format_running_task_list(tasks);
+    }
     format_task_list_with_title(&format!("{} tasks", status), tasks)
+}
+
+fn format_running_task_list(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "No running tasks.".to_owned();
+    }
+
+    let mut lines = vec![format!("Running tasks has {} task(s):", tasks.len())];
+    for task in tasks.iter().take(10) {
+        let owner = task.lease_owner.as_deref().unwrap_or("unknown worker");
+        let lease = task
+            .lease_expires_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "no lease expiry recorded".to_owned());
+        lines.push(format!(
+            "- {} [attempt {} worker {} lease_expires {}] {}",
+            task.id.to_string().chars().take(8).collect::<String>(),
+            task.attempt_count,
+            owner,
+            lease,
+            task.title
+        ));
+    }
+    if tasks.len() > 10 {
+        lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+    lines.push("Use: show history for task <title>".to_owned());
+
+    lines.join("\n")
 }
 
 fn format_task_list_with_title(title: &str, tasks: &[Task]) -> String {
@@ -10321,6 +10397,18 @@ mod tests {
             parse_intent("show queued tasks"),
             MainAgentIntent::ListTasksByStatus {
                 status: TaskStatus::Queued
+            }
+        );
+        assert_eq!(
+            parse_intent("show active tasks"),
+            MainAgentIntent::ListTasksByStatus {
+                status: TaskStatus::Running
+            }
+        );
+        assert_eq!(
+            parse_intent("show current work"),
+            MainAgentIntent::ListTasksByStatus {
+                status: TaskStatus::Running
             }
         );
         assert_eq!(
@@ -14320,6 +14408,51 @@ mod tests {
                     .get("status")
                     .and_then(serde_json::Value::as_str)
                     == Some("failed")
+        }));
+
+        let running = agent
+            .create_task(CreateTask {
+                title: "Run integration smoke".to_owned(),
+                description: "Exercise the current worker path".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 2,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        db.claim_next_runnable("worker-a", 60).await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show active tasks".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+        let running = db.get_task(running.id).await?;
+
+        assert_eq!(running.status, TaskStatus::Running);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Running tasks has 1 task")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Run integration smoke")
+        );
+        assert!(response.assistant_message.content.contains("worker-a"));
+        assert!(response.assistant_message.content.contains("lease_expires"));
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "list_tasks_by_status"
+                && action
+                    .details
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running")
         }));
 
         Ok(())
