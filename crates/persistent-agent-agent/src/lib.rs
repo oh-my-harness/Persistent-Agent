@@ -629,6 +629,10 @@ impl MainAgent {
         Ok(tasks)
     }
 
+    pub async fn recover_expired_running_tasks(&self) -> anyhow::Result<Vec<Task>> {
+        self.db.recover_expired_running_tasks("main_agent").await
+    }
+
     pub async fn list_waiting_for_user_tasks(&self) -> anyhow::Result<String> {
         let tasks = self
             .db
@@ -1920,6 +1924,10 @@ impl MainAgent {
                 let tasks = self.list_task_pool_by_status(status).await?;
                 format_task_list_by_status(status, &tasks)
             }
+            MainAgentIntent::RecoverExpiredRunningTasks => {
+                let tasks = self.recover_expired_running_tasks().await?;
+                format_recovered_running_tasks(&tasks)
+            }
             MainAgentIntent::ListWaitingForUserTasks => self.list_waiting_for_user_tasks().await?,
             MainAgentIntent::ListWaitingForScheduleTasks => {
                 self.list_waiting_for_schedule_tasks().await?
@@ -2546,6 +2554,7 @@ pub enum MainAgentPlan {
     ListTasksByStatus {
         status: TaskStatus,
     },
+    RecoverExpiredRunningTasks,
     ExplainTaskPool,
     RecommendNextAction,
     ExplainTask {
@@ -2743,6 +2752,7 @@ impl MainAgentPlan {
             Self::ListWaitingForUserTasks => MainAgentIntent::ListWaitingForUserTasks,
             Self::ListWaitingForScheduleTasks => MainAgentIntent::ListWaitingForScheduleTasks,
             Self::ListTasksByStatus { status } => MainAgentIntent::ListTasksByStatus { status },
+            Self::RecoverExpiredRunningTasks => MainAgentIntent::RecoverExpiredRunningTasks,
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
             Self::RecommendNextAction => MainAgentIntent::RecommendNextAction,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
@@ -2969,6 +2979,7 @@ enum MainAgentIntent {
     ListTasksByStatus {
         status: TaskStatus,
     },
+    RecoverExpiredRunningTasks,
     ListWaitingForUserTasks,
     ListWaitingForScheduleTasks,
     ListGlobalActions,
@@ -3087,6 +3098,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(intent) = parse_run_task_now_intent(trimmed, &normalized) {
         return intent;
+    }
+
+    if is_recover_expired_running_tasks_request(&normalized) {
+        return MainAgentIntent::RecoverExpiredRunningTasks;
     }
 
     if is_scheduler_scan_request(&normalized) {
@@ -3591,6 +3606,7 @@ async fn dispatch_main_agent_planner(
         "plan_list_main_agent_actions",
         "plan_list_waiting_for_user_tasks",
         "plan_list_waiting_for_schedule_tasks",
+        "plan_recover_expired_running_tasks",
         "plan_explain_task_pool",
         "plan_recommend_next_action",
         "plan_explain_task",
@@ -3759,6 +3775,12 @@ fn main_agent_planner_tool_registry(
         "plan_list_waiting_for_schedule_tasks",
         "Plan to list tasks that are waiting for their next schedule.",
         MainAgentPlan::ListWaitingForScheduleTasks,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_recover_expired_running_tasks",
+        "Plan to recover expired running task leases and requeue those tasks.",
+        MainAgentPlan::RecoverExpiredRunningTasks,
     )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
@@ -6052,6 +6074,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
         "- plan_list_tasks: list tasks.",
         "- plan_list_tasks: list tasks.\n- plan_list_tasks_by_status: list tasks filtered by lifecycle status.",
     )
+    .replace(
+        "- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.",
+        "- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_recover_expired_running_tasks: recover expired running task leases and requeue those tasks.",
+    )
 }
 
 fn main_agent_advisor_prompt(context: &MainAgentAdviceContext) -> String {
@@ -7516,6 +7542,28 @@ fn is_next_action_recommendation_request(normalized: &str) -> bool {
     ) && !is_create_request(normalized)
 }
 
+fn is_recover_expired_running_tasks_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "recover expired running tasks",
+            "recover expired tasks",
+            "recover stale running tasks",
+            "recover stale tasks",
+            "recover expired leases",
+            "recover stale leases",
+            "requeue expired running tasks",
+            "requeue stale running tasks",
+            "requeue expired leases",
+            "clear expired leases",
+            "clear stale leases",
+            "\u{6062}\u{590d}\u{8fc7}\u{671f}\u{4efb}\u{52a1}",
+            "\u{6062}\u{590d}\u{8fc7}\u{671f}\u{79df}\u{7ea6}",
+            "\u{91cd}\u{65b0}\u{5165}\u{961f}\u{8fc7}\u{671f}\u{4efb}\u{52a1}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
 fn is_scheduler_state_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -7722,6 +7770,26 @@ fn format_running_task_list(tasks: &[Task]) -> String {
         lines.push(format!("- ... and {} more", tasks.len() - 10));
     }
     lines.push("Use: show history for task <title>".to_owned());
+
+    lines.join("\n")
+}
+
+fn format_recovered_running_tasks(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "No expired running task leases needed recovery.".to_owned();
+    }
+
+    let mut lines = vec![format!(
+        "Recovered {} expired running task lease(s) and requeued them:",
+        tasks.len()
+    )];
+    for task in tasks.iter().take(10) {
+        lines.push(format!("- {}", format_task_brief(task)));
+    }
+    if tasks.len() > 10 {
+        lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+    lines.push("Use: run next task".to_owned());
 
     lines.join("\n")
 }
@@ -10554,6 +10622,14 @@ mod tests {
             MainAgentIntent::RunSchedulerTick
         );
         assert_eq!(
+            parse_intent("recover expired running tasks"),
+            MainAgentIntent::RecoverExpiredRunningTasks
+        );
+        assert_eq!(
+            parse_intent("requeue stale running tasks"),
+            MainAgentIntent::RecoverExpiredRunningTasks
+        );
+        assert_eq!(
             parse_intent("\u{626b}\u{63cf}\u{4efb}\u{52a1}\u{6c60}"),
             MainAgentIntent::RunSchedulerTick
         );
@@ -11940,6 +12016,55 @@ mod tests {
             updated_low_priority.queue_position,
             low_priority.queue_position
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_expired_lease_recovery() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Recover stale worker".to_owned(),
+                    description: "Exercise expired lease recovery".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.claim_next_runnable("worker-a", -1).await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::RecoverExpiredRunningTasks),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please rescue any stale worker leases.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert!(updated.lease_owner.is_none());
+        assert!(updated.lease_expires_at.is_none());
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Recovered 1 expired running task lease")
+        );
+        assert!(actions.iter().any(|action| {
+            action.action_type == "recover_expired_running_task"
+                && action.actor == "main_agent"
+                && action.details["previous_lease_owner"] == "worker-a"
+        }));
 
         Ok(())
     }
@@ -14618,6 +14743,63 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "inspect_scheduler_state")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_recover_expired_running_tasks_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Recover expired run".to_owned(),
+                description: "Move stale running work back to the queue".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        db.claim_next_runnable("worker-a", -1).await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "recover expired running tasks".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert!(updated.lease_owner.is_none());
+        assert!(updated.lease_expires_at.is_none());
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Recovered 1 expired running task lease")
+        );
+        assert!(response.assistant_message.content.contains(&task.title));
+        assert!(actions.iter().any(|action| {
+            action.action_type == "recover_expired_running_task"
+                && action.actor == "main_agent"
+                && action.details["previous_lease_owner"] == "worker-a"
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "recover expired running tasks".to_owned(),
+            })
+            .await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("No expired running task leases needed recovery")
         );
 
         Ok(())

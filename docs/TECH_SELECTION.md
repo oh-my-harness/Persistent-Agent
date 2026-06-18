@@ -229,6 +229,7 @@ It should:
 - recommend the next operator action without mutating task state;
 - perform lightweight local inspection when that helps task planning;
 - scan runnable tasks through scheduled ticks, manual API calls, or main-agent conversation requests;
+- recover expired running task leases and requeue stale work through the same audited database path as scheduler ticks;
 - move a selected task, or the current next runnable task by scheduler order, to the front of runnable work and request an immediate scheduler scan without bypassing the scheduler/worker path;
 - claim a task lease;
 - resolve requested and matched skills;
