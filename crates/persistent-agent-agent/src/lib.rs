@@ -855,6 +855,37 @@ impl MainAgent {
         Ok(format_task_latest_result(&task, &attempts))
     }
 
+    pub async fn list_task_follow_ups(&self, id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(id).await?;
+        let actions = self.db.list_task_actions(id).await?;
+        let mut follow_ups = Vec::new();
+        for action in actions
+            .iter()
+            .filter(|action| action.action_type == "create_follow_up_task")
+        {
+            let Some(id_text) = action.details["follow_up_task_id"].as_str() else {
+                continue;
+            };
+            let Ok(follow_up_id) = id_text.parse::<TaskId>() else {
+                continue;
+            };
+            if let Ok(follow_up) = self.db.get_task(follow_up_id).await {
+                follow_ups.push(follow_up);
+            }
+        }
+
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "list_task_follow_ups",
+                serde_json::json!({ "follow_up_count": follow_ups.len() }),
+            )
+            .await?;
+
+        Ok(format_task_follow_ups(&task, &follow_ups))
+    }
+
     pub async fn inspect_workspace_status(&self) -> anyhow::Result<String> {
         let cwd = env::current_dir()?;
         let git_status = Command::new("git")
@@ -1814,6 +1845,12 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::ListTaskFollowUps { selector } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => self.list_task_follow_ups(task.id).await?,
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::InspectWorkspace => match self.inspect_workspace_status().await {
                 Ok(reply) => reply,
                 Err(error) => format!("I could not inspect the workspace status: {error}"),
@@ -1938,7 +1975,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2386,6 +2423,9 @@ pub enum MainAgentPlan {
     ShowTaskLatestResult {
         selector: String,
     },
+    ListTaskFollowUps {
+        selector: String,
+    },
     ListTaskConversation {
         selector: String,
     },
@@ -2563,6 +2603,7 @@ impl MainAgentPlan {
             Self::ShowTaskLatestResult { selector } => {
                 MainAgentIntent::ShowTaskLatestResult { selector }
             }
+            Self::ListTaskFollowUps { selector } => MainAgentIntent::ListTaskFollowUps { selector },
             Self::ListTaskConversation { selector } => {
                 MainAgentIntent::ListTaskConversation { selector }
             }
@@ -2787,6 +2828,9 @@ enum MainAgentIntent {
     ShowTaskLatestResult {
         selector: String,
     },
+    ListTaskFollowUps {
+        selector: String,
+    },
     ListTaskConversation {
         selector: String,
     },
@@ -2952,6 +2996,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(selector) = extract_task_history_selector(trimmed, &normalized) {
         return MainAgentIntent::ListTaskHistory { selector };
+    }
+
+    if let Some(selector) = extract_task_follow_up_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskFollowUps { selector };
     }
 
     if let Some(selector) = extract_task_conversation_selector(trimmed, &normalized) {
@@ -3364,6 +3412,7 @@ async fn dispatch_main_agent_planner(
         "plan_list_task_artifacts",
         "plan_list_task_history",
         "plan_show_task_latest_result",
+        "plan_list_task_follow_ups",
         "plan_list_task_conversation",
         "plan_inspect_workspace",
         "plan_inspect_workspace_file",
@@ -3552,6 +3601,12 @@ fn main_agent_planner_tool_registry(
         "plan_show_task_latest_result",
         "Plan to show one task's latest result summary.",
         PlannedTaskReadAction::ShowLatestResult,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_follow_ups",
+        "Plan to list follow-up tasks created from one task.",
+        PlannedTaskReadAction::ListFollowUps,
     )));
     registry.register(Arc::new(PlanTaskReadTool::new(
         state.clone(),
@@ -4992,6 +5047,7 @@ enum PlannedTaskReadAction {
     ListArtifacts,
     ListHistory,
     ShowLatestResult,
+    ListFollowUps,
     ListConversation,
 }
 
@@ -5063,6 +5119,9 @@ impl Tool for PlanTaskReadTool {
                 PlannedTaskReadAction::ListHistory => MainAgentPlan::ListTaskHistory { selector },
                 PlannedTaskReadAction::ShowLatestResult => {
                     MainAgentPlan::ShowTaskLatestResult { selector }
+                }
+                PlannedTaskReadAction::ListFollowUps => {
+                    MainAgentPlan::ListTaskFollowUps { selector }
                 }
                 PlannedTaskReadAction::ListConversation => {
                     MainAgentPlan::ListTaskConversation { selector }
@@ -5673,7 +5732,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.\n- plan_show_task_latest_result: show one task's latest result summary.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve one memory candidate.\n- plan_reject_memory: reject one memory candidate.\n- plan_approve_all_pending_memories: approve all pending memory candidates.\n- plan_reject_all_pending_memories: reject all pending memory candidates.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.\n- plan_show_task_latest_result: show one task's latest result summary.\n- plan_list_task_follow_ups: list follow-up tasks created from one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve one memory candidate.\n- plan_reject_memory: reject one memory candidate.\n- plan_approve_all_pending_memories: approve all pending memory candidates.\n- plan_reject_all_pending_memories: reject all pending memory candidates.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -6554,6 +6613,65 @@ fn extract_task_history_selector(content: &str, normalized: &str) -> Option<Stri
     (!selector.is_empty() && selector != content).then_some(selector)
 }
 
+fn extract_task_follow_up_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "follow-up",
+            "follow up",
+            "followups",
+            "follow-up task",
+            "follow up task",
+            "follow-up tasks",
+            "follow up tasks",
+            "\u{540e}\u{7eed}\u{4efb}\u{52a1}",
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+    {
+        return None;
+    }
+
+    for prefix in [
+        "show follow-up tasks for task",
+        "list follow-up tasks for task",
+        "show follow up tasks for task",
+        "list follow up tasks for task",
+        "show follow-ups for task",
+        "list follow-ups for task",
+        "task follow-up tasks",
+        "task follow up tasks",
+        "task follow-ups",
+    ] {
+        if let Some(index) = normalized.find(prefix) {
+            let selector = content[index + prefix.len()..]
+                .trim()
+                .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\'']);
+            if !selector.is_empty() {
+                return Some(selector.to_owned());
+            }
+        }
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "show",
+            "list",
+            "follow-up",
+            "follow",
+            "up",
+            "followups",
+            "tasks",
+            "task",
+            "\u{67e5}\u{770b}",
+            ZH_LIST,
+            "\u{540e}\u{7eed}\u{4efb}\u{52a1}",
+        ],
+    );
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
 fn extract_task_conversation_selector(content: &str, normalized: &str) -> Option<String> {
     if !contains_any(
         normalized,
@@ -7145,6 +7263,34 @@ fn format_task_latest_result(task: &Task, attempts: &[TaskAttempt]) -> String {
                 bounded_preview(reason, 300)
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_follow_ups(task: &Task, follow_ups: &[Task]) -> String {
+    if follow_ups.is_empty() {
+        return format!("Task '{}' has no recorded follow-up tasks.", task.title);
+    }
+
+    let mut lines = vec![format!(
+        "Task '{}' created {} follow-up task(s):",
+        task.title,
+        follow_ups.len()
+    )];
+    for follow_up in follow_ups.iter().take(10) {
+        lines.push(format!(
+            "- {} [{} {} priority {} queue {}] {}",
+            follow_up.id.to_string().chars().take(8).collect::<String>(),
+            follow_up.status,
+            follow_up.task_type,
+            follow_up.priority,
+            follow_up.queue_position,
+            follow_up.title
+        ));
+    }
+    if follow_ups.len() > 10 {
+        lines.push(format!("- ... and {} more", follow_ups.len() - 10));
     }
 
     lines.join("\n")
@@ -9478,6 +9624,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_follow_up_intents() {
+        assert_eq!(
+            parse_intent("show follow-up tasks for task Deploy release"),
+            MainAgentIntent::ListTaskFollowUps {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release follow up tasks"),
+            MainAgentIntent::ListTaskFollowUps {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{540e}\u{7eed}\u{4efb}\u{52a1}"
+            ),
+            MainAgentIntent::ListTaskFollowUps {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_task_conversation_intents() {
         assert_eq!(
             parse_intent("show conversation for task Deploy release"),
@@ -11471,6 +11641,56 @@ mod tests {
                 .any(|action| action.action_type == "show_task_latest_result")
         );
 
+        let follow_up = db
+            .create_task(
+                CreateTask {
+                    title: "Verify production deploy".to_owned(),
+                    description: "Check production after deployment".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: task.priority,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "worker".to_owned(),
+                },
+                "worker",
+            )
+            .await?;
+        db.record_action(
+            Some(task.id),
+            "worker",
+            "create_follow_up_task",
+            serde_json::json!({
+                "follow_up_task_id": follow_up.id,
+                "title": follow_up.title,
+            }),
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskFollowUps {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "What follow-up work came out of deployment?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Verify production deploy")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_follow_ups")
+        );
+
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ListTaskConversation {
                 selector: "Deploy release".to_owned(),
@@ -13279,6 +13499,74 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "show_task_latest_result")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_task_follow_ups_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let follow_up = db
+            .create_task(
+                CreateTask {
+                    title: "Verify production deploy".to_owned(),
+                    description: "Check production after deployment".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "worker".to_owned(),
+                },
+                "worker",
+            )
+            .await?;
+        db.record_action(
+            Some(task.id),
+            "worker",
+            "create_follow_up_task",
+            serde_json::json!({
+                "follow_up_task_id": follow_up.id,
+                "title": follow_up.title,
+            }),
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show follow-up tasks for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("created 1 follow-up task")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Verify production deploy")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_follow_ups")
         );
 
         Ok(())
