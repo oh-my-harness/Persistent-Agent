@@ -45,7 +45,7 @@ User message -> deterministic parser or OhMyHarnessMainAgentPlanner -> bounded p
 
 The deterministic product operation remains the authority for task state changes. The planner can
 only call bounded planning tools for create-task, split-tasks, pause/resume/cancel task,
-task title/description update, reprioritize-task, queue-reorder, task-type conversion, dependency add/remove, task-note add,
+manual complete/fail task, task title/description update, reprioritize-task, queue-reorder, task-type conversion, dependency add/remove, task-note add,
 resource-lock add/remove, clarification-request, requested-skill add/remove,
 reply-to-task, create/list/update/delete skill-definition, task/artifact inspection,
 workspace/file inspection, memory create/list/approve/reject, audit listing, list-tasks, summarize, and

@@ -173,6 +173,14 @@ impl MainAgent {
             .await
     }
 
+    pub async fn complete_task(&self, id: TaskId, summary: &str) -> anyhow::Result<Task> {
+        self.db.complete_task(id, summary, "main_agent").await
+    }
+
+    pub async fn fail_task(&self, id: TaskId, error: &str) -> anyhow::Result<Task> {
+        self.db.fail_task(id, error, "main_agent").await
+    }
+
     pub async fn add_task_dependency(
         &self,
         task_id: TaskId,
@@ -989,6 +997,30 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::CompleteTask { selector, summary } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => {
+                        let task = self.complete_task(task.id, &summary).await?;
+                        let reply = format!(
+                            "Marked task '{}' as {}. Summary: {}",
+                            task.title, task.status, summary
+                        );
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    Err(reply) => reply,
+                }
+            }
+            MainAgentIntent::FailTask { selector, error } => match self.find_task(&selector).await?
+            {
+                Ok(task) => {
+                    let task = self.fail_task(task.id, &error).await?;
+                    let reply = format!("Marked task '{}' as failed. Reason: {}", task.title, error);
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::UpdateTaskDetails {
                 selector,
                 title,
@@ -1351,7 +1383,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel/complete/fail tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1692,6 +1724,14 @@ pub enum MainAgentPlan {
     CancelTask {
         selector: String,
     },
+    CompleteTask {
+        selector: String,
+        summary: String,
+    },
+    FailTask {
+        selector: String,
+        error: String,
+    },
     UpdateTaskDetails {
         selector: String,
         title: Option<String>,
@@ -1823,6 +1863,10 @@ impl MainAgentPlan {
             Self::PauseTask { selector } => MainAgentIntent::PauseTask { selector },
             Self::ResumeTask { selector } => MainAgentIntent::ResumeTask { selector },
             Self::CancelTask { selector } => MainAgentIntent::CancelTask { selector },
+            Self::CompleteTask { selector, summary } => {
+                MainAgentIntent::CompleteTask { selector, summary }
+            }
+            Self::FailTask { selector, error } => MainAgentIntent::FailTask { selector, error },
             Self::UpdateTaskDetails {
                 selector,
                 title,
@@ -2038,6 +2082,14 @@ enum MainAgentIntent {
     CancelTask {
         selector: String,
     },
+    CompleteTask {
+        selector: String,
+        summary: String,
+    },
+    FailTask {
+        selector: String,
+        error: String,
+    },
     UpdateTaskDetails {
         selector: String,
         title: Option<String>,
@@ -2174,6 +2226,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_scheduler_scan_request(&normalized) {
         return MainAgentIntent::RunSchedulerTick;
+    }
+
+    if let Some(intent) = parse_task_finish_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if let Some(intent) = parse_task_detail_update_intent(trimmed, &normalized) {
@@ -2582,6 +2638,8 @@ async fn dispatch_main_agent_planner(
         "plan_pause_task",
         "plan_resume_task",
         "plan_cancel_task",
+        "plan_complete_task",
+        "plan_fail_task",
         "plan_update_task_details",
         "plan_reprioritize_task",
         "plan_reorder_task",
@@ -2650,6 +2708,18 @@ fn main_agent_planner_tool_registry(
         "plan_cancel_task",
         "Plan to cancel a task selected by id or title fragment.",
         PlannedTaskSelectorAction::Cancel,
+    )));
+    registry.register(Arc::new(PlanTaskFinishTool::new(
+        state.clone(),
+        "plan_complete_task",
+        "Plan to manually mark one task complete with a result summary.",
+        PlannedTaskFinishAction::Complete,
+    )));
+    registry.register(Arc::new(PlanTaskFinishTool::new(
+        state.clone(),
+        "plan_fail_task",
+        "Plan to manually mark one task failed with an error reason.",
+        PlannedTaskFinishAction::Fail,
     )));
     registry.register(Arc::new(PlanUpdateTaskDetailsTool::new(state.clone())));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
@@ -3012,6 +3082,92 @@ impl Tool for PlanTaskSelectorTool {
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned task state change"))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlannedTaskFinishAction {
+    Complete,
+    Fail,
+}
+
+struct PlanTaskFinishTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    name: &'static str,
+    description: &'static str,
+    action: PlannedTaskFinishAction,
+    schema: serde_json::Value,
+}
+
+impl PlanTaskFinishTool {
+    fn new(
+        state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+        name: &'static str,
+        description: &'static str,
+        action: PlannedTaskFinishAction,
+    ) -> Self {
+        Self {
+            state,
+            name,
+            description,
+            action,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the task."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Completion summary or failure reason to store on the task."
+                    }
+                },
+                "required": ["selector", "summary"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanTaskFinishTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let summary = planner_required_string(&args, "summary")?;
+            let plan = match self.action {
+                PlannedTaskFinishAction::Complete => {
+                    MainAgentPlan::CompleteTask { selector, summary }
+                }
+                PlannedTaskFinishAction::Fail => MainAgentPlan::FailTask {
+                    selector,
+                    error: summary,
+                },
+            };
+            self.state.lock().await.plan = Some(plan);
+            Ok(planner_tool_result("planned task finish state change"))
         })
     }
 }
@@ -4525,7 +4681,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -6066,6 +6222,53 @@ fn parse_reply_to_task_intent(content: &str, normalized: &str) -> Option<MainAge
         .map(|(selector, content)| MainAgentIntent::ReplyToTask { selector, content })
 }
 
+fn parse_task_finish_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if is_create_request(normalized) || !contains_any(normalized, &["task", ZH_TASK]) {
+        return None;
+    }
+
+    let is_failure = contains_any(
+        normalized,
+        &[
+            "fail task",
+            "failed task",
+            "mark task",
+            "mark the task",
+            "task failed",
+            "task as failed",
+        ],
+    ) && contains_any(normalized, &["fail", "failed"]);
+    if is_failure {
+        let (selector, error) = split_task_finish_selector_and_summary(content, true)?;
+        return Some(MainAgentIntent::FailTask { selector, error });
+    }
+
+    let is_completion = contains_any(
+        normalized,
+        &[
+            "complete task",
+            "completed task",
+            "finish task",
+            "finished task",
+            "mark task",
+            "mark the task",
+            "task complete",
+            "task completed",
+            "task as complete",
+            "task as completed",
+        ],
+    ) && contains_any(
+        normalized,
+        &["complete", "completed", "finish", "finished", "done"],
+    );
+    if is_completion {
+        let (selector, summary) = split_task_finish_selector_and_summary(content, false)?;
+        return Some(MainAgentIntent::CompleteTask { selector, summary });
+    }
+
+    None
+}
+
 fn parse_task_detail_update_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if is_create_request(normalized) {
         return None;
@@ -6419,6 +6622,61 @@ fn split_reply_selector_and_content(content: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+fn split_task_finish_selector_and_summary(
+    content: &str,
+    is_failure: bool,
+) -> Option<(String, String)> {
+    for separator in ["\u{ff1a}", ":", "\n"] {
+        if let Some((head, tail)) = content.split_once(separator) {
+            let selector = extract_task_selector(
+                head,
+                &[
+                    "complete",
+                    "completed",
+                    "finish",
+                    "finished",
+                    "done",
+                    "fail",
+                    "failed",
+                    "summary",
+                    "reason",
+                    "error",
+                ],
+            );
+            let summary = tail.trim().trim_matches(['"', '\'']).trim();
+            if !selector.is_empty() && !summary.is_empty() {
+                return Some((selector, summary.to_owned()));
+            }
+        }
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "complete",
+            "completed",
+            "finish",
+            "finished",
+            "done",
+            "fail",
+            "failed",
+            "summary",
+            "reason",
+            "error",
+        ],
+    );
+    if selector.is_empty() || selector == content {
+        return None;
+    }
+
+    let summary = if is_failure {
+        "Marked failed by user."
+    } else {
+        "Marked complete by user."
+    };
+    Some((selector, summary.to_owned()))
 }
 
 fn split_selector_and_value_after_phrase(
@@ -7034,6 +7292,14 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "unpause task",
         "cancel task",
         "cancel",
+        "complete task",
+        "completed task",
+        "finish task",
+        "finished task",
+        "fail task",
+        "failed task",
+        "mark the task",
+        "mark task",
         "update task title",
         "update task description",
         "update task",
@@ -7468,6 +7734,31 @@ mod tests {
             MainAgentIntent::ReorderTask {
                 selector: "Check GitHub issues".to_owned(),
                 queue_position: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_finish_intents() {
+        assert_eq!(
+            parse_intent("complete task Deploy release: deployed to production"),
+            MainAgentIntent::CompleteTask {
+                selector: "Deploy release".to_owned(),
+                summary: "deployed to production".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("mark task Deploy release complete"),
+            MainAgentIntent::CompleteTask {
+                selector: "Deploy release".to_owned(),
+                summary: "Marked complete by user.".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("fail task Deploy release: deployment token expired"),
+            MainAgentIntent::FailTask {
+                selector: "Deploy release".to_owned(),
+                error: "deployment token expired".to_owned(),
             }
         );
     }
@@ -8200,6 +8491,95 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].task_snapshot.len(), 1);
         assert_eq!(captured[0].task_snapshot[0].title, "Watch GitHub issues");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_task_finish_states() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let complete_task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let fail_task = db
+            .create_task(
+                CreateTask {
+                    title: "Publish package".to_owned(),
+                    description: "Publish the package".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::CompleteTask {
+                selector: "Deploy release".to_owned(),
+                summary: "Deployed to production.".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "That deployment task is done.".to_owned(),
+            })
+            .await?;
+        let completed = db.get_task(complete_task.id).await?;
+        let actions = db.list_task_actions(complete_task.id).await?;
+
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.result_summary.as_deref(),
+            Some("Deployed to production.")
+        );
+        assert!(response.assistant_message.content.contains("Marked task"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "complete_task")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::FailTask {
+                selector: "Publish package".to_owned(),
+                error: "Registry rejected the token.".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "The package publish cannot be completed.".to_owned(),
+            })
+            .await?;
+        let failed = db.get_task(fail_task.id).await?;
+        let actions = db.list_task_actions(fail_task.id).await?;
+
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.result_summary.as_deref(),
+            Some("Registry rejected the token.")
+        );
+        assert!(response.assistant_message.content.contains("failed"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "fail_task")
+        );
 
         Ok(())
     }
@@ -9256,6 +9636,64 @@ mod tests {
         let updated = db.get_task(task.id).await?;
 
         assert_eq!(updated.title, "Ship release");
+        assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_finish_tasks_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let complete_task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let fail_task = agent
+            .create_task(CreateTask {
+                title: "Publish package".to_owned(),
+                description: "Publish the package".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "complete task Deploy release: deployed to production".to_owned(),
+            })
+            .await?;
+        let completed = db.get_task(complete_task.id).await?;
+
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.result_summary.as_deref(),
+            Some("deployed to production")
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "fail task Publish package: registry token expired".to_owned(),
+            })
+            .await?;
+        let failed = db.get_task(fail_task.id).await?;
+
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.result_summary.as_deref(),
+            Some("registry token expired")
+        );
         assert_eq!(response.changed_tasks.len(), 1);
 
         Ok(())
