@@ -218,6 +218,7 @@ It should:
 - list task notes that preserve user and main-agent coordination context;
 - list task constraints, including dependencies, resource locks, and active resource conflicts;
 - list memory candidates proposed by a specific task for review and traceability;
+- bulk approve or reject pending memory candidates proposed by one task;
 - list tasks that are waiting for user input with their latest task-conversation question;
 - list recurring tasks that are waiting for their next schedule;
 - route user replies back into blocked task conversations, resume the task, and request an immediate scheduler scan for resumed work;
@@ -235,7 +236,7 @@ It should:
 - subscribe to worker events;
 - persist task events and summaries;
 - mark the task outcome;
-- review memory candidates, including bulk approval or rejection of pending candidates.
+- review memory candidates, including bulk approval or rejection of pending candidates globally or by source task.
 
 The main agent may inspect local state, such as repository files or git status, when planning or clarifying tasks. The first implemented local operations are read-only: workspace status inspection reports the process working directory and `git status --short --branch`, workspace directory inspection lists a bounded relative directory, and workspace file inspection previews a relative file inside the current workspace with an output cap. They record `inspect_workspace_status`, `inspect_workspace_directory`, `inspect_workspace_file`, and rejected `inspect_workspace_directory_failed` / `inspect_workspace_file_failed` actions. Substantial execution, code changes, long-running operations, and risky local actions should be delegated to worker agents.
 
