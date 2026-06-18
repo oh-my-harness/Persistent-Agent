@@ -1346,6 +1346,21 @@ impl MainAgent {
         Ok(format_memory_list(filter, &filtered))
     }
 
+    pub async fn list_task_memories(&self, task_id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(task_id).await?;
+        let memories = self.db.list_task_memories(task_id).await?;
+        self.db
+            .record_action(
+                Some(task_id),
+                "main_agent",
+                "list_task_memories",
+                serde_json::json!({ "memory_count": memories.len() }),
+            )
+            .await?;
+
+        Ok(format_task_memories(&task, &memories))
+    }
+
     pub async fn inspect_scheduler_state(&self) -> anyhow::Result<String> {
         let tasks = self.db.list_tasks().await?;
         let running_tasks = tasks
@@ -1993,6 +2008,12 @@ impl MainAgent {
                 Err(reply) => reply,
             },
             MainAgentIntent::ListMemories { filter } => self.list_memories_for_review(filter).await?,
+            MainAgentIntent::ListTaskMemories { selector } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => self.list_task_memories(task.id).await?,
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::CreateSkillDefinition { input } => {
                 let skill = self.create_skill_definition(input).await?;
                 format!(
@@ -2031,7 +2052,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task notes, show task constraints, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task notes, show task constraints, show task memories, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2476,6 +2497,9 @@ pub enum MainAgentPlan {
     ListTaskConstraints {
         selector: String,
     },
+    ListTaskMemories {
+        selector: String,
+    },
     ListTaskArtifacts {
         selector: String,
     },
@@ -2664,6 +2688,7 @@ impl MainAgentPlan {
             Self::ListTaskConstraints { selector } => {
                 MainAgentIntent::ListTaskConstraints { selector }
             }
+            Self::ListTaskMemories { selector } => MainAgentIntent::ListTaskMemories { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
             Self::ListTaskHistory { selector } => MainAgentIntent::ListTaskHistory { selector },
             Self::ShowTaskLatestResult { selector } => {
@@ -2891,6 +2916,9 @@ enum MainAgentIntent {
     ListTaskConstraints {
         selector: String,
     },
+    ListTaskMemories {
+        selector: String,
+    },
     ListTaskArtifacts {
         selector: String,
     },
@@ -3044,6 +3072,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         ],
     ) {
         return MainAgentIntent::Summarize;
+    }
+
+    if let Some(selector) = extract_task_memories_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskMemories { selector };
     }
 
     if let Some(intent) = parse_create_memory_intent(trimmed, &normalized) {
@@ -3491,6 +3523,7 @@ async fn dispatch_main_agent_planner(
         "plan_recommend_next_action",
         "plan_explain_task",
         "plan_list_task_constraints",
+        "plan_list_task_memories",
         "plan_list_task_artifacts",
         "plan_list_task_history",
         "plan_show_task_latest_result",
@@ -3677,6 +3710,12 @@ fn main_agent_planner_tool_registry(
         "plan_list_task_constraints",
         "Plan to list one task's dependencies and resource locks.",
         PlannedTaskReadAction::ListConstraints,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_memories",
+        "Plan to list memory candidates proposed by one task.",
+        PlannedTaskReadAction::ListMemories,
     )));
     registry.register(Arc::new(PlanTaskReadTool::new(
         state.clone(),
@@ -5139,6 +5178,7 @@ impl Tool for PlanUpdateTaskScheduleTool {
 enum PlannedTaskReadAction {
     Explain,
     ListConstraints,
+    ListMemories,
     ListArtifacts,
     ListHistory,
     ShowLatestResult,
@@ -5212,6 +5252,7 @@ impl Tool for PlanTaskReadTool {
                 PlannedTaskReadAction::ListConstraints => {
                     MainAgentPlan::ListTaskConstraints { selector }
                 }
+                PlannedTaskReadAction::ListMemories => MainAgentPlan::ListTaskMemories { selector },
                 PlannedTaskReadAction::ListArtifacts => {
                     MainAgentPlan::ListTaskArtifacts { selector }
                 }
@@ -5849,6 +5890,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     .replace(
         "- plan_explain_task: explain one task's current state.",
         "- plan_explain_task: explain one task's current state.\n- plan_list_task_constraints: list one task's dependencies and resource locks.",
+    )
+    .replace(
+        "- plan_list_task_artifacts: list artifacts for one task.",
+        "- plan_list_task_memories: list memory candidates proposed by one task.\n- plan_list_task_artifacts: list artifacts for one task.",
     )
     .replace(
         "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.",
@@ -6932,6 +6977,94 @@ fn extract_task_constraints_selector_text(content: &str) -> String {
         .to_owned()
 }
 
+fn extract_task_memories_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "memory",
+            "memories",
+            "memory candidates",
+            "\u{8bb0}\u{5fc6}",
+            "\u{8bb0}\u{5fc6}\u{5019}\u{9009}",
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+        || contains_any(
+            normalized,
+            &[
+                "remember",
+                "approve",
+                "reject",
+                "delete",
+                "update",
+                "edit",
+                ZH_APPROVE,
+                ZH_REJECT,
+                "\u{5220}\u{9664}",
+                "\u{66f4}\u{65b0}",
+            ],
+        )
+        || !contains_any(
+            normalized,
+            &[
+                "show",
+                "list",
+                "view",
+                "what",
+                "which",
+                "\u{67e5}\u{770b}",
+                ZH_LIST,
+            ],
+        )
+    {
+        return None;
+    }
+
+    let selector = extract_task_memories_selector_text(content);
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
+fn extract_task_memories_selector_text(content: &str) -> String {
+    let mut selector = content.to_owned();
+    for word in [
+        "show memory candidates for task",
+        "list memory candidates for task",
+        "view memory candidates for task",
+        "show memories for task",
+        "list memories for task",
+        "view memories for task",
+        "show task memory candidates",
+        "list task memory candidates",
+        "show task memories",
+        "list task memories",
+        "task memory candidates",
+        "task memories",
+        "memory candidates",
+        "memory candidate",
+        "memories",
+        "memory",
+        "show",
+        "list",
+        "view",
+        "what",
+        "which",
+        "task",
+        ZH_TASK,
+        "\u{67e5}\u{770b}",
+        ZH_LIST,
+        "\u{8bb0}\u{5fc6}\u{5019}\u{9009}",
+        "\u{8bb0}\u{5fc6}",
+    ] {
+        selector = replace_case_insensitive(&selector, word, "");
+    }
+
+    selector
+        .trim()
+        .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\''])
+        .trim()
+        .to_owned()
+}
+
 fn extract_task_conversation_selector(content: &str, normalized: &str) -> Option<String> {
     if !contains_any(
         normalized,
@@ -7651,6 +7784,33 @@ fn format_task_constraints(
                 resource_lock_conflicts.len() - 10
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_memories(task: &Task, memories: &[Memory]) -> String {
+    if memories.is_empty() {
+        return format!("Task '{}' has no memory candidates yet.", task.title);
+    }
+
+    let mut lines = vec![format!(
+        "Task '{}' memory candidates ({} shown):",
+        task.title,
+        memories.len().min(10)
+    )];
+    for memory in memories.iter().take(10) {
+        lines.push(format!(
+            "- {} [{} {} confidence {:.2}] {}",
+            memory.id.to_string().chars().take(8).collect::<String>(),
+            memory.status,
+            memory.scope,
+            memory.confidence,
+            memory.content
+        ));
+    }
+    if memories.len() > 10 {
+        lines.push(format!("- ... and {} more", memories.len() - 10));
     }
 
     lines.join("\n")
@@ -10601,6 +10761,26 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_intent("show memory candidates for task Deploy release"),
+            MainAgentIntent::ListTaskMemories {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release memories"),
+            MainAgentIntent::ListTaskMemories {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{8bb0}\u{5fc6}\u{5019}\u{9009}"
+            ),
+            MainAgentIntent::ListTaskMemories {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent("list approved memories"),
             MainAgentIntent::ListMemories {
                 filter: MemoryListFilter::Approved,
@@ -12266,6 +12446,63 @@ mod tests {
                 .contains("Prefer cargo test before pushing.")
         );
 
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.create_memory(
+            persistent_agent_domain::CreateMemory {
+                scope: "repo".to_owned(),
+                content: "Deployment needs release notes checked.".to_owned(),
+                source_task_id: Some(task.id),
+                status: MemoryStatus::Approved,
+                confidence: 0.77,
+            },
+            "worker",
+        )
+        .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskMemories {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "What reusable lesson came out of that deployment work?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' memory candidates")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deployment needs release notes checked.")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_memories")
+        );
+
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::UpdateMemory {
                 selector: "cargo test before pushing".to_owned(),
@@ -13265,6 +13502,54 @@ mod tests {
                 .assistant_message
                 .content
                 .contains("browser screenshots")
+        );
+
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        db.create_memory(
+            CreateMemory {
+                scope: "project".to_owned(),
+                content: "Deployment should verify staging first.".to_owned(),
+                source_task_id: Some(task.id),
+                status: MemoryStatus::Pending,
+                confidence: 0.73,
+            },
+            "worker",
+        )
+        .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show memory candidates for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' memory candidates")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deployment should verify staging first.")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_memories")
         );
 
         Ok(())
