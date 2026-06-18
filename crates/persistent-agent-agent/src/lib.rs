@@ -160,6 +160,20 @@ impl MainAgent {
             .await
     }
 
+    pub async fn update_task_schedule(
+        &self,
+        id: TaskId,
+        interval_seconds: i64,
+    ) -> anyhow::Result<Task> {
+        self.db
+            .update_task_schedule(
+                id,
+                serde_json::json!({ "interval_seconds": interval_seconds }),
+                "main_agent",
+            )
+            .await
+    }
+
     pub async fn pause_task(&self, id: TaskId) -> anyhow::Result<Task> {
         self.db
             .set_task_status(id, TaskStatus::Paused, "main_agent", None)
@@ -1448,6 +1462,24 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::UpdateTaskSchedule {
+                selector,
+                interval_seconds,
+            } => match self.find_task(&selector).await? {
+                Ok(task) if task.task_type != TaskType::Recurring => {
+                    format!("Task '{}' is one-off. Convert it to recurring before setting a recurring interval.", task.title)
+                }
+                Ok(task) => {
+                    let task = self.update_task_schedule(task.id, interval_seconds).await?;
+                    let reply = format!(
+                        "Updated task '{}' recurring interval to {} seconds.",
+                        task.title, interval_seconds
+                    );
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::AddTaskDependency {
                 selector,
                 depends_on_selector,
@@ -2134,6 +2166,10 @@ pub enum MainAgentPlan {
         task_type: TaskType,
         interval_seconds: Option<i64>,
     },
+    UpdateTaskSchedule {
+        selector: String,
+        interval_seconds: i64,
+    },
     AddTaskDependency {
         selector: String,
         depends_on_selector: String,
@@ -2288,6 +2324,13 @@ impl MainAgentPlan {
             } => MainAgentIntent::ConvertTaskType {
                 selector,
                 task_type,
+                interval_seconds,
+            },
+            Self::UpdateTaskSchedule {
+                selector,
+                interval_seconds,
+            } => MainAgentIntent::UpdateTaskSchedule {
+                selector,
                 interval_seconds,
             },
             Self::AddTaskDependency {
@@ -2519,6 +2562,10 @@ enum MainAgentIntent {
         task_type: TaskType,
         interval_seconds: Option<i64>,
     },
+    UpdateTaskSchedule {
+        selector: String,
+        interval_seconds: i64,
+    },
     AddTaskDependency {
         selector: String,
         depends_on_selector: String,
@@ -2676,6 +2723,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
     }
 
     if let Some(intent) = parse_task_detail_update_intent(trimmed, &normalized) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_task_schedule_update_intent(trimmed, &normalized) {
         return intent;
     }
 
@@ -3107,6 +3158,7 @@ async fn dispatch_main_agent_planner(
         "plan_reprioritize_task",
         "plan_reorder_task",
         "plan_convert_task_type",
+        "plan_update_task_schedule",
         "plan_add_task_dependency",
         "plan_remove_task_dependency",
         "plan_add_task_note",
@@ -3210,6 +3262,7 @@ fn main_agent_planner_tool_registry(
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanReorderTaskTool::new(state.clone())));
     registry.register(Arc::new(PlanConvertTaskTypeTool::new(state.clone())));
+    registry.register(Arc::new(PlanUpdateTaskScheduleTool::new(state.clone())));
     registry.register(Arc::new(PlanTaskDependencyTool::new(
         state.clone(),
         "plan_add_task_dependency",
@@ -4639,6 +4692,78 @@ impl Tool for PlanConvertTaskTypeTool {
     }
 }
 
+struct PlanUpdateTaskScheduleTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanUpdateTaskScheduleTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Task id or title fragment identifying the recurring task."
+                    },
+                    "interval_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "New recurring interval in seconds."
+                    }
+                },
+                "required": ["selector", "interval_seconds"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanUpdateTaskScheduleTool {
+    fn name(&self) -> &str {
+        "plan_update_task_schedule"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to update the recurring schedule interval for an existing task."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let selector = planner_required_string(&args, "selector")?;
+            let interval_seconds = args
+                .get("interval_seconds")
+                .and_then(|value| value.as_i64())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments(
+                        "interval_seconds must be a positive integer".to_owned(),
+                    )
+                })?;
+            self.state.lock().await.plan = Some(MainAgentPlan::UpdateTaskSchedule {
+                selector,
+                interval_seconds,
+            });
+            Ok(planner_tool_result("planned task schedule update"))
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PlannedTaskReadAction {
     Explain,
@@ -5322,7 +5447,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -7213,6 +7338,7 @@ fn parse_task_finish_intent(content: &str, normalized: &str) -> Option<MainAgent
 
 fn parse_task_retry_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if is_create_request(normalized)
+        || is_convert_request(normalized)
         || !contains_any(normalized, &["task", ZH_TASK])
         || !contains_any(
             normalized,
@@ -7386,6 +7512,58 @@ fn parse_task_detail_update_intent(content: &str, normalized: &str) -> Option<Ma
         selector,
         title,
         description,
+    })
+}
+
+fn parse_task_schedule_update_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if is_create_request(normalized)
+        || is_convert_request(normalized)
+        || !contains_any(normalized, &["task", ZH_TASK])
+        || !contains_any(
+            normalized,
+            &[
+                "schedule",
+                "interval",
+                "cadence",
+                "every",
+                ZH_INTERVAL,
+                ZH_EVERY,
+                "\u{8c03}\u{5ea6}",
+            ],
+        )
+    {
+        return None;
+    }
+
+    let interval_seconds = extract_interval_seconds(normalized)?;
+    if interval_seconds <= 0 {
+        return None;
+    }
+    let selector = extract_task_selector(
+        content,
+        &[
+            "schedule",
+            "interval",
+            "cadence",
+            "every",
+            "to",
+            "seconds",
+            "second",
+            "minutes",
+            "minute",
+            "hours",
+            "hour",
+            "days",
+            "day",
+            ZH_INTERVAL,
+            ZH_EVERY,
+            ZH_TO,
+        ],
+    );
+
+    (!selector.is_empty()).then_some(MainAgentIntent::UpdateTaskSchedule {
+        selector,
+        interval_seconds,
     })
 }
 
@@ -8340,10 +8518,18 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "mark task",
         "update task title",
         "update task description",
+        "update task schedule",
+        "update task interval",
         "update task",
         "change task title",
         "change task description",
+        "change task schedule",
+        "change task interval",
         "change task",
+        "set task schedule",
+        "set task interval",
+        "set schedule",
+        "set interval",
         "edit task",
         "rename task",
         "task",
@@ -8418,7 +8604,52 @@ fn extract_queue_position(normalized: &str) -> Option<i64> {
 }
 
 fn extract_interval_seconds(normalized: &str) -> Option<i64> {
-    extract_number_after_last_any(normalized, &["every", "interval", ZH_INTERVAL, "\u{6bcf} "])
+    extract_duration_after_last_any(normalized, &["every", "interval", ZH_INTERVAL, ZH_EVERY])
+}
+
+fn extract_duration_after_last_any(normalized: &str, markers: &[&str]) -> Option<i64> {
+    markers
+        .iter()
+        .filter_map(|marker| normalized.rfind(marker).map(|index| (index, *marker)))
+        .max_by_key(|(index, _)| *index)
+        .and_then(|(index, marker)| {
+            let after = &normalized[index + marker.len()..];
+            let digit_start = after
+                .char_indices()
+                .find(|(_, ch)| ch.is_ascii_digit() || *ch == '-')
+                .map(|(index, _)| index)?;
+            let digits = after[digit_start..]
+                .char_indices()
+                .take_while(|(_, ch)| ch.is_ascii_digit() || *ch == '-')
+                .last()
+                .map(|(index, ch)| digit_start + index + ch.len_utf8())?;
+            let value = after[digit_start..digits].parse::<i64>().ok()?;
+            let unit_tail = after[digits..].trim_start();
+            Some(value * interval_unit_multiplier(unit_tail))
+        })
+}
+
+fn interval_unit_multiplier(unit_tail: &str) -> i64 {
+    if unit_tail.starts_with("day")
+        || unit_tail.starts_with("days")
+        || unit_tail.starts_with("\u{5929}")
+    {
+        86_400
+    } else if unit_tail.starts_with("hour")
+        || unit_tail.starts_with("hours")
+        || unit_tail.starts_with("hr")
+        || unit_tail.starts_with("\u{5c0f}\u{65f6}")
+    {
+        3_600
+    } else if unit_tail.starts_with("minute")
+        || unit_tail.starts_with("minutes")
+        || unit_tail.starts_with("min")
+        || unit_tail.starts_with("\u{5206}\u{949f}")
+    {
+        60
+    } else {
+        1
+    }
 }
 
 fn extract_number_after_any(normalized: &str, markers: &[&str]) -> Option<i64> {
@@ -8436,22 +8667,6 @@ fn extract_number_after_any(normalized: &str, markers: &[&str]) -> Option<i64> {
         }
     }
     None
-}
-
-fn extract_number_after_last_any(normalized: &str, markers: &[&str]) -> Option<i64> {
-    markers
-        .iter()
-        .filter_map(|marker| normalized.rfind(marker).map(|index| (index, *marker)))
-        .max_by_key(|(index, _)| *index)
-        .and_then(|(index, marker)| {
-            let after = &normalized[index + marker.len()..];
-            let digits: String = after
-                .chars()
-                .skip_while(|ch| !ch.is_ascii_digit() && *ch != '-')
-                .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
-                .collect();
-            digits.parse().ok()
-        })
 }
 
 #[cfg(test)]
@@ -8986,6 +9201,29 @@ mod tests {
                 selector: "Check GitHub issues".to_owned(),
                 task_type: TaskType::OneOff,
                 interval_seconds: None,
+            }
+        );
+        assert_eq!(
+            parse_intent("set task Check GitHub issues interval to 5 minutes"),
+            MainAgentIntent::UpdateTaskSchedule {
+                selector: "Check GitHub issues".to_owned(),
+                interval_seconds: 300,
+            }
+        );
+        assert_eq!(
+            parse_intent("update task Check GitHub issues schedule every 2 hours"),
+            MainAgentIntent::UpdateTaskSchedule {
+                selector: "Check GitHub issues".to_owned(),
+                interval_seconds: 7200,
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{66f4}\u{65b0}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues \u{95f4}\u{9694}\u{4e3a} 10\u{5206}\u{949f}"
+            ),
+            MainAgentIntent::UpdateTaskSchedule {
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned(),
+                interval_seconds: 600,
             }
         );
     }
@@ -10003,6 +10241,33 @@ mod tests {
                 .assistant_message
                 .content
                 .contains("Converted task")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::UpdateTaskSchedule {
+                selector: "Check release feed".to_owned(),
+                interval_seconds: 900,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please slow down that recurring release feed check.".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert_eq!(
+            updated.schedule,
+            Some(serde_json::json!({ "interval_seconds": 900 }))
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("recurring interval to 900 seconds")
         );
 
         Ok(())
@@ -11487,6 +11752,50 @@ mod tests {
             Some(45)
         );
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_update_recurring_task_schedule_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Check GitHub issues".to_owned(),
+                description: "Look for open issues".to_owned(),
+                task_type: TaskType::Recurring,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: Some(serde_json::json!({ "interval_seconds": 60 })),
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "set task Check GitHub issues interval to 5 minutes".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(
+            updated.schedule,
+            Some(serde_json::json!({ "interval_seconds": 300 }))
+        );
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("recurring interval to 300 seconds")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "update_task_schedule")
+        );
 
         Ok(())
     }

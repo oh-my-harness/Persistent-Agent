@@ -215,7 +215,7 @@ It should:
 - list tasks filtered by lifecycle status for operational triage;
 - list tasks that are waiting for user input with their latest task-conversation question;
 - list recurring tasks that are waiting for their next schedule;
-- create, update, pause, resume, cancel, delete, reorder, and reprioritize tasks through explicit tools;
+- create, update, pause, resume, cancel, delete, reorder, reprioritize, and update recurring intervals through explicit tools;
 - split vague user requests into concrete task proposals;
 - use a harness-backed planner for unsupported free-form requests, where the LLM can only call bounded planning tools and product code performs the final state mutation;
 - summarize the task pool and explain why work is or is not running;
@@ -289,6 +289,7 @@ Recommended main-agent tools:
 - `complete_task`;
 - `fail_task`;
 - `convert_task_type`;
+- `update_task_schedule`;
 - `add_requested_skill`;
 - `remove_requested_skill`;
 - `add_task_dependency`;

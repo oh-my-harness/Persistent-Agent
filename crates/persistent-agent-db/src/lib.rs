@@ -196,6 +196,47 @@ impl Db {
         Ok(task)
     }
 
+    pub async fn update_task_schedule(
+        &self,
+        id: TaskId,
+        schedule: Value,
+        actor: &str,
+    ) -> anyhow::Result<Task> {
+        let current = self.get_task(id).await?;
+        let now = Utc::now();
+        let next_run_at = if current.task_type == TaskType::Recurring
+            && current.status == TaskStatus::WaitingForSchedule
+        {
+            Some(now + Duration::seconds(recurring_interval_seconds(Some(&schedule))))
+        } else {
+            current.next_run_at
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET schedule = ?, next_run_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(serde_json::to_string(&schedule)?)
+        .bind(next_run_at)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.record_action(
+            Some(id),
+            actor,
+            "update_task_schedule",
+            json!({ "schedule": schedule, "next_run_at": next_run_at }),
+        )
+        .await?;
+
+        self.get_task(id).await
+    }
+
     pub async fn set_task_status(
         &self,
         id: TaskId,
@@ -2688,6 +2729,42 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "convert_task_type")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recurring_task_schedule_can_be_updated_with_audit_action() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Check issues".to_owned(),
+                    description: "Check repository issues".to_owned(),
+                    task_type: TaskType::Recurring,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: Some(json!({ "interval_seconds": 60 })),
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.complete_task(task.id, "scheduled", "test").await?;
+
+        let updated = db
+            .update_task_schedule(task.id, json!({ "interval_seconds": 600 }), "test")
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert_eq!(updated.schedule, Some(json!({ "interval_seconds": 600 })));
+        assert_eq!(updated.status, TaskStatus::WaitingForSchedule);
+        assert!(updated.next_run_at.is_some());
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "update_task_schedule")
         );
 
         Ok(())
