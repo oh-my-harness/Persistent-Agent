@@ -212,6 +212,7 @@ It should:
 
 - talk with the user about goals, tasks, queue state, blockers, and priorities;
 - show recent global audit actions for non-task-specific tool calls;
+- list tasks filtered by lifecycle status for operational triage;
 - list tasks that are waiting for user input with their latest task-conversation question;
 - list recurring tasks that are waiting for their next schedule;
 - create, update, pause, resume, cancel, reorder, and reprioritize tasks through explicit tools;
@@ -295,6 +296,7 @@ Recommended main-agent tools:
 - `remove_resource_lock`;
 - `add_task_note`;
 - `list_tasks`;
+- `list_tasks_by_status`;
 - `summarize_task_pool`;
 - `inspect_workspace_status`;
 - `inspect_workspace_file`;

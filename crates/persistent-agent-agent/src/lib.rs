@@ -540,6 +540,25 @@ impl MainAgent {
         Ok(tasks)
     }
 
+    pub async fn list_task_pool_by_status(&self, status: TaskStatus) -> anyhow::Result<Vec<Task>> {
+        let tasks = self
+            .db
+            .list_tasks()
+            .await?
+            .into_iter()
+            .filter(|task| task.status == status)
+            .collect::<Vec<_>>();
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_tasks_by_status",
+                serde_json::json!({ "status": status, "count": tasks.len() }),
+            )
+            .await?;
+        Ok(tasks)
+    }
+
     pub async fn list_waiting_for_user_tasks(&self) -> anyhow::Result<String> {
         let tasks = self
             .db
@@ -1586,6 +1605,10 @@ impl MainAgent {
                 let tasks = self.list_task_pool().await?;
                 format_task_list(&tasks)
             }
+            MainAgentIntent::ListTasksByStatus { status } => {
+                let tasks = self.list_task_pool_by_status(status).await?;
+                format_task_list_by_status(status, &tasks)
+            }
             MainAgentIntent::ListWaitingForUserTasks => self.list_waiting_for_user_tasks().await?,
             MainAgentIntent::ListWaitingForScheduleTasks => {
                 self.list_waiting_for_schedule_tasks().await?
@@ -1720,7 +1743,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2143,6 +2166,9 @@ pub enum MainAgentPlan {
     ListGlobalActions,
     ListWaitingForUserTasks,
     ListWaitingForScheduleTasks,
+    ListTasksByStatus {
+        status: TaskStatus,
+    },
     ExplainTaskPool,
     ExplainTask {
         selector: String,
@@ -2309,6 +2335,7 @@ impl MainAgentPlan {
             Self::ListGlobalActions => MainAgentIntent::ListGlobalActions,
             Self::ListWaitingForUserTasks => MainAgentIntent::ListWaitingForUserTasks,
             Self::ListWaitingForScheduleTasks => MainAgentIntent::ListWaitingForScheduleTasks,
+            Self::ListTasksByStatus { status } => MainAgentIntent::ListTasksByStatus { status },
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
@@ -2508,6 +2535,9 @@ enum MainAgentIntent {
         content: String,
     },
     ListTasks,
+    ListTasksByStatus {
+        status: TaskStatus,
+    },
     ListWaitingForUserTasks,
     ListWaitingForScheduleTasks,
     ListGlobalActions,
@@ -2604,6 +2634,18 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         return MainAgentIntent::RunSchedulerTick;
     }
 
+    if is_waiting_for_user_list_request(&normalized) {
+        return MainAgentIntent::ListWaitingForUserTasks;
+    }
+
+    if is_waiting_for_schedule_list_request(&normalized) {
+        return MainAgentIntent::ListWaitingForScheduleTasks;
+    }
+
+    if let Some(intent) = parse_task_status_list_intent(&normalized) {
+        return intent;
+    }
+
     if let Some(intent) = parse_task_retry_intent(trimmed, &normalized) {
         return intent;
     }
@@ -2639,14 +2681,6 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(intent) = parse_memory_review_intent(trimmed, &normalized) {
         return intent;
-    }
-
-    if is_waiting_for_user_list_request(&normalized) {
-        return MainAgentIntent::ListWaitingForUserTasks;
-    }
-
-    if is_waiting_for_schedule_list_request(&normalized) {
-        return MainAgentIntent::ListWaitingForScheduleTasks;
     }
 
     if is_list_tasks_request(&normalized) {
@@ -3066,6 +3100,7 @@ async fn dispatch_main_agent_planner(
         "plan_show_scheduler_state",
         "plan_list_skill_definitions",
         "plan_list_tasks",
+        "plan_list_tasks_by_status",
         "plan_summarize_task_pool",
         "plan_scheduler_scan",
     ]);
@@ -3269,6 +3304,7 @@ fn main_agent_planner_tool_registry(
         "Plan to list the current task pool.",
         MainAgentPlan::ListTasks,
     )));
+    registry.register(Arc::new(PlanListTasksByStatusTool::new(state.clone())));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
         "plan_summarize_task_pool",
@@ -5032,6 +5068,72 @@ impl Tool for PlanListMemoriesTool {
     }
 }
 
+struct PlanListTasksByStatusTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanListTasksByStatusTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "draft",
+                            "queued",
+                            "running",
+                            "waiting_for_user",
+                            "waiting_for_schedule",
+                            "completed",
+                            "failed",
+                            "cancelled",
+                            "paused"
+                        ]
+                    }
+                },
+                "required": ["status"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanListTasksByStatusTool {
+    fn name(&self) -> &str {
+        "plan_list_tasks_by_status"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to list tasks filtered by lifecycle status."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::ListTasksByStatus {
+                status: planner_task_status(&args)?,
+            });
+            Ok(planner_tool_result("planned task status list"))
+        })
+    }
+}
+
 struct PlanSimpleIntentTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     name: &'static str,
@@ -5119,6 +5221,13 @@ fn planner_task_type(args: &serde_json::Value) -> Result<TaskType, ToolError> {
     }
 }
 
+fn planner_task_status(args: &serde_json::Value) -> Result<TaskStatus, ToolError> {
+    let value = planner_required_string(args, "status")?;
+    value
+        .parse::<TaskStatus>()
+        .map_err(|_| ToolError::InvalidArguments(format!("unsupported task status: {value}")))
+}
+
 fn planner_memory_filter(args: &serde_json::Value) -> Result<MemoryListFilter, ToolError> {
     match args
         .get("filter")
@@ -5183,6 +5292,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     .replace(
         "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.",
         "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_task_conversation: list recent conversation messages for one task.",
+    )
+    .replace(
+        "- plan_list_tasks: list tasks.",
+        "- plan_list_tasks: list tasks.\n- plan_list_tasks_by_status: list tasks filtered by lifecycle status.",
     )
 }
 
@@ -5782,6 +5895,62 @@ fn is_waiting_for_schedule_list_request(normalized: &str) -> bool {
         )
 }
 
+fn parse_task_status_list_intent(normalized: &str) -> Option<MainAgentIntent> {
+    if is_create_request(normalized)
+        || !contains_any(
+            normalized,
+            &["list", "show", "which", "what", ZH_LIST, "\u{67e5}\u{770b}"],
+        )
+        || !contains_any(normalized, &["task", "tasks", ZH_TASK])
+    {
+        return None;
+    }
+
+    task_status_from_list_request(normalized)
+        .map(|status| MainAgentIntent::ListTasksByStatus { status })
+}
+
+fn task_status_from_list_request(normalized: &str) -> Option<TaskStatus> {
+    if contains_any(normalized, &["waiting_for_user", "waiting for user"]) {
+        Some(TaskStatus::WaitingForUser)
+    } else if contains_any(
+        normalized,
+        &[
+            "waiting_for_schedule",
+            "waiting for schedule",
+            "waiting for next schedule",
+            "scheduled",
+        ],
+    ) {
+        Some(TaskStatus::WaitingForSchedule)
+    } else if contains_any(normalized, &["queued", "queue", "\u{961f}\u{5217}"]) {
+        Some(TaskStatus::Queued)
+    } else if contains_any(normalized, &["running", "in progress", "\u{8fd0}\u{884c}"]) {
+        Some(TaskStatus::Running)
+    } else if contains_any(
+        normalized,
+        &["completed", "complete", "done", "\u{5b8c}\u{6210}"],
+    ) {
+        Some(TaskStatus::Completed)
+    } else if contains_any(
+        normalized,
+        &["failed", "failure", "errored", "\u{5931}\u{8d25}"],
+    ) {
+        Some(TaskStatus::Failed)
+    } else if contains_any(
+        normalized,
+        &["cancelled", "canceled", "cancelled", "\u{53d6}\u{6d88}"],
+    ) {
+        Some(TaskStatus::Cancelled)
+    } else if contains_any(normalized, &["paused", "pause", "\u{6682}\u{505c}"]) {
+        Some(TaskStatus::Paused)
+    } else if contains_any(normalized, &["draft", "\u{8349}\u{7a3f}"]) {
+        Some(TaskStatus::Draft)
+    } else {
+        None
+    }
+}
+
 fn is_global_action_list_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -6184,11 +6353,19 @@ fn format_workspace_directory(
 }
 
 fn format_task_list(tasks: &[Task]) -> String {
+    format_task_list_with_title("Task pool", tasks)
+}
+
+fn format_task_list_by_status(status: TaskStatus, tasks: &[Task]) -> String {
+    format_task_list_with_title(&format!("{} tasks", status), tasks)
+}
+
+fn format_task_list_with_title(title: &str, tasks: &[Task]) -> String {
     if tasks.is_empty() {
-        return "Task pool is empty.".to_owned();
+        return format!("{title} is empty.");
     }
 
-    let mut lines = vec![format!("Task pool has {} task(s):", tasks.len())];
+    let mut lines = vec![format!("{title} has {} task(s):", tasks.len())];
     for task in tasks.iter().take(10) {
         lines.push(format!(
             "- {} [{} {} priority {} queue {}] {}",
@@ -8407,6 +8584,24 @@ mod tests {
             parse_intent("which recurring tasks are waiting?"),
             MainAgentIntent::ListWaitingForScheduleTasks
         );
+        assert_eq!(
+            parse_intent("list failed tasks"),
+            MainAgentIntent::ListTasksByStatus {
+                status: TaskStatus::Failed
+            }
+        );
+        assert_eq!(
+            parse_intent("show queued tasks"),
+            MainAgentIntent::ListTasksByStatus {
+                status: TaskStatus::Queued
+            }
+        );
+        assert_eq!(
+            parse_intent("\u{67e5}\u{770b}\u{5931}\u{8d25}\u{4efb}\u{52a1}"),
+            MainAgentIntent::ListTasksByStatus {
+                status: TaskStatus::Failed
+            }
+        );
     }
 
     #[test]
@@ -10185,6 +10380,32 @@ mod tests {
         );
 
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTasksByStatus {
+                status: TaskStatus::WaitingForSchedule,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you use the lifecycle status filter?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deploy release")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_tasks_by_status")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ListTaskHistory {
                 selector: "Deploy release".to_owned(),
             }),
@@ -11319,6 +11540,71 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "list_tasks")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_tasks_by_status_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let failed = agent
+            .create_task(CreateTask {
+                title: "Repair failing build".to_owned(),
+                description: "Investigate the broken build".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .create_task(CreateTask {
+                title: "Write release notes".to_owned(),
+                description: "Draft the next release notes".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 1,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        db.fail_task(failed.id, "build failed", "test").await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "list failed tasks".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("failed tasks has 1 task")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Repair failing build")
+        );
+        assert!(
+            !response
+                .assistant_message
+                .content
+                .contains("Write release notes")
+        );
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "list_tasks_by_status"
+                && action
+                    .details
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("failed")
+        }));
 
         Ok(())
     }
