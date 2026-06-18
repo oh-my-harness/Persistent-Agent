@@ -773,6 +773,37 @@ impl MainAgent {
         ))
     }
 
+    pub async fn list_task_constraints(&self, id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(id).await?;
+        let dependencies = self.db.list_task_dependencies(id).await?;
+        let mut dependency_states = Vec::new();
+        for dependency in dependencies {
+            dependency_states.push(self.db.get_task(dependency.depends_on_task_id).await?);
+        }
+        let resource_locks = self.db.list_task_resource_locks(id).await?;
+        let resource_lock_conflicts = self.resource_lock_conflicts(&task).await?;
+
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "list_task_constraints",
+                serde_json::json!({
+                    "dependency_count": dependency_states.len(),
+                    "resource_lock_count": resource_locks.len(),
+                    "resource_lock_conflict_count": resource_lock_conflicts.len(),
+                }),
+            )
+            .await?;
+
+        Ok(format_task_constraints(
+            &task,
+            &dependency_states,
+            &resource_locks,
+            &resource_lock_conflicts,
+        ))
+    }
+
     async fn resource_lock_conflicts(
         &self,
         task: &Task,
@@ -1847,6 +1878,12 @@ impl MainAgent {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
             },
+            MainAgentIntent::ListTaskConstraints { selector } => {
+                match self.find_task(&selector).await? {
+                    Ok(task) => self.list_task_constraints(task.id).await?,
+                    Err(reply) => reply,
+                }
+            }
             MainAgentIntent::ListTaskArtifacts { selector } => {
                 match self.find_task(&selector).await? {
                     Ok(task) => self.list_task_artifacts(task.id).await?,
@@ -1994,7 +2031,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task notes, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task notes, show task constraints, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2436,6 +2473,9 @@ pub enum MainAgentPlan {
     ExplainTask {
         selector: String,
     },
+    ListTaskConstraints {
+        selector: String,
+    },
     ListTaskArtifacts {
         selector: String,
     },
@@ -2621,6 +2661,9 @@ impl MainAgentPlan {
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
             Self::RecommendNextAction => MainAgentIntent::RecommendNextAction,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
+            Self::ListTaskConstraints { selector } => {
+                MainAgentIntent::ListTaskConstraints { selector }
+            }
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
             Self::ListTaskHistory { selector } => MainAgentIntent::ListTaskHistory { selector },
             Self::ShowTaskLatestResult { selector } => {
@@ -2845,6 +2888,9 @@ enum MainAgentIntent {
     ExplainTask {
         selector: String,
     },
+    ListTaskConstraints {
+        selector: String,
+    },
     ListTaskArtifacts {
         selector: String,
     },
@@ -3030,6 +3076,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(selector) = extract_task_notes_selector(trimmed, &normalized) {
         return MainAgentIntent::ListTaskNotes { selector };
+    }
+
+    if let Some(selector) = extract_task_constraints_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskConstraints { selector };
     }
 
     if let Some(selector) = extract_task_conversation_selector(trimmed, &normalized) {
@@ -3440,6 +3490,7 @@ async fn dispatch_main_agent_planner(
         "plan_explain_task_pool",
         "plan_recommend_next_action",
         "plan_explain_task",
+        "plan_list_task_constraints",
         "plan_list_task_artifacts",
         "plan_list_task_history",
         "plan_show_task_latest_result",
@@ -3620,6 +3671,12 @@ fn main_agent_planner_tool_registry(
         "plan_explain_task",
         "Plan to explain one task's current state.",
         PlannedTaskReadAction::Explain,
+    )));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_constraints",
+        "Plan to list one task's dependencies and resource locks.",
+        PlannedTaskReadAction::ListConstraints,
     )));
     registry.register(Arc::new(PlanTaskReadTool::new(
         state.clone(),
@@ -5081,6 +5138,7 @@ impl Tool for PlanUpdateTaskScheduleTool {
 #[derive(Clone, Copy)]
 enum PlannedTaskReadAction {
     Explain,
+    ListConstraints,
     ListArtifacts,
     ListHistory,
     ShowLatestResult,
@@ -5151,6 +5209,9 @@ impl Tool for PlanTaskReadTool {
             let selector = planner_required_string(&args, "selector")?;
             let plan = match self.action {
                 PlannedTaskReadAction::Explain => MainAgentPlan::ExplainTask { selector },
+                PlannedTaskReadAction::ListConstraints => {
+                    MainAgentPlan::ListTaskConstraints { selector }
+                }
                 PlannedTaskReadAction::ListArtifacts => {
                     MainAgentPlan::ListTaskArtifacts { selector }
                 }
@@ -5784,6 +5845,10 @@ fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     .replace(
         "- plan_list_task_artifacts: list artifacts for one task.",
         "- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.",
+    )
+    .replace(
+        "- plan_explain_task: explain one task's current state.",
+        "- plan_explain_task: explain one task's current state.\n- plan_list_task_constraints: list one task's dependencies and resource locks.",
     )
     .replace(
         "- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.",
@@ -6772,6 +6837,101 @@ fn extract_task_notes_selector_text(content: &str) -> String {
         .to_owned()
 }
 
+fn extract_task_constraints_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(
+        normalized,
+        &[
+            "constraint",
+            "constraints",
+            "dependency",
+            "dependencies",
+            "resource lock",
+            "resource locks",
+            "\u{7ea6}\u{675f}",
+            "\u{4f9d}\u{8d56}",
+            ZH_RESOURCE_LOCK,
+        ],
+    ) || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+        || contains_any(
+            normalized,
+            &[
+                "add dependency",
+                "set dependency",
+                "remove dependency",
+                "delete dependency",
+                "clear dependency",
+                "add resource lock",
+                "remove resource lock",
+                "delete resource lock",
+                "clear resource lock",
+                ZH_ADD,
+                "\u{79fb}\u{9664}",
+                "\u{5220}\u{9664}",
+            ],
+        )
+        || !contains_any(
+            normalized,
+            &[
+                "show",
+                "list",
+                "view",
+                "what",
+                "which",
+                "\u{67e5}\u{770b}",
+                ZH_LIST,
+            ],
+        )
+    {
+        return None;
+    }
+
+    let selector = extract_task_constraints_selector_text(content);
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
+fn extract_task_constraints_selector_text(content: &str) -> String {
+    let mut selector = content.to_owned();
+    for word in [
+        "show constraints for task",
+        "list constraints for task",
+        "view constraints for task",
+        "show dependencies for task",
+        "list dependencies for task",
+        "show resource locks for task",
+        "list resource locks for task",
+        "show task constraints",
+        "list task constraints",
+        "task constraints",
+        "resource locks",
+        "resource lock",
+        "dependencies",
+        "dependency",
+        "constraints",
+        "constraint",
+        "show",
+        "list",
+        "view",
+        "what",
+        "which",
+        "task",
+        ZH_TASK,
+        "\u{67e5}\u{770b}",
+        ZH_LIST,
+        "\u{7ea6}\u{675f}",
+        "\u{4f9d}\u{8d56}",
+        ZH_RESOURCE_LOCK,
+    ] {
+        selector = replace_case_insensitive(&selector, word, "");
+    }
+
+    selector
+        .trim()
+        .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\''])
+        .trim()
+        .to_owned()
+}
+
 fn extract_task_conversation_selector(content: &str, normalized: &str) -> Option<String> {
     if !contains_any(
         normalized,
@@ -7416,6 +7576,81 @@ fn format_task_notes(task: &Task, notes: &[TaskNote]) -> String {
     }
     if notes.len() > 10 {
         lines.push(format!("- ... and {} more", notes.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_constraints(
+    task: &Task,
+    dependencies: &[Task],
+    resource_locks: &[TaskResourceLock],
+    resource_lock_conflicts: &[ResourceLockConflict],
+) -> String {
+    let mut lines = vec![format!("Task '{}' constraints:", task.title)];
+
+    if dependencies.is_empty() {
+        lines.push("Dependencies: none.".to_owned());
+    } else {
+        lines.push(format!("Dependencies ({}):", dependencies.len()));
+        for dependency in dependencies.iter().take(10) {
+            let state = if matches!(
+                dependency.status,
+                TaskStatus::Completed | TaskStatus::WaitingForSchedule
+            ) {
+                "satisfied"
+            } else {
+                "blocking"
+            };
+            lines.push(format!(
+                "- {} [{} {}] {}",
+                dependency
+                    .id
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect::<String>(),
+                dependency.status,
+                state,
+                dependency.title
+            ));
+        }
+        if dependencies.len() > 10 {
+            lines.push(format!("- ... and {} more", dependencies.len() - 10));
+        }
+    }
+
+    if resource_locks.is_empty() {
+        lines.push("Resource locks: none.".to_owned());
+    } else {
+        lines.push(format!("Resource locks ({}):", resource_locks.len()));
+        for lock in resource_locks.iter().take(10) {
+            lines.push(format!("- {} [{}]", lock.resource_key, lock.lock_mode));
+        }
+        if resource_locks.len() > 10 {
+            lines.push(format!("- ... and {} more", resource_locks.len() - 10));
+        }
+    }
+
+    if resource_lock_conflicts.is_empty() {
+        lines.push("Active resource lock conflicts: none.".to_owned());
+    } else {
+        lines.push(format!(
+            "Active resource lock conflicts ({}):",
+            resource_lock_conflicts.len()
+        ));
+        for conflict in resource_lock_conflicts.iter().take(10) {
+            lines.push(format!(
+                "- {} held by running task '{}'",
+                conflict.resource_key, conflict.running_task.title
+            ));
+        }
+        if resource_lock_conflicts.len() > 10 {
+            lines.push(format!(
+                "- ... and {} more",
+                resource_lock_conflicts.len() - 10
+            ));
+        }
     }
 
     lines.join("\n")
@@ -10084,6 +10319,26 @@ mod tests {
     #[test]
     fn parses_task_dependency_intents() {
         assert_eq!(
+            parse_intent("show constraints for task Deploy release"),
+            MainAgentIntent::ListTaskConstraints {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release dependencies"),
+            MainAgentIntent::ListTaskConstraints {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{7ea6}\u{675f}"
+            ),
+            MainAgentIntent::ListTaskConstraints {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent("make task Deploy release depend on Build package"),
             MainAgentIntent::AddTaskDependency {
                 selector: "Deploy release".to_owned(),
@@ -11674,6 +11929,57 @@ mod tests {
                 .any(|action| action.action_type == "recommend_next_action")
         );
 
+        let dependency = db
+            .create_task(
+                CreateTask {
+                    title: "Build package".to_owned(),
+                    description: "Build package before deployment".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        db.add_task_dependency(task.id, dependency.id, "test")
+            .await?;
+        db.add_task_resource_lock(task.id, "repo:oh-my-harness/Persistent-Agent", "test")
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskConstraints {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "What dependencies and resource locks constrain deployment?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' constraints")
+        );
+        assert!(response.assistant_message.content.contains("Build package"));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("repo:oh-my-harness/Persistent-Agent")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_constraints")
+        );
+
         db.set_task_status(
             task.id,
             TaskStatus::WaitingForUser,
@@ -13088,6 +13394,35 @@ mod tests {
                 .assistant_message
                 .content
                 .contains("Added dependency")
+        );
+
+        agent
+            .add_task_resource_lock(dependent.id, "repo:oh-my-harness/Persistent-Agent")
+            .await?;
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show constraints for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(dependent.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' constraints")
+        );
+        assert!(response.assistant_message.content.contains("Build package"));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("repo:oh-my-harness/Persistent-Agent")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_constraints")
         );
 
         let response = agent

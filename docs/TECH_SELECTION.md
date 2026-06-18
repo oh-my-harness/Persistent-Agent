@@ -216,6 +216,7 @@ It should:
 - show a task's latest result summary without requiring full history inspection;
 - list follow-up tasks created from one task through worker audit records;
 - list task notes that preserve user and main-agent coordination context;
+- list task constraints, including dependencies, resource locks, and active resource conflicts;
 - list tasks that are waiting for user input with their latest task-conversation question;
 - list recurring tasks that are waiting for their next schedule;
 - route user replies back into blocked task conversations, resume the task, and request an immediate scheduler scan for resumed work;
