@@ -947,4 +947,64 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn main_agent_run_task_now_triggers_scheduler_for_selected_task() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let background = db
+            .create_task(
+                CreateTask {
+                    title: "High priority background task".to_owned(),
+                    description: "Should not be claimed first after run-now request".to_owned(),
+                    task_type: persistent_agent_domain::TaskType::OneOff,
+                    priority: 9,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let selected = db
+            .create_task(
+                CreateTask::one_off_from_user(
+                    "Deploy release",
+                    "Selected task should be claimed by the run-now request",
+                ),
+                "test",
+            )
+            .await?;
+        let state = AppState::new(db.clone(), WorkerBackend::Stub(StubWorker));
+
+        let Json(response) = send_main_agent_message(
+            State(state),
+            Json(MainAgentMessageInput {
+                content: "run task Deploy release now".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+
+        let scheduler_tick = response
+            .scheduler_tick
+            .expect("run-now request should execute a scheduler tick");
+        let claimed_task = scheduler_tick
+            .claimed_task
+            .expect("selected task should be claimed");
+        let selected = db.get_task(selected.id).await?;
+        let background = db.get_task(background.id).await?;
+
+        assert!(response.scheduler_tick_requested);
+        assert_eq!(claimed_task.title, "Deploy release");
+        assert_eq!(
+            selected.status,
+            persistent_agent_domain::TaskStatus::Completed
+        );
+        assert_eq!(
+            background.status,
+            persistent_agent_domain::TaskStatus::Queued
+        );
+
+        Ok(())
+    }
 }

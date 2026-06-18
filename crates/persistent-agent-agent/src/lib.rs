@@ -187,6 +187,75 @@ impl MainAgent {
             .await
     }
 
+    pub async fn prepare_task_for_immediate_run(
+        &self,
+        id: TaskId,
+    ) -> anyhow::Result<Result<Task, String>> {
+        let mut task = self.db.get_task(id).await?;
+        match task.status {
+            TaskStatus::Queued => {}
+            TaskStatus::Draft | TaskStatus::Paused => {
+                task = self.resume_task(id).await?;
+            }
+            TaskStatus::Failed => {
+                task = self
+                    .retry_task(id, "Immediate run requested by user.")
+                    .await?;
+            }
+            TaskStatus::Running => {
+                return Ok(Err(format!("Task '{}' is already running.", task.title)));
+            }
+            TaskStatus::WaitingForUser => {
+                return Ok(Err(format!(
+                    "Task '{}' is waiting for user input before it can run.",
+                    task.title
+                )));
+            }
+            TaskStatus::WaitingForSchedule => {
+                task = self.resume_task(id).await?;
+            }
+            TaskStatus::Completed => {
+                return Ok(Err(format!(
+                    "Task '{}' is already completed. Retry or create follow-up work if it needs another pass.",
+                    task.title
+                )));
+            }
+            TaskStatus::Cancelled => {
+                return Ok(Err(format!(
+                    "Task '{}' is cancelled. Resume or recreate it before running.",
+                    task.title
+                )));
+            }
+        }
+
+        let max_priority = self
+            .db
+            .list_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.priority)
+            .max()
+            .unwrap_or(task.priority);
+        if task.priority <= max_priority {
+            self.reprioritize_task(id, max_priority + 1).await?;
+        }
+        task = self.reorder_task(id, -1).await?;
+
+        self.db
+            .record_action(
+                Some(id),
+                "main_agent",
+                "request_task_run_now",
+                serde_json::json!({
+                    "priority": task.priority,
+                    "queue_position": task.queue_position,
+                }),
+            )
+            .await?;
+
+        Ok(Ok(task))
+    }
+
     pub async fn add_task_dependency(
         &self,
         task_id: TaskId,
@@ -1062,7 +1131,7 @@ impl MainAgent {
             .await?;
 
         let intent = self.resolve_intent(&input.content).await?;
-        let scheduler_tick_requested = matches!(intent, MainAgentIntent::RunSchedulerTick);
+        let mut scheduler_tick_requested = false;
         let mut changed_tasks = Vec::new();
         let deterministic_reply = match intent {
             MainAgentIntent::SplitTasks { titles } => {
@@ -1198,6 +1267,21 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::RunTaskNow { selector } => match self.find_task(&selector).await? {
+                Ok(task) => match self.prepare_task_for_immediate_run(task.id).await? {
+                    Ok(task) => {
+                        scheduler_tick_requested = true;
+                        let reply = format!(
+                            "Moved task '{}' to the front of runnable work and requested a scheduler scan.",
+                            task.title
+                        );
+                        changed_tasks.push(task);
+                        reply
+                    }
+                    Err(reply) => reply,
+                },
+                Err(reply) => reply,
+            },
             MainAgentIntent::UpdateTaskDetails {
                 selector,
                 title,
@@ -1564,11 +1648,12 @@ impl MainAgent {
                 }
             }
             MainAgentIntent::RunSchedulerTick => {
+                scheduler_tick_requested = true;
                 "Scheduler scan requested. I will ask the scheduler to check the task pool now."
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1921,6 +2006,9 @@ pub enum MainAgentPlan {
         selector: String,
         reason: String,
     },
+    RunTaskNow {
+        selector: String,
+    },
     UpdateTaskDetails {
         selector: String,
         title: Option<String>,
@@ -2060,6 +2148,7 @@ impl MainAgentPlan {
             }
             Self::FailTask { selector, error } => MainAgentIntent::FailTask { selector, error },
             Self::RetryTask { selector, reason } => MainAgentIntent::RetryTask { selector, reason },
+            Self::RunTaskNow { selector } => MainAgentIntent::RunTaskNow { selector },
             Self::UpdateTaskDetails {
                 selector,
                 title,
@@ -2290,6 +2379,9 @@ enum MainAgentIntent {
         selector: String,
         reason: String,
     },
+    RunTaskNow {
+        selector: String,
+    },
     UpdateTaskDetails {
         selector: String,
         title: Option<String>,
@@ -2429,6 +2521,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_workspace_inspection_request(&normalized) {
         return MainAgentIntent::InspectWorkspace;
+    }
+
+    if let Some(intent) = parse_run_task_now_intent(trimmed, &normalized) {
+        return intent;
     }
 
     if is_scheduler_scan_request(&normalized) {
@@ -2852,6 +2948,7 @@ async fn dispatch_main_agent_planner(
         "plan_complete_task",
         "plan_fail_task",
         "plan_retry_task",
+        "plan_run_task_now",
         "plan_update_task_details",
         "plan_reprioritize_task",
         "plan_reorder_task",
@@ -2939,6 +3036,12 @@ fn main_agent_planner_tool_registry(
         "plan_retry_task",
         "Plan to requeue a failed task for another attempt.",
         PlannedTaskFinishAction::Retry,
+    )));
+    registry.register(Arc::new(PlanTaskSelectorTool::new(
+        state.clone(),
+        "plan_run_task_now",
+        "Plan to move one task to the front of runnable work and request a scheduler scan.",
+        PlannedTaskSelectorAction::RunNow,
     )));
     registry.register(Arc::new(PlanUpdateTaskDetailsTool::new(state.clone())));
     registry.register(Arc::new(PlanReprioritizeTaskTool::new(state.clone())));
@@ -3235,6 +3338,7 @@ enum PlannedTaskSelectorAction {
     Pause,
     Resume,
     Cancel,
+    RunNow,
 }
 
 struct PlanTaskSelectorTool {
@@ -3301,6 +3405,7 @@ impl Tool for PlanTaskSelectorTool {
                 PlannedTaskSelectorAction::Pause => MainAgentPlan::PauseTask { selector },
                 PlannedTaskSelectorAction::Resume => MainAgentPlan::ResumeTask { selector },
                 PlannedTaskSelectorAction::Cancel => MainAgentPlan::CancelTask { selector },
+                PlannedTaskSelectorAction::RunNow => MainAgentPlan::RunTaskNow { selector },
             };
             self.state.lock().await.plan = Some(plan);
             Ok(planner_tool_result("planned task state change"))
@@ -4966,7 +5071,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -6674,6 +6779,44 @@ fn parse_task_retry_intent(content: &str, normalized: &str) -> Option<MainAgentI
     Some(MainAgentIntent::RetryTask { selector, reason })
 }
 
+fn parse_run_task_now_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
+    if is_create_request(normalized)
+        || !contains_any(normalized, &["task", ZH_TASK])
+        || contains_any(normalized, &["task pool", ZH_TASK_POOL, "scheduler"])
+        || !contains_any(
+            normalized,
+            &[
+                "run task",
+                "run the task",
+                "execute task",
+                "execute the task",
+                "start task",
+                "start the task",
+                "run now",
+                "execute now",
+                "start now",
+            ],
+        )
+    {
+        return None;
+    }
+
+    let selector = extract_task_selector(
+        content,
+        &[
+            "now",
+            "immediately",
+            "please",
+            "run",
+            "execute",
+            "start",
+            "task",
+        ],
+    );
+    (!selector.is_empty() && selector != content)
+        .then_some(MainAgentIntent::RunTaskNow { selector })
+}
+
 fn parse_task_detail_update_intent(content: &str, normalized: &str) -> Option<MainAgentIntent> {
     if is_create_request(normalized) {
         return None;
@@ -7728,6 +7871,12 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "requeue task",
         "try task again",
         "run task again",
+        "run the task",
+        "run task",
+        "execute the task",
+        "execute task",
+        "start the task",
+        "start task",
         "mark the task",
         "mark task",
         "update task title",
@@ -8176,6 +8325,18 @@ mod tests {
             MainAgentIntent::ReorderTask {
                 selector: "Check GitHub issues".to_owned(),
                 queue_position: 4,
+            }
+        );
+        assert_eq!(
+            parse_intent("run task Check GitHub issues now"),
+            MainAgentIntent::RunTaskNow {
+                selector: "Check GitHub issues".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("execute the task Deploy release immediately"),
+            MainAgentIntent::RunTaskNow {
+                selector: "Deploy release".to_owned(),
             }
         );
     }
@@ -9216,6 +9377,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_agent_uses_llm_planner_for_run_task_now() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Deploy release".to_owned(),
+                    description: "Deploy the release".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::RunTaskNow {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Can you kick off the deployment work now?".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+
+        assert!(response.scheduler_tick_requested);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert_eq!(updated.queue_position, -1);
+        assert!(updated.priority > task.priority);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_agent_uses_llm_planner_for_task_type_conversion() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         let task = db
@@ -10154,6 +10355,89 @@ mod tests {
 
         assert_eq!(updated.title, "Ship release");
         assert_eq!(response.changed_tasks.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_request_task_run_now_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        agent
+            .create_task(CreateTask {
+                title: "High priority background task".to_owned(),
+                description: "Already urgent work".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 9,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let task = agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "run task Deploy release now".to_owned(),
+            })
+            .await?;
+        let updated = db.get_task(task.id).await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(response.scheduler_tick_requested);
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert_eq!(updated.status, TaskStatus::Queued);
+        assert_eq!(updated.priority, 10);
+        assert_eq!(updated.queue_position, -1);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("requested a scheduler scan")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "request_task_run_now")
+        );
+
+        let completed_task = agent
+            .create_task(CreateTask {
+                title: "Completed rollout".to_owned(),
+                description: "Already done".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent
+            .complete_task(completed_task.id, "already deployed")
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "run task Completed rollout now".to_owned(),
+            })
+            .await?;
+        assert!(!response.scheduler_tick_requested);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("already completed")
+        );
 
         Ok(())
     }
