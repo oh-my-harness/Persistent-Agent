@@ -215,6 +215,7 @@ It should:
 - list tasks filtered by lifecycle status for operational triage;
 - list tasks that are waiting for user input with their latest task-conversation question;
 - list recurring tasks that are waiting for their next schedule;
+- route user replies back into blocked task conversations, resume the task, and request an immediate scheduler scan for resumed work;
 - create, update, pause, resume, cancel, delete, reorder, reprioritize, and update recurring intervals through explicit tools;
 - split vague user requests into concrete task proposals;
 - use a harness-backed planner for unsupported free-form requests, where the LLM can only call bounded planning tools and product code performs the final state mutation;

@@ -1665,8 +1665,9 @@ impl MainAgent {
                     Ok(task) => {
                         let (task, _, resumed) = self.reply_to_task(task.id, &content).await?;
                         let reply = if resumed.is_some() {
+                            scheduler_tick_requested = true;
                             format!(
-                                "Sent your reply to '{}' and moved it back to the queue.",
+                                "Sent your reply to '{}' and moved it back to the queue, then requested a scheduler scan.",
                                 task.title
                             )
                         } else {
@@ -10693,11 +10694,12 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Queued);
         assert!(updated.blocked_reason.is_none());
         assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.scheduler_tick_requested);
         assert!(
             response
                 .assistant_message
                 .content
-                .contains("moved it back to the queue")
+                .contains("requested a scheduler scan")
         );
         assert!(
             messages
@@ -13128,10 +13130,46 @@ mod tests {
 
         assert_eq!(updated.status, TaskStatus::Queued);
         assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.scheduler_tick_requested);
         assert!(
             messages
                 .iter()
                 .any(|message| message.role == "user" && message.content == "use staging first")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_reply_to_active_task_does_not_request_scheduler_scan() -> anyhow::Result<()>
+    {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        agent
+            .create_task(CreateTask {
+                title: "Deploy release".to_owned(),
+                description: "Deploy the release".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "reply to task Deploy release: keep the release notes concise".to_owned(),
+            })
+            .await?;
+
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(!response.scheduler_tick_requested);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Sent your reply")
         );
 
         Ok(())

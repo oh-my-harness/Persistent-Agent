@@ -1033,6 +1033,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_agent_reply_to_blocked_task_triggers_scheduler() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let main_agent = MainAgent::new(db.clone());
+        let task = main_agent
+            .create_task(CreateTask::one_off_from_user(
+                "Deploy release",
+                "Blocked task should continue after the user answers",
+            ))
+            .await?;
+        main_agent
+            .request_user_clarification(task.id, "Which environment should receive the release?")
+            .await?;
+        let state = AppState::new_with_scheduler_policy_and_main_agent(
+            db.clone(),
+            WorkerBackend::Stub(StubWorker),
+            persistent_agent_scheduler::SchedulerPolicy::serial(),
+            main_agent,
+        );
+
+        let Json(response) = send_main_agent_message(
+            State(state),
+            Json(MainAgentMessageInput {
+                content: "reply to task Deploy release: use production".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+
+        let scheduler_tick = response
+            .scheduler_tick
+            .expect("replying to a blocked task should execute a scheduler tick");
+        let claimed_task = scheduler_tick
+            .claimed_task
+            .expect("resumed task should be claimed");
+        let updated = db.get_task(task.id).await?;
+
+        assert!(response.scheduler_tick_requested);
+        assert_eq!(claimed_task.id, task.id);
+        assert_eq!(
+            updated.status,
+            persistent_agent_domain::TaskStatus::Completed
+        );
+        assert!(response.scheduler_message.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delete_task_endpoint_removes_task_through_main_agent() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         let task = db
