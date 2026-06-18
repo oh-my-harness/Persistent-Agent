@@ -36,6 +36,7 @@ const ZH_PRIORITY: &str = "\u{4f18}\u{5148}\u{7ea7}";
 const ZH_PAUSE_TASK: &str = "\u{6682}\u{505c}\u{4efb}\u{52a1}";
 const ZH_RESUME_TASK: &str = "\u{6062}\u{590d}\u{4efb}\u{52a1}";
 const ZH_CANCEL_TASK: &str = "\u{53d6}\u{6d88}\u{4efb}\u{52a1}";
+const ZH_DELETE_TASK: &str = "\u{5220}\u{9664}\u{4efb}\u{52a1}";
 const ZH_QUEUE: &str = "\u{961f}\u{5217}";
 const ZH_SORT: &str = "\u{6392}\u{5e8f}";
 const ZH_MOVE: &str = "\u{79fb}\u{52a8}";
@@ -116,6 +117,10 @@ impl MainAgent {
 
     pub async fn update_task(&self, id: TaskId, input: UpdateTask) -> anyhow::Result<Task> {
         self.db.update_task(id, input, "main_agent").await
+    }
+
+    pub async fn delete_task(&self, id: TaskId) -> anyhow::Result<Task> {
+        self.db.delete_task(id, "main_agent").await
     }
 
     pub async fn reprioritize_task(&self, id: TaskId, priority: i64) -> anyhow::Result<Task> {
@@ -1311,6 +1316,15 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::DeleteTask { selector } => match self.find_task(&selector).await? {
+                Ok(task) => {
+                    let task = self.delete_task(task.id).await?;
+                    let reply = format!("Deleted task '{}'.", task.title);
+                    changed_tasks.push(task);
+                    reply
+                }
+                Err(reply) => reply,
+            },
             MainAgentIntent::CompleteTask { selector, summary } => {
                 match self.find_task(&selector).await? {
                     Ok(task) => {
@@ -1743,7 +1757,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2084,6 +2098,9 @@ pub enum MainAgentPlan {
     CancelTask {
         selector: String,
     },
+    DeleteTask {
+        selector: String,
+    },
     CompleteTask {
         selector: String,
         summary: String,
@@ -2238,6 +2255,7 @@ impl MainAgentPlan {
             Self::PauseTask { selector } => MainAgentIntent::PauseTask { selector },
             Self::ResumeTask { selector } => MainAgentIntent::ResumeTask { selector },
             Self::CancelTask { selector } => MainAgentIntent::CancelTask { selector },
+            Self::DeleteTask { selector } => MainAgentIntent::DeleteTask { selector },
             Self::CompleteTask { selector, summary } => {
                 MainAgentIntent::CompleteTask { selector, summary }
             }
@@ -2463,6 +2481,9 @@ enum MainAgentIntent {
         selector: String,
     },
     CancelTask {
+        selector: String,
+    },
+    DeleteTask {
         selector: String,
     },
     CompleteTask {
@@ -2837,6 +2858,23 @@ fn parse_intent(content: &str) -> MainAgentIntent {
         };
     }
 
+    if contains_any(
+        &normalized,
+        &[
+            "delete task",
+            "remove task",
+            "delete the task",
+            "remove the task",
+            ZH_DELETE_TASK,
+        ],
+    ) || normalized.starts_with("delete ")
+        || normalized.starts_with("remove task ")
+    {
+        return MainAgentIntent::DeleteTask {
+            selector: extract_task_selector(trimmed, &[]),
+        };
+    }
+
     if contains_any(&normalized, &["cancel task", ZH_CANCEL_TASK])
         || normalized.starts_with("cancel ")
     {
@@ -3060,6 +3098,7 @@ async fn dispatch_main_agent_planner(
         "plan_pause_task",
         "plan_resume_task",
         "plan_cancel_task",
+        "plan_delete_task",
         "plan_complete_task",
         "plan_fail_task",
         "plan_retry_task",
@@ -3136,6 +3175,12 @@ fn main_agent_planner_tool_registry(
         "plan_cancel_task",
         "Plan to cancel a task selected by id or title fragment.",
         PlannedTaskSelectorAction::Cancel,
+    )));
+    registry.register(Arc::new(PlanTaskSelectorTool::new(
+        state.clone(),
+        "plan_delete_task",
+        "Plan to permanently delete a task selected by id or title fragment.",
+        PlannedTaskSelectorAction::Delete,
     )));
     registry.register(Arc::new(PlanTaskFinishTool::new(
         state.clone(),
@@ -3469,6 +3514,7 @@ enum PlannedTaskSelectorAction {
     Pause,
     Resume,
     Cancel,
+    Delete,
     RunNow,
 }
 
@@ -3536,6 +3582,7 @@ impl Tool for PlanTaskSelectorTool {
                 PlannedTaskSelectorAction::Pause => MainAgentPlan::PauseTask { selector },
                 PlannedTaskSelectorAction::Resume => MainAgentPlan::ResumeTask { selector },
                 PlannedTaskSelectorAction::Cancel => MainAgentPlan::CancelTask { selector },
+                PlannedTaskSelectorAction::Delete => MainAgentPlan::DeleteTask { selector },
                 PlannedTaskSelectorAction::RunNow => MainAgentPlan::RunTaskNow { selector },
             };
             self.state.lock().await.plan = Some(plan);
@@ -5275,7 +5322,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -8266,6 +8313,11 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         "unpause task",
         "cancel task",
         "cancel",
+        "delete the task",
+        "delete task",
+        "delete",
+        "remove the task",
+        "remove task",
         "complete task",
         "completed task",
         "finish task",
@@ -8300,6 +8352,7 @@ fn extract_task_selector(content: &str, stop_words: &[&str]) -> String {
         ZH_PAUSE,
         ZH_RESUME,
         ZH_CANCEL,
+        ZH_DELETE_TASK,
         ZH_NOTE,
         ZH_SKILL,
         ZH_CLARIFY,
@@ -8755,6 +8808,18 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_intent("delete task Check GitHub issues"),
+            MainAgentIntent::DeleteTask {
+                selector: "Check GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("remove task Check GitHub issues"),
+            MainAgentIntent::DeleteTask {
+                selector: "Check GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
             parse_intent("set priority task Check GitHub issues to 8"),
             MainAgentIntent::ReprioritizeTask {
                 selector: "Check GitHub issues".to_owned(),
@@ -8838,6 +8903,12 @@ mod tests {
         assert_eq!(
             parse_intent("\u{53d6}\u{6d88}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues"),
             MainAgentIntent::CancelTask {
+                selector: "\u{68c0}\u{67e5} GitHub issues".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_intent("\u{5220}\u{9664}\u{4efb}\u{52a1} \u{68c0}\u{67e5} GitHub issues"),
+            MainAgentIntent::DeleteTask {
                 selector: "\u{68c0}\u{67e5} GitHub issues".to_owned()
             }
         );
@@ -9549,6 +9620,37 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].task_snapshot.len(), 1);
         assert_eq!(captured[0].task_snapshot[0].title, "Watch GitHub issues");
+
+        let delete_task = db
+            .create_task(
+                CreateTask {
+                    title: "Remove stale work".to_owned(),
+                    description: "No longer useful".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::DeleteTask {
+                selector: "Remove stale work".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Could you remove that stale item from the backlog?".to_owned(),
+            })
+            .await?;
+
+        assert!(db.get_task(delete_task.id).await.is_err());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert!(response.assistant_message.content.contains("Deleted task"));
 
         Ok(())
     }
@@ -10847,6 +10949,44 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Paused);
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Paused task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_delete_task_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Remove stale task".to_owned(),
+                description: "No longer needed".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "delete task Remove stale task".to_owned(),
+            })
+            .await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(tasks.is_empty());
+        assert!(db.get_task(task.id).await.is_err());
+        assert_eq!(response.changed_tasks.len(), 1);
+        assert_eq!(response.changed_tasks[0].id, task.id);
+        assert!(response.assistant_message.content.contains("Deleted task"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "delete_task")
+        );
 
         Ok(())
     }

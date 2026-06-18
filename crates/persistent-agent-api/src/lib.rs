@@ -112,7 +112,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/tasks", get(list_tasks).post(create_task))
-        .route("/api/tasks/{id}", get(get_task).patch(update_task))
+        .route(
+            "/api/tasks/{id}",
+            get(get_task).patch(update_task).delete(delete_task),
+        )
         .route("/api/tasks/{id}/reprioritize", post(reprioritize_task))
         .route("/api/tasks/{id}/reorder", post(reorder_task))
         .route(
@@ -196,6 +199,27 @@ async fn update_task(
     state
         .events
         .send(AppEvent::TaskChanged { task: task.clone() });
+    Ok(Json(task))
+}
+
+async fn delete_task(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Task>, ApiError> {
+    let task = state.main_agent.delete_task(id).await?;
+    let id_string = id.to_string();
+    for action in state.db.list_global_actions().await? {
+        if action.action_type == "delete_task"
+            && action
+                .details
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(id_string.as_str())
+        {
+            state.events.send(AppEvent::MainAgentAction { action });
+            break;
+        }
+    }
     Ok(Json(task))
 }
 
@@ -1004,6 +1028,40 @@ mod tests {
             background.status,
             persistent_agent_domain::TaskStatus::Queued
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_task_endpoint_removes_task_through_main_agent() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask::one_off_from_user(
+                    "Delete through API",
+                    "exercise direct task deletion endpoint",
+                ),
+                "test",
+            )
+            .await?;
+        let state = AppState::new(db.clone(), WorkerBackend::Stub(StubWorker));
+
+        let Json(deleted) = delete_task(State(state), Path(task.id))
+            .await
+            .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(deleted.id, task.id);
+        assert!(tasks.is_empty());
+        assert!(actions.iter().any(|action| {
+            action.action_type == "delete_task"
+                && action
+                    .details
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(task.id.to_string().as_str())
+        }));
 
         Ok(())
     }

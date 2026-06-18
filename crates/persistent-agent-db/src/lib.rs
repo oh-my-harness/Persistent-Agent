@@ -173,6 +173,29 @@ impl Db {
         self.get_task(id).await
     }
 
+    pub async fn delete_task(&self, id: TaskId, actor: &str) -> anyhow::Result<Task> {
+        let task = self.get_task(id).await?;
+        sqlx::query("DELETE FROM tasks WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.record_action(
+            None,
+            actor,
+            "delete_task",
+            json!({
+                "task_id": id,
+                "title": task.title,
+                "status": task.status,
+                "task_type": task.task_type
+            }),
+        )
+        .await?;
+
+        Ok(task)
+    }
+
     pub async fn set_task_status(
         &self,
         id: TaskId,
@@ -2448,6 +2471,40 @@ mod tests {
                 .iter()
                 .any(|action| action.action_type == "fail_task")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_can_be_deleted_with_global_audit_action() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let task = db
+            .create_task(
+                CreateTask {
+                    title: "Remove obsolete task".to_owned(),
+                    description: "This task should be deleted".to_owned(),
+                    task_type: TaskType::OneOff,
+                    priority: 0,
+                    requested_skills: Vec::new(),
+                    schedule: None,
+                    created_by: "test".to_owned(),
+                },
+                "test",
+            )
+            .await?;
+
+        let deleted = db.delete_task(task.id, "test").await?;
+        let tasks = db.list_tasks().await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(deleted.id, task.id);
+        assert!(tasks.is_empty());
+        assert!(db.get_task(task.id).await.is_err());
+        assert!(actions.iter().any(|action| {
+            action.action_type == "delete_task"
+                && action.details["task_id"] == task.id.to_string()
+                && action.details["title"] == "Remove obsolete task"
+        }));
 
         Ok(())
     }
