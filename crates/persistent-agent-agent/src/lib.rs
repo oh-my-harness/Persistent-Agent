@@ -337,6 +337,21 @@ impl MainAgent {
         self.db.add_task_note(task_id, content, "main_agent").await
     }
 
+    pub async fn list_task_notes(&self, task_id: TaskId) -> anyhow::Result<String> {
+        let task = self.db.get_task(task_id).await?;
+        let notes = self.db.list_task_notes(task_id).await?;
+        self.db
+            .record_action(
+                Some(task_id),
+                "main_agent",
+                "list_task_notes",
+                serde_json::json!({ "note_count": notes.len() }),
+            )
+            .await?;
+
+        Ok(format_task_notes(&task, &notes))
+    }
+
     pub async fn add_requested_skills(
         &self,
         task_id: TaskId,
@@ -1692,6 +1707,10 @@ impl MainAgent {
                     Err(reply) => reply,
                 }
             }
+            MainAgentIntent::ListTaskNotes { selector } => match self.find_task(&selector).await? {
+                Ok(task) => self.list_task_notes(task.id).await?,
+                Err(reply) => reply,
+            },
             MainAgentIntent::AddRequestedSkills {
                 selector,
                 skill_names,
@@ -1975,7 +1994,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task latest result, show task follow-up tasks, show task notes, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2369,6 +2388,9 @@ pub enum MainAgentPlan {
         selector: String,
         content: String,
     },
+    ListTaskNotes {
+        selector: String,
+    },
     AddRequestedSkills {
         selector: String,
         skill_names: Vec<String>,
@@ -2548,6 +2570,7 @@ impl MainAgentPlan {
             Self::AddTaskNote { selector, content } => {
                 MainAgentIntent::AddTaskNote { selector, content }
             }
+            Self::ListTaskNotes { selector } => MainAgentIntent::ListTaskNotes { selector },
             Self::AddRequestedSkills {
                 selector,
                 skill_names,
@@ -2783,6 +2806,9 @@ enum MainAgentIntent {
         selector: String,
         content: String,
     },
+    ListTaskNotes {
+        selector: String,
+    },
     AddRequestedSkills {
         selector: String,
         skill_names: Vec<String>,
@@ -3000,6 +3026,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(selector) = extract_task_follow_up_selector(trimmed, &normalized) {
         return MainAgentIntent::ListTaskFollowUps { selector };
+    }
+
+    if let Some(selector) = extract_task_notes_selector(trimmed, &normalized) {
+        return MainAgentIntent::ListTaskNotes { selector };
     }
 
     if let Some(selector) = extract_task_conversation_selector(trimmed, &normalized) {
@@ -3394,6 +3424,7 @@ async fn dispatch_main_agent_planner(
         "plan_add_task_dependency",
         "plan_remove_task_dependency",
         "plan_add_task_note",
+        "plan_list_task_notes",
         "plan_add_requested_skills",
         "plan_remove_requested_skills",
         "plan_create_skill_definition",
@@ -3519,6 +3550,12 @@ fn main_agent_planner_tool_registry(
         PlannedDependencyAction::Remove,
     )));
     registry.register(Arc::new(PlanTaskNoteTool::new(state.clone())));
+    registry.register(Arc::new(PlanTaskReadTool::new(
+        state.clone(),
+        "plan_list_task_notes",
+        "Plan to list notes attached to one task.",
+        PlannedTaskReadAction::ListNotes,
+    )));
     registry.register(Arc::new(PlanRequestedSkillsTool::new(
         state.clone(),
         "plan_add_requested_skills",
@@ -5048,6 +5085,7 @@ enum PlannedTaskReadAction {
     ListHistory,
     ShowLatestResult,
     ListFollowUps,
+    ListNotes,
     ListConversation,
 }
 
@@ -5123,6 +5161,7 @@ impl Tool for PlanTaskReadTool {
                 PlannedTaskReadAction::ListFollowUps => {
                     MainAgentPlan::ListTaskFollowUps { selector }
                 }
+                PlannedTaskReadAction::ListNotes => MainAgentPlan::ListTaskNotes { selector },
                 PlannedTaskReadAction::ListConversation => {
                     MainAgentPlan::ListTaskConversation { selector }
                 }
@@ -5732,7 +5771,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.\n- plan_show_task_latest_result: show one task's latest result summary.\n- plan_list_task_follow_ups: list follow-up tasks created from one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve one memory candidate.\n- plan_reject_memory: reject one memory candidate.\n- plan_approve_all_pending_memories: approve all pending memory candidates.\n- plan_reject_all_pending_memories: reject all pending memory candidates.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_list_task_notes: list notes attached to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_list_task_history: list attempts, worker events, and audit actions for one task.\n- plan_show_task_latest_result: show one task's latest result summary.\n- plan_list_task_follow_ups: list follow-up tasks created from one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve one memory candidate.\n- plan_reject_memory: reject one memory candidate.\n- plan_approve_all_pending_memories: approve all pending memory candidates.\n- plan_reject_all_pending_memories: reject all pending memory candidates.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -6672,6 +6711,67 @@ fn extract_task_follow_up_selector(content: &str, normalized: &str) -> Option<St
     (!selector.is_empty() && selector != content).then_some(selector)
 }
 
+fn extract_task_notes_selector(content: &str, normalized: &str) -> Option<String> {
+    if !contains_any(normalized, &["note", "notes", ZH_NOTE])
+        || !contains_any(normalized, &["task", ZH_TASK])
+        || is_create_request(normalized)
+        || contains_any(
+            normalized,
+            &["add note", "note to task", "note task", ZH_ADD],
+        )
+        || !contains_any(
+            normalized,
+            &[
+                "show",
+                "list",
+                "view",
+                "what",
+                "which",
+                "\u{67e5}\u{770b}",
+                ZH_LIST,
+            ],
+        )
+    {
+        return None;
+    }
+
+    let selector = extract_task_notes_selector_text(content);
+    (!selector.is_empty() && selector != content).then_some(selector)
+}
+
+fn extract_task_notes_selector_text(content: &str) -> String {
+    let mut selector = content.to_owned();
+    for word in [
+        "show notes for task",
+        "list notes for task",
+        "view notes for task",
+        "show task notes",
+        "list task notes",
+        "view task notes",
+        "task notes",
+        "notes",
+        "note",
+        "show",
+        "list",
+        "view",
+        "what",
+        "which",
+        "task",
+        ZH_TASK,
+        "\u{67e5}\u{770b}",
+        ZH_LIST,
+        ZH_NOTE,
+    ] {
+        selector = replace_case_insensitive(&selector, word, "");
+    }
+
+    selector
+        .trim()
+        .trim_matches([':', '\u{ff1a}', '?', '\u{ff1f}', '"', '\''])
+        .trim()
+        .to_owned()
+}
+
 fn extract_task_conversation_selector(content: &str, normalized: &str) -> Option<String> {
     if !contains_any(
         normalized,
@@ -7291,6 +7391,31 @@ fn format_task_follow_ups(task: &Task, follow_ups: &[Task]) -> String {
     }
     if follow_ups.len() > 10 {
         lines.push(format!("- ... and {} more", follow_ups.len() - 10));
+    }
+
+    lines.join("\n")
+}
+
+fn format_task_notes(task: &Task, notes: &[TaskNote]) -> String {
+    if notes.is_empty() {
+        return format!("Task '{}' has no notes yet.", task.title);
+    }
+
+    let mut lines = vec![format!(
+        "Task '{}' notes ({} shown):",
+        task.title,
+        notes.len().min(10)
+    )];
+    for note in notes.iter().rev().take(10) {
+        lines.push(format!(
+            "- {} [{}] {}",
+            note.id.to_string().chars().take(8).collect::<String>(),
+            note.actor,
+            bounded_preview(&note.content, 240)
+        ));
+    }
+    if notes.len() > 10 {
+        lines.push(format!("- ... and {} more", notes.len() - 10));
     }
 
     lines.join("\n")
@@ -9995,6 +10120,26 @@ mod tests {
     #[test]
     fn parses_task_note_intents() {
         assert_eq!(
+            parse_intent("show notes for task Deploy release"),
+            MainAgentIntent::ListTaskNotes {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list task Deploy release notes"),
+            MainAgentIntent::ListTaskNotes {
+                selector: "Deploy release".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent(
+                "\u{67e5}\u{770b}\u{4efb}\u{52a1} \u{53d1}\u{5e03}\u{7248}\u{672c} \u{5907}\u{6ce8}"
+            ),
+            MainAgentIntent::ListTaskNotes {
+                selector: "\u{53d1}\u{5e03}\u{7248}\u{672c}".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent("add note to task Deploy release: wait for staging approval"),
             MainAgentIntent::AddTaskNote {
                 selector: "Deploy release".to_owned(),
@@ -11163,6 +11308,38 @@ mod tests {
         assert_eq!(notes[0].content, "Wait for staging approval");
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Added note"));
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListTaskNotes {
+                selector: "Deploy release".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "What coordination notes do we have for deployment?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' notes")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Wait for staging approval")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_notes")
+        );
 
         Ok(())
     }
@@ -12959,6 +13136,31 @@ mod tests {
         assert_eq!(notes[0].content, "wait for staging approval");
         assert_eq!(response.changed_tasks.len(), 1);
         assert!(response.assistant_message.content.contains("Added note"));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show notes for task Deploy release".to_owned(),
+            })
+            .await?;
+        let actions = db.list_task_actions(task.id).await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Task 'Deploy release' notes")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("wait for staging approval")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_task_notes")
+        );
 
         Ok(())
     }
