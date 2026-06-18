@@ -1180,6 +1180,44 @@ impl MainAgent {
             .await
     }
 
+    pub async fn set_all_pending_memories_status(
+        &self,
+        status: MemoryStatus,
+    ) -> anyhow::Result<Vec<Memory>> {
+        if status == MemoryStatus::Pending {
+            anyhow::bail!("bulk memory review requires a terminal memory status");
+        }
+
+        let pending = self
+            .db
+            .list_memories()
+            .await?
+            .into_iter()
+            .filter(|memory| memory.status == MemoryStatus::Pending)
+            .collect::<Vec<_>>();
+        let mut updated = Vec::with_capacity(pending.len());
+        for memory in pending {
+            updated.push(
+                self.db
+                    .set_memory_status(memory.id, status, "main_agent")
+                    .await?,
+            );
+        }
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "bulk_set_memory_status",
+                serde_json::json!({
+                    "status": status,
+                    "count": updated.len(),
+                }),
+            )
+            .await?;
+
+        Ok(updated)
+    }
+
     pub async fn update_memory(&self, id: MemoryId, input: UpdateMemory) -> anyhow::Result<Memory> {
         self.db.update_memory(id, input, "main_agent").await
     }
@@ -1802,6 +1840,18 @@ impl MainAgent {
                 }
                 Err(reply) => reply,
             },
+            MainAgentIntent::BulkReviewMemories { status } => {
+                let memories = self.set_all_pending_memories_status(status).await?;
+                format!(
+                    "{} {} pending memory candidate(s).",
+                    match status {
+                        MemoryStatus::Approved => "Approved",
+                        MemoryStatus::Rejected => "Rejected",
+                        MemoryStatus::Pending => "Updated",
+                    },
+                    memories.len()
+                )
+            }
             MainAgentIntent::UpdateMemory { selector, input } => match self.find_memory(&selector).await? {
                 Ok(memory) => {
                     let memory = self.update_memory(memory.id, input).await?;
@@ -2328,6 +2378,9 @@ pub enum MainAgentPlan {
     RejectMemory {
         selector: String,
     },
+    BulkReviewMemories {
+        status: MemoryStatus,
+    },
     UpdateMemory {
         selector: String,
         input: UpdateMemory,
@@ -2492,6 +2545,7 @@ impl MainAgentPlan {
             }
             Self::ApproveMemory { selector } => MainAgentIntent::ApproveMemory { selector },
             Self::RejectMemory { selector } => MainAgentIntent::RejectMemory { selector },
+            Self::BulkReviewMemories { status } => MainAgentIntent::BulkReviewMemories { status },
             Self::UpdateMemory { selector, input } => {
                 MainAgentIntent::UpdateMemory { selector, input }
             }
@@ -2718,6 +2772,9 @@ enum MainAgentIntent {
     },
     RejectMemory {
         selector: String,
+    },
+    BulkReviewMemories {
+        status: MemoryStatus,
     },
     UpdateMemory {
         selector: String,
@@ -3275,6 +3332,8 @@ async fn dispatch_main_agent_planner(
         "plan_create_memory",
         "plan_approve_memory",
         "plan_reject_memory",
+        "plan_approve_all_pending_memories",
+        "plan_reject_all_pending_memories",
         "plan_update_memory",
         "plan_delete_memory",
         "plan_list_memories",
@@ -3477,6 +3536,22 @@ fn main_agent_planner_tool_registry(
         "plan_reject_memory",
         "Plan to reject a memory candidate selected by id, scope, or content fragment.",
         PlannedMemoryReviewAction::Reject,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_approve_all_pending_memories",
+        "Plan to approve all pending memory candidates.",
+        MainAgentPlan::BulkReviewMemories {
+            status: MemoryStatus::Approved,
+        },
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_reject_all_pending_memories",
+        "Plan to reject all pending memory candidates.",
+        MainAgentPlan::BulkReviewMemories {
+            status: MemoryStatus::Rejected,
+        },
     )));
     registry.register(Arc::new(PlanUpdateMemoryTool::new(state.clone())));
     registry.register(Arc::new(PlanMemoryReviewTool::new(
@@ -5549,7 +5624,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve one memory candidate.\n- plan_reject_memory: reject one memory candidate.\n- plan_approve_all_pending_memories: approve all pending memory candidates.\n- plan_reject_all_pending_memories: reject all pending memory candidates.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -7870,6 +7945,41 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
         return None;
     }
 
+    if is_bulk_memory_review_request(normalized)
+        && contains_any(
+            normalized,
+            &[
+                "approve",
+                "accept",
+                "approve memory",
+                "accept memory",
+                ZH_APPROVE,
+                ZH_ACCEPT,
+            ],
+        )
+    {
+        return Some(MainAgentIntent::BulkReviewMemories {
+            status: MemoryStatus::Approved,
+        });
+    }
+
+    if is_bulk_memory_review_request(normalized)
+        && contains_any(
+            normalized,
+            &[
+                "reject",
+                "discard",
+                "reject memory",
+                "discard memory",
+                ZH_REJECT,
+            ],
+        )
+    {
+        return Some(MainAgentIntent::BulkReviewMemories {
+            status: MemoryStatus::Rejected,
+        });
+    }
+
     if contains_any(
         normalized,
         &[
@@ -7909,6 +8019,11 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
             ZH_ACCEPT,
         ],
     ) {
+        if is_bulk_memory_review_request(normalized) {
+            return Some(MainAgentIntent::BulkReviewMemories {
+                status: MemoryStatus::Approved,
+            });
+        }
         let selector = extract_memory_selector(content);
         return (!selector.is_empty()).then_some(MainAgentIntent::ApproveMemory { selector });
     }
@@ -7956,11 +8071,32 @@ fn parse_memory_review_intent(content: &str, normalized: &str) -> Option<MainAge
             ZH_REJECT,
         ],
     ) {
+        if is_bulk_memory_review_request(normalized) {
+            return Some(MainAgentIntent::BulkReviewMemories {
+                status: MemoryStatus::Rejected,
+            });
+        }
         let selector = extract_memory_selector(content);
         return (!selector.is_empty()).then_some(MainAgentIntent::RejectMemory { selector });
     }
 
     None
+}
+
+fn is_bulk_memory_review_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "all pending",
+            "all memory",
+            "all memories",
+            "all candidates",
+            "every memory",
+            "every candidate",
+            "\u{5168}\u{90e8}",
+            "\u{6240}\u{6709}",
+        ],
+    )
 }
 
 fn split_memory_update(content: &str) -> Option<(String, UpdateMemory)> {
@@ -9743,9 +9879,21 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_intent("approve all pending memories"),
+            MainAgentIntent::BulkReviewMemories {
+                status: MemoryStatus::Approved,
+            }
+        );
+        assert_eq!(
             parse_intent("reject memory candidate noisy temporary note"),
             MainAgentIntent::RejectMemory {
                 selector: "noisy temporary note".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("reject all memory candidates"),
+            MainAgentIntent::BulkReviewMemories {
+                status: MemoryStatus::Rejected,
             }
         );
         assert_eq!(
@@ -11254,6 +11402,35 @@ mod tests {
                 .contains("Updated memory")
         );
 
+        let batch_memory = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "repo".to_owned(),
+                    content: "Prefer small focused commits.".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.82,
+                },
+                "test",
+            )
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::BulkReviewMemories {
+                status: MemoryStatus::Approved,
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Those suggested lessons all look useful.".to_owned(),
+            })
+            .await?;
+        let batch_memory = db.get_memory(batch_memory.id).await?;
+
+        assert_eq!(batch_memory.status, MemoryStatus::Approved);
+        assert!(response.assistant_message.content.contains("Approved 1"));
+
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::DeleteMemory {
                 selector: "cargo test --workspace".to_owned(),
@@ -11966,6 +12143,92 @@ mod tests {
                 .content
                 .contains("Deleted memory")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_bulk_review_pending_memories_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let first = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Prefer cargo test before push".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.84,
+                },
+                "worker",
+            )
+            .await?;
+        let second = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Avoid noisy temporary notes".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.72,
+                },
+                "worker",
+            )
+            .await?;
+        let already_approved = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Already durable".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Approved,
+                    confidence: 0.95,
+                },
+                "worker",
+            )
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "approve all pending memories".to_owned(),
+            })
+            .await?;
+        let first = db.get_memory(first.id).await?;
+        let second = db.get_memory(second.id).await?;
+        let already_approved = db.get_memory(already_approved.id).await?;
+        let actions = db.list_global_actions().await?;
+
+        assert_eq!(first.status, MemoryStatus::Approved);
+        assert_eq!(second.status, MemoryStatus::Approved);
+        assert_eq!(already_approved.status, MemoryStatus::Approved);
+        assert!(response.assistant_message.content.contains("Approved 2"));
+        assert!(actions.iter().any(|action| {
+            action.action_type == "bulk_set_memory_status"
+                && action.details["status"] == "approved"
+                && action.details["count"] == 2
+        }));
+
+        let reject_me = db
+            .create_memory(
+                persistent_agent_domain::CreateMemory {
+                    scope: "project".to_owned(),
+                    content: "Temporary dead end".to_owned(),
+                    source_task_id: None,
+                    status: MemoryStatus::Pending,
+                    confidence: 0.2,
+                },
+                "worker",
+            )
+            .await?;
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "reject all memory candidates".to_owned(),
+            })
+            .await?;
+        let rejected = db.get_memory(reject_me.id).await?;
+
+        assert_eq!(rejected.status, MemoryStatus::Rejected);
+        assert!(response.assistant_message.content.contains("Rejected 1"));
 
         Ok(())
     }

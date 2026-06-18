@@ -230,7 +230,7 @@ It should:
 - subscribe to worker events;
 - persist task events and summaries;
 - mark the task outcome;
-- review memory candidates.
+- review memory candidates, including bulk approval or rejection of pending candidates.
 
 The main agent may inspect local state, such as repository files or git status, when planning or clarifying tasks. The first implemented local operations are read-only: workspace status inspection reports the process working directory and `git status --short --branch`, workspace directory inspection lists a bounded relative directory, and workspace file inspection previews a relative file inside the current workspace with an output cap. They record `inspect_workspace_status`, `inspect_workspace_directory`, `inspect_workspace_file`, and rejected `inspect_workspace_directory_failed` / `inspect_workspace_file_failed` actions. Substantial execution, code changes, long-running operations, and risky local actions should be delegated to worker agents.
 
