@@ -576,6 +576,33 @@ impl MainAgent {
         Ok(format_waiting_for_user_tasks(&summaries))
     }
 
+    pub async fn list_waiting_for_schedule_tasks(&self) -> anyhow::Result<String> {
+        let mut tasks = self
+            .db
+            .list_tasks()
+            .await?
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::WaitingForSchedule)
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            left.next_run_at
+                .cmp(&right.next_run_at)
+                .then_with(|| right.priority.cmp(&left.priority))
+                .then_with(|| left.queue_position.cmp(&right.queue_position))
+        });
+
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "list_waiting_for_schedule_tasks",
+                serde_json::json!({ "count": tasks.len() }),
+            )
+            .await?;
+
+        Ok(format_waiting_for_schedule_tasks(&tasks))
+    }
+
     pub async fn explain_task_pool_state(&self) -> anyhow::Result<String> {
         let tasks = self.db.list_tasks().await?;
         self.db
@@ -1560,6 +1587,9 @@ impl MainAgent {
                 format_task_list(&tasks)
             }
             MainAgentIntent::ListWaitingForUserTasks => self.list_waiting_for_user_tasks().await?,
+            MainAgentIntent::ListWaitingForScheduleTasks => {
+                self.list_waiting_for_schedule_tasks().await?
+            }
             MainAgentIntent::ShowSchedulerState => self.inspect_scheduler_state().await?,
             MainAgentIntent::ListGlobalActions => self.list_main_agent_actions().await?,
             MainAgentIntent::ExplainTaskPool => self.explain_task_pool_state().await?,
@@ -1690,7 +1720,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, list tasks waiting for user input, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run a selected task now, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2112,6 +2142,7 @@ pub enum MainAgentPlan {
     },
     ListGlobalActions,
     ListWaitingForUserTasks,
+    ListWaitingForScheduleTasks,
     ExplainTaskPool,
     ExplainTask {
         selector: String,
@@ -2277,6 +2308,7 @@ impl MainAgentPlan {
             }
             Self::ListGlobalActions => MainAgentIntent::ListGlobalActions,
             Self::ListWaitingForUserTasks => MainAgentIntent::ListWaitingForUserTasks,
+            Self::ListWaitingForScheduleTasks => MainAgentIntent::ListWaitingForScheduleTasks,
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
@@ -2477,6 +2509,7 @@ enum MainAgentIntent {
     },
     ListTasks,
     ListWaitingForUserTasks,
+    ListWaitingForScheduleTasks,
     ListGlobalActions,
     ExplainTaskPool,
     ExplainTask {
@@ -2610,6 +2643,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_waiting_for_user_list_request(&normalized) {
         return MainAgentIntent::ListWaitingForUserTasks;
+    }
+
+    if is_waiting_for_schedule_list_request(&normalized) {
+        return MainAgentIntent::ListWaitingForScheduleTasks;
     }
 
     if is_list_tasks_request(&normalized) {
@@ -3011,6 +3048,7 @@ async fn dispatch_main_agent_planner(
         "plan_reply_to_task",
         "plan_list_main_agent_actions",
         "plan_list_waiting_for_user_tasks",
+        "plan_list_waiting_for_schedule_tasks",
         "plan_explain_task_pool",
         "plan_explain_task",
         "plan_list_task_artifacts",
@@ -3145,6 +3183,12 @@ fn main_agent_planner_tool_registry(
         "plan_list_waiting_for_user_tasks",
         "Plan to list tasks that are waiting for user input.",
         MainAgentPlan::ListWaitingForUserTasks,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_list_waiting_for_schedule_tasks",
+        "Plan to list tasks that are waiting for their next schedule.",
+        MainAgentPlan::ListWaitingForScheduleTasks,
     )));
     registry.register(Arc::new(PlanSimpleIntentTool::new(
         state.clone(),
@@ -5122,7 +5166,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one task to the front of runnable work and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -5700,6 +5744,44 @@ fn is_waiting_for_user_list_request(normalized: &str) -> bool {
         )
 }
 
+fn is_waiting_for_schedule_list_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "waiting for schedule",
+            "waiting for its schedule",
+            "waiting for next schedule",
+            "scheduled tasks",
+            "scheduled task",
+            "next scheduled",
+            "recurring tasks waiting",
+            "recurring task waiting",
+            "waiting recurring",
+            "recurring tasks are waiting",
+            "recurring task is waiting",
+            "\u{7b49}\u{5f85}\u{8c03}\u{5ea6}",
+            "\u{7b49}\u{5f85}\u{65e5}\u{7a0b}",
+            "\u{5faa}\u{73af}\u{4efb}\u{52a1}",
+        ],
+    ) && !is_create_request(normalized)
+        && contains_any(
+            normalized,
+            &[
+                "list",
+                "show",
+                "what",
+                "which",
+                "tasks",
+                "task",
+                "scheduled",
+                "recurring",
+                ZH_LIST,
+                "\u{67e5}\u{770b}",
+                ZH_TASK,
+            ],
+        )
+}
+
 fn is_global_action_list_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -6148,6 +6230,31 @@ fn format_waiting_for_user_tasks(tasks: &[(Task, Option<String>)]) -> String {
         lines.push(format!("- ... and {} more", tasks.len() - 10));
     }
     lines.push("Reply with: reply to task <title>: <your answer>".to_owned());
+
+    lines.join("\n")
+}
+
+fn format_waiting_for_schedule_tasks(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "No tasks are waiting for schedule.".to_owned();
+    }
+
+    let mut lines = vec![format!("{} task(s) are waiting for schedule:", tasks.len())];
+    for task in tasks.iter().take(10) {
+        let next_run = task
+            .next_run_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "not set".to_owned());
+        lines.push(format!(
+            "- {} next_run_at {}",
+            format_task_brief(task),
+            next_run
+        ));
+    }
+    if tasks.len() > 10 {
+        lines.push(format!("- ... and {} more", tasks.len() - 10));
+    }
+    lines.push("Run a due scan with: run scheduler scan".to_owned());
 
     lines.join("\n")
 }
@@ -8292,6 +8399,14 @@ mod tests {
             parse_intent("what needs user input?"),
             MainAgentIntent::ListWaitingForUserTasks
         );
+        assert_eq!(
+            parse_intent("show tasks waiting for schedule"),
+            MainAgentIntent::ListWaitingForScheduleTasks
+        );
+        assert_eq!(
+            parse_intent("which recurring tasks are waiting?"),
+            MainAgentIntent::ListWaitingForScheduleTasks
+        );
     }
 
     #[test]
@@ -10035,6 +10150,40 @@ mod tests {
                 .any(|action| action.action_type == "list_waiting_for_user_tasks")
         );
 
+        db.convert_task_type(
+            task.id,
+            TaskType::Recurring,
+            Some(serde_json::json!({ "interval_seconds": 300 })),
+            "test",
+        )
+        .await?;
+        db.complete_task(task.id, "scheduled next run", "test")
+            .await?;
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::ListWaitingForScheduleTasks),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Which recurring work is waiting for schedule?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Deploy release")
+        );
+        assert!(response.assistant_message.content.contains("next_run_at"));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "list_waiting_for_schedule_tasks")
+        );
+
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ListTaskHistory {
                 selector: "Deploy release".to_owned(),
@@ -11222,6 +11371,53 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "list_waiting_for_user_tasks")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_waiting_for_schedule_tasks_by_conversation() -> anyhow::Result<()>
+    {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        let task = agent
+            .create_task(CreateTask {
+                title: "Check GitHub issues".to_owned(),
+                description: "Check repository issues repeatedly".to_owned(),
+                task_type: TaskType::Recurring,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: Some(serde_json::json!({ "interval_seconds": 300 })),
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        agent.complete_task(task.id, "checked once").await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "show tasks waiting for schedule".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Check GitHub issues")
+        );
+        assert!(response.assistant_message.content.contains("next_run_at"));
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("run scheduler scan")
+        );
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "list_waiting_for_schedule_tasks")
         );
 
         Ok(())
