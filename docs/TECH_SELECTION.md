@@ -220,6 +220,7 @@ It should:
 - split vague user requests into concrete task proposals;
 - use a harness-backed planner for unsupported free-form requests, where the LLM can only call bounded planning tools and product code performs the final state mutation;
 - summarize the task pool and explain why work is or is not running;
+- recommend the next operator action without mutating task state;
 - perform lightweight local inspection when that helps task planning;
 - scan runnable tasks through scheduled ticks, manual API calls, or main-agent conversation requests;
 - move a selected task, or the current next runnable task by scheduler order, to the front of runnable work and request an immediate scheduler scan without bypassing the scheduler/worker path;

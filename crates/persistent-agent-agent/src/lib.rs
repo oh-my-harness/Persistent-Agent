@@ -691,6 +691,27 @@ impl MainAgent {
         Ok(format_task_pool_explanation(&tasks))
     }
 
+    pub async fn recommend_next_action(&self) -> anyhow::Result<String> {
+        let tasks = self.db.list_tasks().await?;
+        let next_runnable = self.db.peek_next_runnable().await?;
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "recommend_next_action",
+                serde_json::json!({
+                    "task_count": tasks.len(),
+                    "next_runnable_task_id": next_runnable.as_ref().map(|task| task.id),
+                }),
+            )
+            .await?;
+
+        Ok(format_next_action_recommendation(
+            &tasks,
+            next_runnable.as_ref(),
+        ))
+    }
+
     pub async fn list_main_agent_actions(&self) -> anyhow::Result<String> {
         self.db
             .record_action(
@@ -1714,6 +1735,7 @@ impl MainAgent {
             MainAgentIntent::ShowSchedulerState => self.inspect_scheduler_state().await?,
             MainAgentIntent::ListGlobalActions => self.list_main_agent_actions().await?,
             MainAgentIntent::ExplainTaskPool => self.explain_task_pool_state().await?,
+            MainAgentIntent::RecommendNextAction => self.recommend_next_action().await?,
             MainAgentIntent::ExplainTask { selector } => match self.find_task(&selector).await? {
                 Ok(task) => self.explain_task_state(task.id).await?,
                 Err(reply) => reply,
@@ -1841,7 +1863,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks by status, list tasks waiting for user input or schedule, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, recommend the next action, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, run the next runnable task, run a selected task now, pause/resume/cancel/delete/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -2276,6 +2298,7 @@ pub enum MainAgentPlan {
         status: TaskStatus,
     },
     ExplainTaskPool,
+    RecommendNextAction,
     ExplainTask {
         selector: String,
     },
@@ -2452,6 +2475,7 @@ impl MainAgentPlan {
             Self::ListWaitingForScheduleTasks => MainAgentIntent::ListWaitingForScheduleTasks,
             Self::ListTasksByStatus { status } => MainAgentIntent::ListTasksByStatus { status },
             Self::ExplainTaskPool => MainAgentIntent::ExplainTaskPool,
+            Self::RecommendNextAction => MainAgentIntent::RecommendNextAction,
             Self::ExplainTask { selector } => MainAgentIntent::ExplainTask { selector },
             Self::ListTaskArtifacts { selector } => MainAgentIntent::ListTaskArtifacts { selector },
             Self::ListTaskHistory { selector } => MainAgentIntent::ListTaskHistory { selector },
@@ -2665,6 +2689,7 @@ enum MainAgentIntent {
     ListWaitingForScheduleTasks,
     ListGlobalActions,
     ExplainTaskPool,
+    RecommendNextAction,
     ExplainTask {
         selector: String,
     },
@@ -2731,6 +2756,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if is_scheduler_state_request(&normalized) {
         return MainAgentIntent::ShowSchedulerState;
+    }
+
+    if is_next_action_recommendation_request(&normalized) {
+        return MainAgentIntent::RecommendNextAction;
     }
 
     if let Some(intent) = parse_explain_intent(trimmed, &normalized) {
@@ -3235,6 +3264,7 @@ async fn dispatch_main_agent_planner(
         "plan_list_waiting_for_user_tasks",
         "plan_list_waiting_for_schedule_tasks",
         "plan_explain_task_pool",
+        "plan_recommend_next_action",
         "plan_explain_task",
         "plan_list_task_artifacts",
         "plan_list_task_history",
@@ -3394,6 +3424,12 @@ fn main_agent_planner_tool_registry(
         "plan_explain_task_pool",
         "Plan to explain why the task pool is in its current state.",
         MainAgentPlan::ExplainTaskPool,
+    )));
+    registry.register(Arc::new(PlanSimpleIntentTool::new(
+        state.clone(),
+        "plan_recommend_next_action",
+        "Plan to recommend the next operator action for the task pool.",
+        MainAgentPlan::RecommendNextAction,
     )));
     registry.register(Arc::new(PlanTaskReadTool::new(
         state.clone(),
@@ -5513,7 +5549,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_delete_task: permanently delete one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_run_task_now: move one selected task to the front of runnable work and request a scheduler scan.\n- plan_run_next_task: select the next runnable task by scheduler order and request a scheduler scan.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_update_task_schedule: update one recurring task's interval in seconds.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_list_waiting_for_user_tasks: list tasks waiting for user input.\n- plan_list_waiting_for_schedule_tasks: list tasks waiting for their next schedule.\n- plan_explain_task_pool: explain current task pool state.\n- plan_recommend_next_action: recommend the next operator action for the task pool.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -6453,6 +6489,26 @@ fn is_run_next_task_request(normalized: &str) -> bool {
     ))
 }
 
+fn is_next_action_recommendation_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "what should i do next",
+            "what should we do next",
+            "what is next",
+            "next action",
+            "recommended next action",
+            "recommend next action",
+            "suggest next action",
+            "what should the agent do next",
+            "how should we proceed",
+            "\u{63a5}\u{4e0b}\u{6765}\u{505a}\u{4ec0}\u{4e48}",
+            "\u{4e0b}\u{4e00}\u{6b65}\u{505a}\u{4ec0}\u{4e48}",
+            "\u{63a8}\u{8350}\u{4e0b}\u{4e00}\u{6b65}",
+        ],
+    ) && !is_create_request(normalized)
+}
+
 fn is_scheduler_state_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -7082,6 +7138,61 @@ fn format_task_pool_explanation(tasks: &[Task]) -> String {
     }
 
     lines.join("\n")
+}
+
+fn format_next_action_recommendation(tasks: &[Task], next_runnable: Option<&Task>) -> String {
+    if tasks.is_empty() {
+        return "Recommended next action: create the first task. The task pool is empty."
+            .to_owned();
+    }
+
+    if let Some(task) = tasks.iter().find(|task| task.status == TaskStatus::Running) {
+        return format!(
+            "Recommended next action: monitor the running task '{}'. Use: show history for task {}",
+            task.title, task.title
+        );
+    }
+
+    if let Some(task) = next_runnable {
+        return format!(
+            "Recommended next action: run the next runnable task '{}'. Use: run next task",
+            task.title
+        );
+    }
+
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| task.status == TaskStatus::WaitingForUser)
+    {
+        let reason = task.blocked_reason.as_deref().unwrap_or("needs input");
+        return format!(
+            "Recommended next action: answer the blocked task '{}'. Reason: {}. Use: reply to task {}: <your answer>",
+            task.title,
+            bounded_preview(reason, 180),
+            task.title
+        );
+    }
+
+    if let Some(task) = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::WaitingForSchedule)
+        .min_by_key(|task| task.next_run_at)
+    {
+        let next_run = task
+            .next_run_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "not set".to_owned());
+        return format!(
+            "Recommended next action: wait for recurring task '{}' to become due at {}. Use: show scheduler status",
+            task.title, next_run
+        );
+    }
+
+    if tasks.iter().any(|task| task.status == TaskStatus::Failed) {
+        return "Recommended next action: inspect failed work. Use: show failed tasks".to_owned();
+    }
+
+    "Recommended next action: review the task pool. Use: list tasks".to_owned()
 }
 
 fn format_task_explanation(
@@ -9128,6 +9239,14 @@ mod tests {
                 selector: "Deploy release".to_owned()
             }
         );
+        assert_eq!(
+            parse_intent("what should I do next?"),
+            MainAgentIntent::RecommendNextAction
+        );
+        assert_eq!(
+            parse_intent("\u{4e0b}\u{4e00}\u{6b65}\u{505a}\u{4ec0}\u{4e48}"),
+            MainAgentIntent::RecommendNextAction
+        );
     }
 
     #[test]
@@ -10864,6 +10983,30 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.action_type == "inspect_scheduler_state")
+        );
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::RecommendNextAction),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "How should we proceed?".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Recommended next action")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.action_type == "recommend_next_action")
         );
 
         db.set_task_status(
@@ -12850,6 +12993,59 @@ mod tests {
             global_actions
                 .iter()
                 .any(|action| action.action_type == "explain_task_pool_state")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_recommend_next_action_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+        agent
+            .create_task(CreateTask {
+                title: "Low priority cleanup".to_owned(),
+                description: "Can wait".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 0,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+        let next = agent
+            .create_task(CreateTask {
+                title: "Fix release blocker".to_owned(),
+                description: "Ready to run".to_owned(),
+                task_type: TaskType::OneOff,
+                priority: 5,
+                requested_skills: Vec::new(),
+                schedule: None,
+                created_by: "test".to_owned(),
+            })
+            .await?;
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "what should I do next?".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert_eq!(response.changed_tasks.len(), 0);
+        assert!(!response.scheduler_tick_requested);
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Recommended next action")
+        );
+        assert!(response.assistant_message.content.contains(&next.title));
+        assert!(response.assistant_message.content.contains("run next task"));
+        assert!(
+            global_actions
+                .iter()
+                .any(|action| action.action_type == "recommend_next_action")
         );
 
         Ok(())
