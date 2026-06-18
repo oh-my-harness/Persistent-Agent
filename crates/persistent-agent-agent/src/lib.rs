@@ -747,6 +747,144 @@ impl MainAgent {
         ))
     }
 
+    pub async fn inspect_workspace_directory(&self, relative_path: &str) -> anyhow::Result<String> {
+        let cwd = env::current_dir()?;
+        let path_text = clean_workspace_path(relative_path);
+        let display_path = if path_text.is_empty() {
+            ".".to_owned()
+        } else {
+            path_text.clone()
+        };
+        let requested_path = Path::new(&display_path);
+        if requested_path.is_absolute() {
+            self.record_workspace_directory_inspection_failure(
+                &display_path,
+                "workspace directory path must be relative",
+            )
+            .await?;
+            anyhow::bail!("workspace directory path must be relative");
+        }
+
+        let workspace_root = cwd.canonicalize()?;
+        let directory_path = cwd.join(requested_path);
+        let canonical_directory_path = match directory_path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.record_workspace_directory_inspection_failure(
+                    &display_path,
+                    &error.to_string(),
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
+        if !canonical_directory_path.starts_with(&workspace_root) {
+            self.record_workspace_directory_inspection_failure(
+                &display_path,
+                "workspace directory path must stay inside the current workspace",
+            )
+            .await?;
+            anyhow::bail!("workspace directory path must stay inside the current workspace");
+        }
+
+        let metadata = match fs::metadata(&canonical_directory_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.record_workspace_directory_inspection_failure(
+                    &display_path,
+                    &error.to_string(),
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
+        if !metadata.is_dir() {
+            self.record_workspace_directory_inspection_failure(
+                &display_path,
+                "workspace path is not a directory",
+            )
+            .await?;
+            anyhow::bail!("workspace path is not a directory");
+        }
+
+        let mut entries = Vec::new();
+        let read_dir = match fs::read_dir(&canonical_directory_path) {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                self.record_workspace_directory_inspection_failure(
+                    &display_path,
+                    &error.to_string(),
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.record_workspace_directory_inspection_failure(
+                        &display_path,
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.record_workspace_directory_inspection_failure(
+                        &display_path,
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
+            };
+            let kind = if metadata.is_dir() {
+                "dir"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.file_type().is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            entries.push((kind.to_owned(), name, metadata.len()));
+        }
+        entries.sort_by(|left, right| {
+            entry_kind_rank(&left.0)
+                .cmp(&entry_kind_rank(&right.0))
+                .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
+        });
+
+        const MAX_DIRECTORY_ENTRIES: usize = 50;
+        let shown = entries.len().min(MAX_DIRECTORY_ENTRIES);
+        let truncated = entries.len() > shown;
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_workspace_directory",
+                serde_json::json!({
+                    "path": display_path,
+                    "entry_count": entries.len(),
+                    "shown": shown,
+                    "truncated": truncated,
+                }),
+            )
+            .await?;
+
+        Ok(format_workspace_directory(
+            &display_path,
+            &entries,
+            shown,
+            truncated,
+        ))
+    }
+
     async fn record_workspace_file_inspection_failure(
         &self,
         path: &str,
@@ -757,6 +895,25 @@ impl MainAgent {
                 None,
                 "main_agent",
                 "inspect_workspace_file_failed",
+                serde_json::json!({
+                    "path": path,
+                    "error": error,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn record_workspace_directory_inspection_failure(
+        &self,
+        path: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .record_action(
+                None,
+                "main_agent",
+                "inspect_workspace_directory_failed",
                 serde_json::json!({
                     "path": path,
                     "error": error,
@@ -1312,6 +1469,14 @@ impl MainAgent {
                     }
                 }
             }
+            MainAgentIntent::InspectWorkspaceDirectory { path } => {
+                match self.inspect_workspace_directory(&path).await {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        format!("I could not inspect workspace directory '{}': {error}", path)
+                    }
+                }
+            }
             MainAgentIntent::CreateMemory { scope, content } => {
                 let memory = self.create_memory(scope, content).await?;
                 format!(
@@ -1403,7 +1568,7 @@ impl MainAgent {
                     .to_owned()
             }
             MainAgentIntent::Help => {
-                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, request user clarification, reply to blocked tasks, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
+                "I can create tasks, split goals into tasks, list tasks, create/list/delete skills, show task artifacts, show task history, show task conversation, remember durable preferences, show memory candidates, show main-agent audit actions, explain task state, inspect workspace status, preview workspace files, list workspace directories, request user clarification, reply to blocked tasks, pause/resume/cancel/complete/fail/retry tasks, update task title/description, set priority, reorder the queue, add notes, add/remove requested skills, add/remove task dependencies, add/remove resource locks, list/approve/reject/update/delete memory candidates, run a scheduler scan, convert tasks between one-off and recurring, or summarize the task pool. Example: split goal: investigate issue; write fix; run tests.".to_owned()
             }
         };
 
@@ -1838,6 +2003,9 @@ pub enum MainAgentPlan {
     InspectWorkspaceFile {
         path: String,
     },
+    InspectWorkspaceDirectory {
+        path: String,
+    },
     CreateMemory {
         scope: String,
         content: String,
@@ -1990,6 +2158,9 @@ impl MainAgentPlan {
             }
             Self::InspectWorkspace => MainAgentIntent::InspectWorkspace,
             Self::InspectWorkspaceFile { path } => MainAgentIntent::InspectWorkspaceFile { path },
+            Self::InspectWorkspaceDirectory { path } => {
+                MainAgentIntent::InspectWorkspaceDirectory { path }
+            }
             Self::CreateMemory { scope, content } => {
                 MainAgentIntent::CreateMemory { scope, content }
             }
@@ -2192,6 +2363,9 @@ enum MainAgentIntent {
     InspectWorkspaceFile {
         path: String,
     },
+    InspectWorkspaceDirectory {
+        path: String,
+    },
     CreateMemory {
         scope: String,
         content: String,
@@ -2247,6 +2421,10 @@ fn parse_intent(content: &str) -> MainAgentIntent {
 
     if let Some(path) = extract_workspace_file_inspection_path(trimmed, &normalized) {
         return MainAgentIntent::InspectWorkspaceFile { path };
+    }
+
+    if let Some(path) = extract_workspace_directory_inspection_path(trimmed, &normalized) {
+        return MainAgentIntent::InspectWorkspaceDirectory { path };
     }
 
     if is_workspace_inspection_request(&normalized) {
@@ -2698,6 +2876,7 @@ async fn dispatch_main_agent_planner(
         "plan_list_task_conversation",
         "plan_inspect_workspace",
         "plan_inspect_workspace_file",
+        "plan_inspect_workspace_directory",
         "plan_create_memory",
         "plan_approve_memory",
         "plan_reject_memory",
@@ -2850,6 +3029,9 @@ fn main_agent_planner_tool_registry(
         MainAgentPlan::InspectWorkspace,
     )));
     registry.register(Arc::new(PlanInspectWorkspaceFileTool::new(state.clone())));
+    registry.register(Arc::new(PlanInspectWorkspaceDirectoryTool::new(
+        state.clone(),
+    )));
     registry.register(Arc::new(PlanCreateMemoryTool::new(state.clone())));
     registry.register(Arc::new(PlanMemoryReviewTool::new(
         state.clone(),
@@ -4314,6 +4496,64 @@ impl Tool for PlanInspectWorkspaceFileTool {
     }
 }
 
+struct PlanInspectWorkspaceDirectoryTool {
+    state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
+    schema: serde_json::Value,
+}
+
+impl PlanInspectWorkspaceDirectoryTool {
+    fn new(state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>) -> Self {
+        Self {
+            state,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory path to list. Use . for the workspace root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+}
+
+impl Tool for PlanInspectWorkspaceDirectoryTool {
+    fn name(&self) -> &str {
+        "plan_inspect_workspace_directory"
+    }
+
+    fn description(&self) -> &str {
+        "Plan to list a workspace-relative directory."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.schema
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ToolResult, ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.state.lock().await.plan = Some(MainAgentPlan::InspectWorkspaceDirectory {
+                path: planner_required_string(&args, "path")?,
+            });
+            Ok(planner_tool_result(
+                "planned workspace directory inspection",
+            ))
+        })
+    }
+}
+
 struct PlanCreateMemoryTool {
     state: Arc<tokio::sync::Mutex<MainAgentPlannerState>>,
     schema: serde_json::Value,
@@ -4726,7 +4966,7 @@ fn planner_tool_result(message: &str) -> ToolResult {
 
 fn main_agent_planner_prompt(context: &MainAgentPlanContext) -> String {
     format!(
-        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
+        "User message:\n{}\n\nTask pool summary:\n{}\n\nTask snapshot:\n{}\n\nRecent main conversation:\n{}\n\nSupported planning tools:\n- plan_create_task: create one one-off or recurring task.\n- plan_split_tasks: split a goal into multiple one-off tasks.\n- plan_pause_task: pause one existing task by id or title fragment.\n- plan_resume_task: resume a paused, blocked, or waiting task selected by id or title fragment.\n- plan_cancel_task: cancel one existing task by id or title fragment.\n- plan_complete_task: manually mark one existing task complete with a result summary.\n- plan_fail_task: manually mark one existing task failed with an error reason.\n- plan_retry_task: requeue a failed task for another attempt.\n- plan_update_task_details: update one existing task's title and/or description.\n- plan_reprioritize_task: set one existing task's priority.\n- plan_reorder_task: move one task to a queue position.\n- plan_convert_task_type: convert one task between one-off and recurring.\n- plan_add_task_dependency: make one task wait for another task.\n- plan_remove_task_dependency: remove a task dependency.\n- plan_add_task_note: add a note to one task.\n- plan_add_requested_skills: add one or more requested skills to an existing task.\n- plan_remove_requested_skills: remove one or more requested skills from an existing task.\n- plan_create_skill_definition: create a reusable skill definition with triggers, tools, and optional resource path.\n- plan_update_skill_definition: update an existing skill definition's metadata, triggers, tools, or resource path.\n- plan_delete_skill_definition: delete an existing skill definition.\n- plan_add_resource_lock: add a resource lock to one task.\n- plan_remove_resource_lock: remove a resource lock from one task.\n- plan_request_clarification: ask the user a clarification question for one task.\n- plan_reply_to_task: append the user's reply to a task conversation and resume it if it is waiting for input.\n- plan_list_main_agent_actions: list recent main-agent audit actions.\n- plan_explain_task_pool: explain current task pool state.\n- plan_explain_task: explain one task's current state.\n- plan_list_task_artifacts: list artifacts for one task.\n- plan_inspect_workspace: inspect workspace status.\n- plan_inspect_workspace_file: preview a workspace-relative file.\n- plan_inspect_workspace_directory: list a workspace-relative directory.\n- plan_approve_memory: approve a memory candidate.\n- plan_reject_memory: reject a memory candidate.\n- plan_list_memories: list memory candidates by status.\n- plan_list_skill_definitions: list skill definitions.\n- plan_list_tasks: list tasks.\n- plan_summarize_task_pool: summarize task pool state.\n- plan_scheduler_scan: run one scheduler scan.\n\nCall one tool only when the user intent is clear.",
         context.user_message,
         format_advisor_summary(&context.task_pool_summary),
         format_planner_task_snapshot(&context.task_snapshot),
@@ -5552,6 +5792,65 @@ fn extract_workspace_file_inspection_path(content: &str, normalized: &str) -> Op
     None
 }
 
+fn extract_workspace_directory_inspection_path(content: &str, normalized: &str) -> Option<String> {
+    if is_create_request(normalized) {
+        return None;
+    }
+
+    if normalized == "ls" {
+        return Some(".".to_owned());
+    }
+    if normalized.starts_with("ls ") {
+        let path = clean_workspace_path(&content[3..]);
+        return Some(if path.is_empty() {
+            ".".to_owned()
+        } else {
+            path
+        });
+    }
+
+    for marker in [
+        "list directory ",
+        "show directory ",
+        "inspect directory ",
+        "list folder ",
+        "show folder ",
+        "inspect folder ",
+        "list dir ",
+        "\u{5217}\u{51fa}\u{76ee}\u{5f55}",
+        "\u{67e5}\u{770b}\u{76ee}\u{5f55}",
+        "\u{68c0}\u{67e5}\u{76ee}\u{5f55}",
+    ] {
+        if let Some(index) = normalized.find(marker) {
+            let path = clean_workspace_path(&content[index + marker.len()..]);
+            return Some(if path.is_empty() {
+                ".".to_owned()
+            } else {
+                path
+            });
+        }
+    }
+
+    if contains_any(
+        normalized,
+        &[
+            "list workspace files",
+            "show workspace files",
+            "list project files",
+            "show project files",
+            "list root files",
+            "show root files",
+            "workspace tree",
+            "\u{5217}\u{51fa}\u{9879}\u{76ee}\u{6587}\u{4ef6}",
+            "\u{67e5}\u{770b}\u{9879}\u{76ee}\u{6587}\u{4ef6}",
+        ],
+    ) {
+        return Some(".".to_owned());
+    }
+
+    None
+}
+
 fn clean_workspace_path(value: &str) -> String {
     value
         .trim()
@@ -5560,6 +5859,45 @@ fn clean_workspace_path(value: &str) -> String {
         .trim_matches(['`', '"', '\''])
         .trim()
         .to_owned()
+}
+
+fn entry_kind_rank(kind: &str) -> u8 {
+    match kind {
+        "dir" => 0,
+        "file" => 1,
+        "symlink" => 2,
+        _ => 3,
+    }
+}
+
+fn format_workspace_directory(
+    path: &str,
+    entries: &[(String, String, u64)],
+    shown: usize,
+    truncated: bool,
+) -> String {
+    if entries.is_empty() {
+        return format!("Directory: {path}\nNo entries.");
+    }
+
+    let truncation_note = if truncated { " (truncated)" } else { "" };
+    let mut lines = vec![format!(
+        "Directory: {path}\nEntries shown: {} of {}{}",
+        shown,
+        entries.len(),
+        truncation_note
+    )];
+    for (kind, name, bytes) in entries.iter().take(shown) {
+        let suffix = if kind == "dir" { "/" } else { "" };
+        let size = if kind == "file" {
+            format!(" {bytes} bytes")
+        } else {
+            String::new()
+        };
+        lines.push(format!("- {name}{suffix} [{kind}{size}]"));
+    }
+
+    lines.join("\n")
 }
 
 fn format_task_list(tasks: &[Task]) -> String {
@@ -7596,6 +7934,18 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_intent("list directory crates"),
+            MainAgentIntent::InspectWorkspaceDirectory {
+                path: "crates".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_intent("list workspace files"),
+            MainAgentIntent::InspectWorkspaceDirectory {
+                path: ".".to_owned(),
+            }
+        );
+        assert_eq!(
             parse_intent("\u{67e5}\u{770b}\u{6587}\u{4ef6}\u{ff1a}Cargo.toml"),
             MainAgentIntent::InspectWorkspaceFile {
                 path: "Cargo.toml".to_owned(),
@@ -9261,6 +9611,25 @@ mod tests {
         }));
 
         let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
+            plan: Some(MainAgentPlan::InspectWorkspaceDirectory {
+                path: ".".to_owned(),
+            }),
+            contexts: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "Please show me the crate layout.".to_owned(),
+            })
+            .await?;
+        let actions = db.list_global_actions().await?;
+
+        assert!(response.assistant_message.content.contains("Directory: ."));
+        assert!(actions.iter().any(|action| {
+            action.action_type == "inspect_workspace_directory" && action.details["path"] == "."
+        }));
+
+        let agent = MainAgent::new(db.clone()).with_planner(Arc::new(FixedPlanner {
             plan: Some(MainAgentPlan::ExplainTaskPool),
             contexts: Arc::new(StdMutex::new(Vec::new())),
         }));
@@ -10698,6 +11067,28 @@ mod tests {
         assert_eq!(response.changed_tasks.len(), 0);
         assert!(global_actions.iter().any(|action| {
             action.action_type == "inspect_workspace_file" && action.details["path"] == "Cargo.toml"
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn main_agent_can_list_workspace_directory_by_conversation() -> anyhow::Result<()> {
+        let db = Db::connect("sqlite::memory:").await?;
+        let agent = MainAgent::new(db.clone());
+
+        let response = agent
+            .handle_user_message(MainAgentMessageInput {
+                content: "list workspace files".to_owned(),
+            })
+            .await?;
+        let global_actions = db.list_global_actions().await?;
+
+        assert!(response.assistant_message.content.contains("Directory: ."));
+        assert!(response.assistant_message.content.contains("Cargo.toml"));
+        assert_eq!(response.changed_tasks.len(), 0);
+        assert!(global_actions.iter().any(|action| {
+            action.action_type == "inspect_workspace_directory" && action.details["path"] == "."
         }));
 
         Ok(())
