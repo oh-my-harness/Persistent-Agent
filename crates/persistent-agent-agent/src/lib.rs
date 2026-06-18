@@ -687,6 +687,9 @@ impl MainAgent {
                     "status": task.status,
                     "dependency_count": dependency_states.len(),
                     "resource_lock_conflict_count": resource_lock_conflicts.len(),
+                    "requested_skill_count": task.requested_skills.len(),
+                    "matched_skill_count": task.matched_skills.len(),
+                    "active_skills": active_skill_names_for_task(&task),
                 }),
             )
             .await?;
@@ -7085,6 +7088,18 @@ fn format_task_explanation(
             resource_lock_conflicts.len()
         ));
     }
+    lines.push(format!(
+        "Requested skills: {}.",
+        format_skill_list(&task.requested_skills)
+    ));
+    lines.push(format!(
+        "Matched skills: {}.",
+        format_skill_list(&task.matched_skills)
+    ));
+    lines.push(format!(
+        "Active skills for the next worker run: {}.",
+        format_skill_list(&active_skill_names_for_task(task))
+    ));
 
     lines.join("\n")
 }
@@ -8244,6 +8259,23 @@ fn format_skill_list(skill_names: &[String]) -> String {
     } else {
         skill_names.join(", ")
     }
+}
+
+fn active_skill_names_for_task(task: &Task) -> Vec<String> {
+    let mut skills = Vec::new();
+    for skill in task
+        .requested_skills
+        .iter()
+        .chain(task.matched_skills.iter())
+    {
+        if !skills
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(skill))
+        {
+            skills.push(skill.clone());
+        }
+    }
+    skills
 }
 
 fn format_skill_definitions(skills: &[Skill]) -> String {
@@ -12607,6 +12639,17 @@ mod tests {
     async fn main_agent_can_explain_why_task_is_not_running() -> anyhow::Result<()> {
         let db = Db::connect("sqlite::memory:").await?;
         let agent = MainAgent::new(db.clone());
+        db.create_skill(
+            CreateSkill {
+                name: "deploy".to_owned(),
+                description: "Deployment work".to_owned(),
+                trigger_rules: vec!["deploy".to_owned()],
+                tool_subset: vec!["shell".to_owned()],
+                resource_path: None,
+            },
+            "test",
+        )
+        .await?;
         let dependency = agent
             .create_task(CreateTask {
                 title: "Build package".to_owned(),
@@ -12624,7 +12667,7 @@ mod tests {
                 description: "Deploy after build".to_owned(),
                 task_type: TaskType::OneOff,
                 priority: 10,
-                requested_skills: Vec::new(),
+                requested_skills: vec!["github".to_owned()],
                 schedule: None,
                 created_by: "test".to_owned(),
             })
@@ -12648,10 +12691,27 @@ mod tests {
         );
         assert!(response.assistant_message.content.contains("Build package"));
         assert!(
-            actions
-                .iter()
-                .any(|action| action.action_type == "explain_task_state")
+            response
+                .assistant_message
+                .content
+                .contains("Requested skills: github")
         );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Matched skills: deploy")
+        );
+        assert!(
+            response
+                .assistant_message
+                .content
+                .contains("Active skills for the next worker run: github, deploy")
+        );
+        assert!(actions.iter().any(|action| {
+            action.action_type == "explain_task_state"
+                && action.details["active_skills"] == serde_json::json!(["github", "deploy"])
+        }));
 
         Ok(())
     }
